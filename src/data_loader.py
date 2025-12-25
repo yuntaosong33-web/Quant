@@ -1771,6 +1771,107 @@ class DataLoader:
             包含 success, failed, total 的统计字典
         """
         return self._download_stats.copy()
+    
+    def fetch_index_price(
+        self,
+        index_code: str,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        """
+        获取指数日线价格数据
+        
+        用于获取沪深300、中证500等指数的历史价格，支持大盘风控计算。
+        
+        Parameters
+        ----------
+        index_code : str
+            指数代码，如 '000300' (沪深300), '000905' (中证500)
+            注意：会自动添加 'sh' 前缀用于 AkShare 接口
+        start_date : str
+            开始日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
+        end_date : str
+            结束日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
+        
+        Returns
+        -------
+        pd.DataFrame
+            指数日线数据，包含以下列：
+            - date: 日期（索引，DatetimeIndex）
+            - open, high, low, close: OHLC 价格
+            - volume: 成交量
+        
+        Raises
+        ------
+        ConnectionError
+            当网络连接失败且重试耗尽时
+        
+        Examples
+        --------
+        >>> loader = DataLoader()
+        >>> hs300 = loader.fetch_index_price("000300", "2023-01-01", "2024-12-31")
+        >>> print(hs300[['close']].tail())
+        
+        Notes
+        -----
+        - 使用 ak.stock_zh_index_daily 接口获取数据
+        - 自动处理日期格式转换
+        - 内置重试机制处理网络异常
+        """
+        # 标准化日期格式
+        start_date_clean = start_date.replace("-", "")
+        end_date_clean = end_date.replace("-", "")
+        
+        # 确定指数符号（AkShare 需要 sh/sz 前缀）
+        # 沪深300 (000300) 在上海交易所，中证500 (000905) 也在上海
+        if index_code.startswith(("000", "399")):
+            symbol = f"sh{index_code}"
+        else:
+            symbol = f"sh{index_code}"  # 默认上海
+        
+        logger.info(f"获取指数 {index_code} ({symbol}) 日线数据: {start_date} - {end_date}")
+        
+        # 使用重试机制获取数据
+        df = self._fetch_with_retry(
+            func=ak.stock_zh_index_daily,
+            symbol=symbol
+        )
+        
+        if df is None or df.empty:
+            logger.warning(f"指数 {index_code} 无数据")
+            return pd.DataFrame()
+        
+        # 数据清洗和标准化
+        # 确保日期列存在并转换
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        elif '日期' in df.columns:
+            df['date'] = pd.to_datetime(df['日期'])
+            df = df.drop(columns=['日期'])
+        
+        # 过滤日期范围
+        start_dt = pd.to_datetime(start_date_clean)
+        end_dt = pd.to_datetime(end_date_clean)
+        
+        df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)].copy()
+        
+        # 设置日期索引
+        df = df.set_index('date')
+        df = df.sort_index()
+        df.index.name = 'date'
+        
+        # 确保列名标准化
+        column_mapping = {
+            '开盘': 'open',
+            '收盘': 'close',
+            '最高': 'high',
+            '最低': 'low',
+            '成交量': 'volume',
+        }
+        df = df.rename(columns=column_mapping)
+        
+        logger.info(f"获取指数 {index_code} 成功，共 {len(df)} 条记录")
+        return df
 
 
 class DataCleaner:

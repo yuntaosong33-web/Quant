@@ -50,6 +50,7 @@ from .optimizer import (
 from .utils import (
     setup_logging,
     load_config,
+    send_pushplus_msg,
     # GroupBy 向量化工具
     groupby_rolling,
     groupby_shift,
@@ -103,6 +104,7 @@ __all__ = [
     # 工具
     "setup_logging",
     "load_config",
+    "send_pushplus_msg",
     # GroupBy 向量化
     "groupby_rolling",
     "groupby_shift",

@@ -20,6 +20,7 @@ Usage
 
 import argparse
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -49,6 +50,7 @@ from src import (
     # 工具
     setup_logging,
     load_config,
+    send_pushplus_msg,
 )
 
 # 配置常量
@@ -121,6 +123,7 @@ class DailyUpdateRunner:
         self.financial_data: Optional[pd.DataFrame] = None
         self.industry_data: Optional[pd.DataFrame] = None
         self.factor_data: Optional[pd.DataFrame] = None
+        self.benchmark_data: Optional[pd.DataFrame] = None  # 基准指数数据（用于大盘风控）
         self.current_positions: Dict[str, float] = {}
         self.target_positions: Dict[str, float] = {}
         
@@ -565,6 +568,91 @@ class DailyUpdateRunner:
             'sw_industry_l1': np.random.choice(industries, len(stocks))
         })
     
+    def update_benchmark_data(self) -> bool:
+        """
+        更新基准指数数据（用于大盘风控）
+        
+        获取沪深300指数数据，用于计算MA20风控指标。
+        
+        Returns
+        -------
+        bool
+            更新是否成功
+        """
+        self.logger.info("开始更新基准指数数据（沪深300）...")
+        
+        try:
+            data_config = self.config.get("data", {})
+            start_date = data_config.get("start_date", "2020-01-01")
+            end_date = self.today.strftime("%Y-%m-%d")
+            
+            # 使用 DataLoader 获取沪深300指数数据
+            self.benchmark_data = self.financial_loader.fetch_index_price(
+                index_code="000300",
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if self.benchmark_data is not None and not self.benchmark_data.empty:
+                self.logger.info(
+                    f"基准指数数据更新完成，共 {len(self.benchmark_data)} 条记录，"
+                    f"日期范围: {self.benchmark_data.index[0].strftime('%Y-%m-%d')} ~ "
+                    f"{self.benchmark_data.index[-1].strftime('%Y-%m-%d')}"
+                )
+                return True
+            else:
+                self.logger.warning("未获取到基准指数数据，大盘风控将不生效")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"更新基准指数数据失败: {e}，大盘风控将不生效")
+            self.benchmark_data = None
+            return False
+    
+    def is_market_risk_triggered(self) -> bool:
+        """
+        检查大盘风控是否触发
+        
+        风控条件：沪深300收盘价 < 20日均线
+        
+        Returns
+        -------
+        bool
+            True 表示风控触发（应空仓），False 表示正常
+        """
+        if self.benchmark_data is None or self.benchmark_data.empty:
+            self.logger.debug("无基准数据，风控检查跳过")
+            return False
+        
+        try:
+            # 获取最新数据
+            latest_data = self.benchmark_data.tail(20)
+            
+            if len(latest_data) < 20:
+                self.logger.debug("基准数据不足20天，风控检查跳过")
+                return False
+            
+            # 计算20日均线
+            ma20 = latest_data['close'].mean()
+            latest_close = latest_data['close'].iloc[-1]
+            
+            is_triggered = latest_close < ma20
+            
+            if is_triggered:
+                self.logger.warning(
+                    f"大盘风控触发: 沪深300收盘价 {latest_close:.2f} < MA20 {ma20:.2f}"
+                )
+            else:
+                self.logger.info(
+                    f"大盘风控正常: 沪深300收盘价 {latest_close:.2f} >= MA20 {ma20:.2f}"
+                )
+            
+            return is_triggered
+            
+        except Exception as e:
+            self.logger.warning(f"风控检查失败: {e}")
+            return False
+    
     def calculate_factors(self) -> bool:
         """
         计算因子数据
@@ -739,6 +827,8 @@ class DailyUpdateRunner:
         """
         生成目标持仓
         
+        包含大盘风控逻辑：当沪深300跌破20日均线时，强制空仓。
+        
         Returns
         -------
         bool
@@ -747,6 +837,30 @@ class DailyUpdateRunner:
         self.logger.info("开始生成目标持仓...")
         
         try:
+            # === 大盘风控检查 ===
+            if self.is_market_risk_triggered():
+                self.logger.warning("大盘风控触发，系统强制空仓！")
+                self.target_positions = {}
+                
+                # 保存空仓状态
+                portfolio_config = self.config.get("portfolio", {})
+                total_capital = portfolio_config.get("total_capital", 1000000)
+                
+                positions_path = DATA_PROCESSED_PATH / f"target_positions_{self.today.strftime('%Y%m%d')}.json"
+                with open(positions_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'date': self.today.strftime('%Y-%m-%d'),
+                        'positions': {},
+                        'weights': {},
+                        'total_capital': total_capital,
+                        'market_risk_triggered': True,
+                        'reason': '沪深300跌破20日均线，触发大盘风控'
+                    }, f, ensure_ascii=False, indent=2)
+                
+                self.logger.info("已保存空仓目标持仓（风控触发）")
+                return True
+            # =====================
+            
             if self.factor_data is None:
                 self.logger.warning("因子数据为空，无法生成持仓")
                 return False
@@ -818,6 +932,7 @@ class DailyUpdateRunner:
                     'positions': self.target_positions,
                     'weights': weights,
                     'total_capital': total_capital,
+                    'market_risk_triggered': False,
                 }, f, ensure_ascii=False, indent=2)
             
             return True
@@ -1296,6 +1411,210 @@ class DailyUpdateRunner:
         return report_path
 
 
+def _format_orders_for_push(
+    buy_orders: Dict[str, float],
+    sell_orders: Dict[str, float],
+    target_positions: Dict[str, float],
+    report_date: str,
+    market_risk_triggered: bool = False
+) -> str:
+    """
+    将交易订单格式化为 PushPlus 推送内容（HTML格式）
+    
+    Parameters
+    ----------
+    buy_orders : Dict[str, float]
+        买入订单 {股票代码: 金额}
+    sell_orders : Dict[str, float]
+        卖出订单 {股票代码: 金额}
+    target_positions : Dict[str, float]
+        目标持仓 {股票代码: 金额}
+    report_date : str
+        报告日期
+    market_risk_triggered : bool
+        大盘风控是否触发
+    
+    Returns
+    -------
+    str
+        HTML 格式的推送内容
+    """
+    lines = []
+    
+    # 样式
+    lines.append("""
+    <style>
+        body { font-family: -apple-system, sans-serif; padding: 10px; }
+        .header { color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; }
+        .section { margin: 15px 0; }
+        .section-title { color: #667eea; font-size: 16px; font-weight: bold; margin-bottom: 8px; }
+        .buy { color: #00aa00; }
+        .sell { color: #ff4444; }
+        .warning { color: #ff8800; background: #fff3cd; padding: 10px; border-radius: 5px; }
+        .item { padding: 5px 0; border-bottom: 1px solid #eee; }
+        .amount { float: right; font-weight: bold; }
+        .summary { background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 15px; }
+        .no-action { color: #888; text-align: center; padding: 20px; }
+    </style>
+    """)
+    
+    # 标题
+    lines.append(f'<div class="header"><h2>📊 每日交易计划</h2><p>日期: {report_date}</p></div>')
+    
+    # 大盘风控警告
+    if market_risk_triggered:
+        lines.append('''
+        <div class="warning">
+            ⚠️ <strong>大盘风控触发</strong><br>
+            沪深300跌破20日均线，系统强制空仓！
+        </div>
+        ''')
+    
+    # 判断是否有操作
+    has_orders = bool(buy_orders) or bool(sell_orders)
+    
+    if not has_orders:
+        lines.append('''
+        <div class="no-action">
+            <p>✅ 今日无交易操作</p>
+            <p style="font-size: 12px; color: #aaa;">持仓保持不变</p>
+        </div>
+        ''')
+    else:
+        # 买入清单
+        if buy_orders:
+            lines.append('<div class="section">')
+            lines.append(f'<div class="section-title buy">📈 明日需买入 ({len(buy_orders)}只)</div>')
+            
+            for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
+                shares = int(amount / 10 / 100) * 100  # 估算股数
+                lines.append(f'''
+                <div class="item">
+                    <span>{stock}</span>
+                    <span class="amount buy">¥{amount:,.0f}</span>
+                    <span style="color:#888; font-size:12px;"> (~{shares}股)</span>
+                </div>
+                ''')
+            
+            total_buy = sum(buy_orders.values())
+            lines.append(f'<div style="text-align:right; margin-top:8px;"><strong>合计: ¥{total_buy:,.0f}</strong></div>')
+            lines.append('</div>')
+        
+        # 卖出清单
+        if sell_orders:
+            lines.append('<div class="section">')
+            lines.append(f'<div class="section-title sell">📉 明日需卖出 ({len(sell_orders)}只)</div>')
+            
+            for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
+                shares = int(amount / 10 / 100) * 100
+                lines.append(f'''
+                <div class="item">
+                    <span>{stock}</span>
+                    <span class="amount sell">¥{amount:,.0f}</span>
+                    <span style="color:#888; font-size:12px;"> (~{shares}股)</span>
+                </div>
+                ''')
+            
+            total_sell = sum(sell_orders.values())
+            lines.append(f'<div style="text-align:right; margin-top:8px;"><strong>合计: ¥{total_sell:,.0f}</strong></div>')
+            lines.append('</div>')
+    
+    # 持仓汇总
+    lines.append('<div class="summary">')
+    lines.append(f'<strong>目标持仓: {len(target_positions)} 只股票</strong>')
+    if target_positions:
+        total_value = sum(target_positions.values())
+        lines.append(f'<br>总市值: ¥{total_value:,.0f}')
+        
+        # 显示前5只持仓
+        top_5 = sorted(target_positions.items(), key=lambda x: -x[1])[:5]
+        lines.append('<br><span style="font-size:12px; color:#666;">Top 5: ')
+        lines.append(', '.join([f'{s}({w/total_value:.1%})' for s, w in top_5]))
+        lines.append('</span>')
+    lines.append('</div>')
+    
+    # 时间戳
+    lines.append(f'<p style="text-align:center; color:#aaa; font-size:11px; margin-top:15px;">生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>')
+    
+    return '\n'.join(lines)
+
+
+def _send_daily_notification(
+    runner: "DailyUpdateRunner",
+    buy_orders: Dict[str, float],
+    sell_orders: Dict[str, float],
+    config: Dict[str, Any]
+) -> None:
+    """
+    发送每日交易通知到微信
+    
+    Parameters
+    ----------
+    runner : DailyUpdateRunner
+        运行器实例
+    buy_orders : Dict[str, float]
+        买入订单
+    sell_orders : Dict[str, float]
+        卖出订单
+    config : Dict[str, Any]
+        配置
+    """
+    logger = logging.getLogger(__name__)
+    
+    # 获取 PushPlus Token
+    # 优先从环境变量读取，其次从配置文件读取
+    token = os.environ.get("PUSHPLUS_TOKEN", "")
+    
+    if not token:
+        token = config.get("notification", {}).get("pushplus_token", "")
+    
+    if not token:
+        logger.debug("未配置 PUSHPLUS_TOKEN，跳过微信推送")
+        return
+    
+    # 检查是否为风控触发的空仓
+    market_risk_triggered = False
+    positions_path = DATA_PROCESSED_PATH / f"target_positions_{runner.today.strftime('%Y%m%d')}.json"
+    if positions_path.exists():
+        try:
+            with open(positions_path, 'r', encoding='utf-8') as f:
+                pos_data = json.load(f)
+                market_risk_triggered = pos_data.get("market_risk_triggered", False)
+        except Exception:
+            pass
+    
+    # 格式化推送内容
+    report_date = runner.today.strftime('%Y-%m-%d')
+    content = _format_orders_for_push(
+        buy_orders=buy_orders,
+        sell_orders=sell_orders,
+        target_positions=runner.target_positions,
+        report_date=report_date,
+        market_risk_triggered=market_risk_triggered
+    )
+    
+    # 构建标题
+    if market_risk_triggered:
+        title = f"⚠️ 风控触发 - {report_date}"
+    elif buy_orders or sell_orders:
+        title = f"📊 交易计划 - {report_date}"
+    else:
+        title = f"✅ 无操作 - {report_date}"
+    
+    # 发送消息
+    success = send_pushplus_msg(
+        token=token,
+        title=title,
+        content=content,
+        template="html"
+    )
+    
+    if success:
+        logger.info("每日交易计划已推送至微信")
+    else:
+        logger.warning("微信推送失败，请检查 PUSHPLUS_TOKEN 配置")
+
+
 def run_daily_update(
     force_rebalance: bool = False,
     config: Optional[Dict[str, Any]] = None
@@ -1306,9 +1625,10 @@ def run_daily_update(
     流程：
     1. 调用 DataLoader 更新至今日的最新数据
     2. 调用 FactorCalculator 更新因子数据
-    3. 检查今日是否为月底（调仓日）。如果是，运行 MultiFactorStrategy 生成新的目标持仓列表
-    4. 调用 optimize_weights 计算每只持仓股的具体股数
-    5. 生成报告
+    3. 更新基准指数数据（用于大盘风控）
+    4. 检查今日是否为月底（调仓日）。如果是，运行 MultiFactorStrategy 生成新的目标持仓列表
+    5. 调用 optimize_weights 计算每只持仓股的具体股数
+    6. 生成报告
     
     Parameters
     ----------
@@ -1332,37 +1652,41 @@ def run_daily_update(
         runner = DailyUpdateRunner(config)
         
         # Step 1: 更新市场数据
-        logger.info("Step 1/5: 更新市场数据")
+        logger.info("Step 1/6: 更新市场数据")
         if not runner.update_market_data():
             logger.error("市场数据更新失败")
             return False
         
         # Step 2: 更新财务数据
-        logger.info("Step 2/5: 更新财务数据")
+        logger.info("Step 2/6: 更新财务数据")
         if not runner.update_financial_data():
             logger.error("财务数据更新失败")
             return False
         
-        # Step 3: 计算因子
-        logger.info("Step 3/5: 计算因子数据")
+        # Step 3: 更新基准指数数据（用于大盘风控）
+        logger.info("Step 3/6: 更新基准指数数据（大盘风控）")
+        runner.update_benchmark_data()  # 即使失败也继续，只是风控不生效
+        
+        # Step 4: 计算因子
+        logger.info("Step 4/6: 计算因子数据")
         if not runner.calculate_factors():
             logger.error("因子计算失败")
             return False
         
-        # Step 4: 检查是否调仓日
+        # Step 5: 检查是否调仓日
         is_rebalance = force_rebalance or runner.is_rebalance_day()
         
         if is_rebalance:
-            logger.info("Step 4/5: 生成目标持仓（调仓日）")
+            logger.info("Step 5/6: 生成目标持仓（调仓日）")
             if not runner.generate_target_positions():
                 logger.error("目标持仓生成失败")
                 return False
         else:
-            logger.info("Step 4/5: 非调仓日，跳过持仓生成")
+            logger.info("Step 5/6: 非调仓日，跳过持仓生成")
             runner.target_positions = runner.current_positions.copy()
         
-        # Step 5: 生成报告
-        logger.info("Step 5/5: 生成交易报告")
+        # Step 6: 生成报告
+        logger.info("Step 6/6: 生成交易报告")
         buy_orders, sell_orders = runner.calculate_trade_orders()
         
         report_config = runner.config.get("report", {})
@@ -1372,6 +1696,15 @@ def run_daily_update(
         for fmt in ["markdown", "html"]:
             report_content = runner.generate_report(buy_orders, sell_orders, format=fmt)
             runner.save_report(report_content, format=fmt)
+        
+        # Step 7: 发送微信推送通知
+        logger.info("Step 7/7: 发送微信通知")
+        _send_daily_notification(
+            runner=runner,
+            buy_orders=buy_orders,
+            sell_orders=sell_orders,
+            config=runner.config
+        )
         
         logger.info("=" * 60)
         logger.info("每日更新流程完成")

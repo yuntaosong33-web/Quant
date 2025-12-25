@@ -66,6 +66,7 @@ class BacktestEngine:
     回测引擎
     
     基于VectorBT实现高性能向量化回测。
+    对于小资金账户（< 50万），强制使用 Simple 模式以确保佣金计算准确（最低5元规则）。
     
     Attributes
     ----------
@@ -78,6 +79,9 @@ class BacktestEngine:
     >>> result = engine.run(strategy, price_data, signals)
     >>> print(f"夏普比率: {result.sharpe_ratio:.2f}")
     """
+    
+    # 小资金阈值：低于此值强制使用 Simple 模式
+    SMALL_CAPITAL_THRESHOLD = 500000  # 50万
     
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -96,6 +100,9 @@ class BacktestEngine:
         self._slippage = self.config.get("slippage", 0.001)
         self._risk_free_rate = self.config.get("risk_free_rate", 0.03)
         
+        # 强制使用 Simple 模式的标志
+        self._force_simple_mode = self.config.get("force_simple_mode", False)
+        
         logger.info(
             f"回测引擎初始化: 初始资金={self._initial_capital}, "
             f"佣金={self._commission}, 滑点={self._slippage}"
@@ -109,6 +116,9 @@ class BacktestEngine:
     ) -> BacktestResult:
         """
         执行回测
+        
+        对于小资金账户（< 50万），强制使用 Simple 模式以确保佣金计算准确。
+        VectorBT 无法精确模拟 A股"最低5元佣金"规则，对小资金影响显著。
         
         Parameters
         ----------
@@ -130,8 +140,24 @@ class BacktestEngine:
         if signals is None:
             signals = strategy.generate_signals(price_data)
         
-        # 执行回测
-        if VBT_AVAILABLE:
+        # === 小资金账户强制使用 Simple 模式 ===
+        # 原因：VectorBT 无法精确模拟 A股"最低5元佣金"规则
+        # 对于30万资金，每笔交易约3-6万，按万三计算只有9-18元
+        # 但实际最低5元的限制会导致费率实际高达万1.5左右
+        use_simple_mode = (
+            self._force_simple_mode or 
+            self._initial_capital < self.SMALL_CAPITAL_THRESHOLD
+        )
+        
+        if use_simple_mode:
+            if self._initial_capital < self.SMALL_CAPITAL_THRESHOLD:
+                logger.warning(
+                    f"小资金模式（{self._initial_capital/10000:.0f}万 < {self.SMALL_CAPITAL_THRESHOLD/10000:.0f}万）："
+                    f"强制使用简单回测引擎，以精确计算最低5元佣金"
+                )
+            result = self._run_simple(price_data, signals)
+        elif VBT_AVAILABLE:
+            logger.info("使用 VectorBT 回测引擎（大资金模式）")
             result = self._run_vectorbt(price_data, signals)
         else:
             result = self._run_simple(price_data, signals)
@@ -236,7 +262,20 @@ class BacktestEngine:
         trades_pct = position.diff().abs().fillna(0)  # 仓位变化比例
         trade_amounts = trades_pct * current_capital_series  # 估算交易金额
         
-        # 计算交易成本 (含最低佣金限制)
+        # ========================================
+        # 计算交易成本 (含A股最低佣金限制)
+        # ========================================
+        # 
+        # A股佣金规则：
+        # - 费率：通常万分之三 (0.0003)
+        # - 最低限制：单笔最低5元
+        # 
+        # 对于30万小资金账户：
+        # - 持仓5只股票，每只约6万
+        # - 按万三计算：6万 * 0.0003 = 18元
+        # - 但如果单笔交易金额 < 1.67万，则佣金不足5元，需按5元收取
+        # - 这导致实际费率可能高达 5元/1.67万 ≈ 万3
+        #
         # 1. 佣金：max(5元, 交易额 * 费率)
         commission_costs = np.maximum(5.0, trade_amounts * self._commission)
         # 修正：只有发生交易(trades_pct > 0)时才计算佣金，否则为0
@@ -273,7 +312,7 @@ class BacktestEngine:
         max_drawdown = drawdown.min()
         
         # 胜率和盈亏比
-        trade_returns = strategy_returns[trades > 0]
+        trade_returns = strategy_returns[trades_pct > 0]
         wins = (trade_returns > 0).sum()
         total_trades = len(trade_returns)
         win_rate = wins / total_trades if total_trades > 0 else 0
@@ -490,6 +529,9 @@ class VBTProBacktester:
     
     专为A股全市场多标的回测设计，支持固定金额买入策略。
     
+    注意：VBT 无法精确模拟 A股"最低5元佣金"规则。
+    对于小资金账户（< 50万），建议使用 BacktestEngine 的 Simple 模式。
+    
     Attributes
     ----------
     init_cash : float
@@ -512,6 +554,7 @@ class VBTProBacktester:
     DEFAULT_FIXED_AMOUNT = 100_000  # 默认每次买入10万
     TRADING_DAYS_PER_YEAR = 252     # 年交易日
     RISK_FREE_RATE = 0.03           # 无风险利率
+    SMALL_CAPITAL_THRESHOLD = 500000  # 小资金阈值：50万
     
     def __init__(
         self,
@@ -548,6 +591,14 @@ class VBTProBacktester:
         self._portfolio = None
         self._stats = None
         self._returns = None
+        
+        # 小资金警告
+        if init_cash < self.SMALL_CAPITAL_THRESHOLD:
+            logger.warning(
+                f"⚠️ 小资金警告：初始资金 {init_cash/10000:.0f}万 < {self.SMALL_CAPITAL_THRESHOLD/10000:.0f}万\n"
+                f"   VBT 无法精确模拟 A股最低5元佣金规则，回测结果可能偏乐观\n"
+                f"   建议使用 BacktestEngine(config={{'force_simple_mode': True}}) 获取更准确的结果"
+            )
         
         logger.info(
             f"VBT Pro回测器初始化: "

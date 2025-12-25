@@ -795,7 +795,8 @@ class MultiFactorStrategy(BaseStrategy):
         self,
         data: pd.DataFrame,
         start_date: Optional[pd.Timestamp] = None,
-        end_date: Optional[pd.Timestamp] = None
+        end_date: Optional[pd.Timestamp] = None,
+        benchmark_data: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """
         生成目标持仓矩阵
@@ -817,6 +818,10 @@ class MultiFactorStrategy(BaseStrategy):
             开始日期
         end_date : Optional[pd.Timestamp]
             结束日期
+        benchmark_data : Optional[pd.DataFrame]
+            基准指数数据（如沪深300），用于大盘风控。
+            需包含 'close' 列，索引为 DatetimeIndex。
+            如果为 None，则跳过大盘风控逻辑。
         
         Returns
         -------
@@ -827,7 +832,12 @@ class MultiFactorStrategy(BaseStrategy):
         Examples
         --------
         >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
+        >>> # 不启用大盘风控
         >>> positions = strategy.generate_target_positions(factor_data)
+        >>> 
+        >>> # 启用大盘风控
+        >>> hs300_data = data_loader.fetch_index_price("000300", "2020-01-01", "2024-12-31")
+        >>> positions = strategy.generate_target_positions(factor_data, benchmark_data=hs300_data)
         >>> print(positions.sum(axis=1))  # 每日持仓数量
         """
         # 确定日期列
@@ -867,42 +877,42 @@ class MultiFactorStrategy(BaseStrategy):
         
         logger.info(f"调仓日期数量: {len(rebalance_dates)}")
 
-        # === 大盘风控准备 (新增) ===
+        # === 大盘风控准备 ===
         # 默认为 False (无风险)
         market_risk_series = pd.Series(False, index=all_dates)
         
-        if ak is not None:
+        if benchmark_data is not None and not benchmark_data.empty:
             try:
-                # 获取沪深300指数数据
-                # sh000300 是沪深300指数代码
-                index_df = ak.stock_zh_index_daily(symbol="sh000300")
+                index_df = benchmark_data.copy()
                 
-                if not index_df.empty:
-                    # 确保日期格式
-                    index_df['date'] = pd.to_datetime(index_df['date'])
-                    index_df.set_index('date', inplace=True)
-                    index_df.sort_index(inplace=True)
-                    
-                    # 计算20日均线
-                    index_df['ma20'] = index_df['close'].rolling(window=20).mean()
-                    
-                    # 对齐到策略日期范围
-                    # 使用 ffill 填充非交易日的空缺 (如果有的话)
-                    aligned_index = index_df.reindex(all_dates, method='ffill')
-                    
-                    # 判断风控条件：收盘价 < 20日均线
-                    # 只有当数据存在且满足条件时才为 True
-                    # 如果数据缺失 (NaN)，fillna(False) 视为无风险
-                    market_risk_series = (aligned_index['close'] < aligned_index['ma20']).fillna(False)
-                    
-                    logger.info("已加载沪深300数据并计算MA20风控指标")
-                else:
-                    logger.warning("获取到的沪深300数据为空，大盘风控未生效")
-                    
+                # 确保索引是 DatetimeIndex
+                if not isinstance(index_df.index, pd.DatetimeIndex):
+                    if 'date' in index_df.columns:
+                        index_df['date'] = pd.to_datetime(index_df['date'])
+                        index_df = index_df.set_index('date')
+                    else:
+                        index_df.index = pd.to_datetime(index_df.index)
+                
+                index_df = index_df.sort_index()
+                
+                # 计算20日均线
+                index_df['ma20'] = index_df['close'].rolling(window=20).mean()
+                
+                # 对齐到策略日期范围
+                # 使用 ffill 填充非交易日的空缺 (如果有的话)
+                aligned_index = index_df.reindex(all_dates, method='ffill')
+                
+                # 判断风控条件：收盘价 < 20日均线
+                # 只有当数据存在且满足条件时才为 True
+                # 如果数据缺失 (NaN)，fillna(False) 视为无风险
+                market_risk_series = (aligned_index['close'] < aligned_index['ma20']).fillna(False)
+                
+                logger.info("已使用传入的基准数据计算MA20风控指标")
+                
             except Exception as e:
-                logger.warning(f"无法获取大盘数据，风控功能暂时失效: {e}")
+                logger.warning(f"计算大盘风控指标失败: {e}，风控功能暂时失效")
         else:
-            logger.warning("未安装 AkShare，无法启用大盘风控")
+            logger.debug("未传入基准数据，大盘风控未启用")
         # ===========================
         
         # 初始化目标持仓矩阵

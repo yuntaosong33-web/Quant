@@ -4,7 +4,8 @@
 # 数据配置
 data:
   # 股票池: hs300(沪深300), zz500(中证500), all(全市场)
-  stock_pool: "hs300"
+  # 注意：使用 zz500 可减轻幸存者偏差，更适合中小资金量化
+  stock_pool: "zz500"
   
   # 历史数据开始日期
   start_date: "2020-01-01"
@@ -23,9 +24,10 @@ strategy:
   
   # 因子权重配置
   # Total_Score = value_weight * Value_Z + quality_weight * Quality_Z + momentum_weight * Momentum_Z
-  value_weight: 0.4      # 价值因子权重
-  quality_weight: 0.4    # 质量因子权重
-  momentum_weight: 0.2   # 动量因子权重
+  # 重要：为避免前视偏差（财务数据有滞后性），暂时禁用基本面因子，仅使用量价因子
+  value_weight: 0.0      # 价值因子权重 (禁用 - 避免前视偏差)
+  quality_weight: 0.0    # 质量因子权重 (禁用 - 避免前视偏差)
+  momentum_weight: 1.0   # 动量因子权重 (纯量价因子，无未来函数)
   
   # 选股参数
   top_n: 5              # 选取股票数量
@@ -112,6 +114,16 @@ report:
     sender: ""
     password: ""
     recipients: []
+
+# 消息推送配置
+notification:
+  # PushPlus 微信推送 (http://www.pushplus.plus/)
+  # Token 获取方式：注册 PushPlus 账号后，在个人中心获取
+  # 也可通过环境变量 PUSHPLUS_TOKEN 配置（优先级更高）
+  pushplus_token: "c71a6a03122e41e3b0b691693748c0ce"
+  
+  # 是否启用推送
+  enabled: true
 
 # 日志配置
 logging:
