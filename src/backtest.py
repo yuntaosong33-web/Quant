@@ -112,7 +112,8 @@ class BacktestEngine:
         
         # 回测参数
         self._initial_capital = self.config.get("initial_capital", 300000)
-        self._commission = self.config.get("commission", 0.0003)  # 标准A股费率
+        self._commission = self.config.get("commission", 0.0003)  # 标准A股费率（万分之三）
+        self._stamp_duty = self.config.get("stamp_duty", 0.001)  # 印花税（千分之一，仅卖出时收取）
         self._slippage = self.config.get("slippage", 0.001)
         self._risk_free_rate = self.config.get("risk_free_rate", 0.03)
         
@@ -121,7 +122,9 @@ class BacktestEngine:
         
         logger.info(
             f"回测引擎初始化: 初始资金={self._initial_capital/10000:.1f}万, "
-            f"佣金={self._commission*10000:.1f}‱, 滑点={self._slippage*100:.2f}%"
+            f"佣金={self._commission*10000:.1f}‱ (最低{self.MIN_COMMISSION_CNY}元), "
+            f"印花税={self._stamp_duty*1000:.1f}‰ (仅卖出), "
+            f"滑点={self._slippage*100:.2f}%"
         )
     
     def run(
@@ -386,12 +389,16 @@ class BacktestEngine:
                     # 执行卖出
                     sell_value = sell_shares * price
                     
-                    # 计算卖出成本
+                    # ===== 小资金实盘优化：精确计算卖出成本 =====
+                    # 1. 佣金：max(5元最低佣金, 交易额 * 万分之三)
                     commission = max(self.MIN_COMMISSION_CNY, sell_value * self._commission)
+                    # 2. 印花税：仅卖出时收取（千分之一）
+                    stamp_duty = sell_value * self._stamp_duty
+                    # 3. 滑点成本
                     slippage_cost = sell_value * self._slippage
                     
-                    # 更新现金和持仓
-                    net_proceeds = sell_value - commission - slippage_cost
+                    # 更新现金和持仓（卖出所得 = 成交额 - 佣金 - 印花税 - 滑点）
+                    net_proceeds = sell_value - commission - stamp_duty - slippage_cost
                     cash += net_proceeds
                     shares[stock] = target
                     
@@ -404,6 +411,7 @@ class BacktestEngine:
                         'price': price,
                         'value': sell_value,
                         'commission': commission,
+                        'stamp_duty': stamp_duty,  # 新增：印花税记录
                         'slippage': slippage_cost,
                         'net_proceeds': net_proceeds
                     })
@@ -433,10 +441,13 @@ class BacktestEngine:
                     blocked_buys += 1
                     continue  # 涨停无法买入
                 
-                # 计算买入成本
+                # ===== 小资金实盘优化：精确计算买入成本 =====
+                # 注意：印花税仅卖出时收取，买入不收
                 buy_value = buy_shares * price
+                # 佣金：max(5元最低佣金, 交易额 * 万分之三)
                 commission = max(self.MIN_COMMISSION_CNY, buy_value * self._commission)
                 slippage_cost = buy_value * self._slippage
+                # 买入总成本 = 成交额 + 佣金 + 滑点（无印花税）
                 total_cost = buy_value + commission + slippage_cost
                 
                 # 检查现金是否充足
@@ -466,6 +477,7 @@ class BacktestEngine:
                     'price': price,
                     'value': buy_value,
                     'commission': commission,
+                    'stamp_duty': 0.0,  # 买入不收印花税
                     'slippage': slippage_cost,
                     'total_cost': total_cost
                 })
@@ -881,6 +893,7 @@ class VBTProBacktester:
         fees: float = DEFAULT_FEES,
         fixed_amount: float = DEFAULT_FIXED_AMOUNT,
         slippage: float = 0.0,
+        stamp_duty: float = 0.001,
         risk_free_rate: float = RISK_FREE_RATE
     ) -> None:
         """
@@ -891,19 +904,27 @@ class VBTProBacktester:
         init_cash : float, optional
             初始资金，默认1000万
         fees : float, optional
-            交易费率（双边），默认万分之三 (0.0003)
-            模拟佣金+印花税均摊
+            交易费率（佣金），默认万分之三 (0.0003)
         fixed_amount : float, optional
             每次交易买入的固定金额，默认10万
         slippage : float, optional
             滑点，默认为0
+        stamp_duty : float, optional
+            印花税率（仅卖出时收取），默认千分之一 (0.001)
         risk_free_rate : float, optional
             无风险利率，用于计算夏普比率，默认3%
+        
+        Notes
+        -----
+        小资金实盘优化：
+        - 佣金执行 max(5元, 交易额 * fees) 规则
+        - 印花税仅在卖出时收取
         """
         self.init_cash = init_cash
         self.fees = fees
         self.fixed_amount = fixed_amount
         self.slippage = slippage
+        self.stamp_duty = stamp_duty  # 印花税（仅卖出）
         self.risk_free_rate = risk_free_rate
         
         # 回测结果缓存
@@ -1288,11 +1309,14 @@ class VBTProBacktester:
                 change = share_changes[col]
                 if change != 0:
                     trade_value = abs(change) * curr_prices[col]
-                    # 佣金 = max(5元, 交易额 * 费率)
+                    # ===== 小资金实盘优化：精确计算交易成本 =====
+                    # 1. 佣金：max(5元最低佣金, 交易额 * 万分之三)
                     commission = max(self.MIN_COMMISSION_CNY, trade_value * self.fees)
-                    # 滑点
+                    # 2. 印花税：仅卖出时收取（千分之一）
+                    stamp_duty = trade_value * self.stamp_duty if change < 0 else 0.0
+                    # 3. 滑点
                     slippage = trade_value * self.slippage
-                    trade_cost += commission + slippage
+                    trade_cost += commission + stamp_duty + slippage
             
             # 更新组合价值
             prev_total = portfolio_values[-1]

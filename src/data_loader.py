@@ -1474,6 +1474,172 @@ class DataLoader:
             include_financial=include_financial
         )
     
+    def fetch_multi_stock_data(
+        self,
+        symbols: List[str],
+        start_date: str,
+        end_date: str,
+        include_financial: bool = True,
+        n_jobs: Optional[int] = None
+    ) -> pd.DataFrame:
+        """
+        多线程批量获取股票数据并合并为面板数据
+        
+        针对全市场 5000+ 只股票的大规模数据拉取优化：
+        - 使用 ThreadPoolExecutor 并行下载
+        - 单个线程失败不影响整体任务
+        - 自动跳过无数据的股票
+        - 返回适合回测的面板格式 DataFrame
+        
+        Parameters
+        ----------
+        symbols : List[str]
+            股票代码列表
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        include_financial : bool, optional
+            是否包含财务指标（PE、PB、流通市值等），默认 True
+        n_jobs : Optional[int]
+            并发线程数。如果为 None，使用 self.max_workers
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的面板数据，包含列：
+            - date: 日期
+            - stock_code: 股票代码
+            - open, high, low, close, volume, amount: 价格/成交数据
+            - turn: 换手率
+            - pe_ttm, pb, circ_mv: 财务指标（如果 include_financial=True）
+        
+        Notes
+        -----
+        小资金实盘优化：
+        - 为激进型小市值策略设计，支持全市场 5000+ 股票并行下载
+        - 单个股票下载失败会记录警告日志但不中断整体流程
+        - 返回的 DataFrame 已按 (date, stock_code) 排序
+        
+        Examples
+        --------
+        >>> loader = DataLoader(max_workers=10)  # 增加并发数
+        >>> symbols = loader.get_all_a_stock_list()
+        >>> df = loader.fetch_multi_stock_data(symbols, "2023-01-01", "2024-12-31")
+        >>> print(f"获取 {df['stock_code'].nunique()} 只股票的数据")
+        """
+        n_workers = n_jobs if n_jobs is not None else self.max_workers
+        total = len(symbols)
+        
+        logger.info(
+            f"开始多线程批量获取: {total} 只股票, "
+            f"并发线程={n_workers}, 财务指标={include_financial}"
+        )
+        
+        # 用于存储成功获取的数据
+        all_data: List[pd.DataFrame] = []
+        success_count = 0
+        failed_count = 0
+        
+        def fetch_one(symbol: str) -> Optional[pd.DataFrame]:
+            """
+            获取单只股票数据（内部函数，用于并行执行）
+            
+            异常处理：任何异常都被捕获并记录，返回 None
+            """
+            try:
+                # 获取价格数据
+                df = self.fetch_daily_price(symbol, start_date, end_date)
+                
+                if df.empty:
+                    return None
+                
+                # 添加股票代码列
+                df = df.reset_index()
+                df['stock_code'] = symbol
+                
+                # 获取财务指标（可选）
+                if include_financial:
+                    try:
+                        fin_df = self.fetch_financial_indicator(symbol)
+                        if not fin_df.empty:
+                            df = self._merge_financial_data(df, fin_df)
+                    except Exception as e:
+                        # 财务指标获取失败不影响主数据
+                        logger.debug(f"{symbol} 财务指标获取失败: {e}")
+                
+                return df
+                
+            except TimeoutError:
+                logger.warning(f"{symbol} 下载超时，跳过")
+                return None
+            except ConnectionError as e:
+                logger.warning(f"{symbol} 网络错误: {e}，跳过")
+                return None
+            except Exception as e:
+                logger.warning(f"{symbol} 下载失败: {e}，跳过")
+                return None
+        
+        # 使用线程池并发获取
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            # 提交所有任务
+            future_to_symbol = {
+                executor.submit(fetch_one, symbol): symbol
+                for symbol in symbols
+            }
+            
+            # 处理完成的任务
+            completed = 0
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                completed += 1
+                
+                try:
+                    result = future.result(timeout=self.timeout)
+                    
+                    if result is not None and not result.empty:
+                        all_data.append(result)
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                        
+                except TimeoutError:
+                    failed_count += 1
+                    logger.warning(f"{symbol} 任务超时")
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"{symbol} 任务异常: {e}")
+                
+                # 进度日志（每50只或完成时）
+                if completed % 50 == 0 or completed == total:
+                    logger.info(
+                        f"下载进度: {completed}/{total} "
+                        f"(成功: {success_count}, 失败: {failed_count})"
+                    )
+        
+        # 合并所有数据
+        if not all_data:
+            logger.error("所有股票数据获取失败，返回空 DataFrame")
+            return pd.DataFrame()
+        
+        merged_df = pd.concat(all_data, ignore_index=True)
+        
+        # 确保日期列格式正确
+        if 'date' not in merged_df.columns and 'index' in merged_df.columns:
+            merged_df = merged_df.rename(columns={'index': 'date'})
+        
+        if 'date' in merged_df.columns:
+            merged_df['date'] = pd.to_datetime(merged_df['date'])
+            merged_df = merged_df.sort_values(['date', 'stock_code'])
+        
+        logger.info(
+            f"多线程批量获取完成: "
+            f"成功 {success_count}/{total} 只股票, "
+            f"共 {len(merged_df)} 条记录"
+        )
+        
+        return merged_df
+    
     def save_to_parquet(
         self,
         df: pd.DataFrame,

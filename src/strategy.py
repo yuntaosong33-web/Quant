@@ -890,22 +890,48 @@ class MultiFactorStrategy(BaseStrategy):
                 f"不支持的调仓频率: {frequency}，可选 'monthly' 或 'weekly'"
             )
     
+    # ===== 小资金实盘优化：流动性与可交易性过滤常量 =====
+    # 最低日成交额（元），低于此值的股票流动性不足
+    MIN_DAILY_AMOUNT = 20_000_000  # 2000万
+    # 涨停判断阈值（涨幅 >= 9.5% 视为涨停）
+    LIMIT_UP_THRESHOLD = 0.095
+    # 跌停判断阈值（跌幅 >= 9.5% 视为跌停）
+    LIMIT_DOWN_THRESHOLD = -0.095
+    # ST/退市股关键字
+    ST_KEYWORDS = ('ST', '*ST', '退', 'S', 'PT')
+    
     def filter_stocks(
         self,
         data: pd.DataFrame,
         date: pd.Timestamp
     ) -> pd.DataFrame:
         """
-        根据条件过滤股票
+        根据条件过滤股票（增强版：小资金实盘优化）
+        
+        针对激进型小市值策略的增强过滤，确保选出的股票：
+        1. 可交易（非涨跌停、非ST）
+        2. 有流动性（成交额足够）
+        3. 价格适中（能买入足够手数）
+        4. 上市足够久（非次新股）
         
         过滤条件：
-        1. 剔除涨跌停股票 (is_limit = True)
-        2. 剔除上市不满 6 个月的股票
+        1. 剔除涨跌停股票 (无法买入/卖出)
+        2. 剔除一字涨停股票 (High == Low 且涨幅 >= 9.5%)
+        3. 剔除流动性不足股票 (日成交额 < 2000万)
+        4. 剔除 ST/*ST/退市股票 (高风险标的)
+        5. 剔除高价股 (> 100元)
+        6. 剔除上市不满 6 个月的股票
         
         Parameters
         ----------
         data : pd.DataFrame
-            因子数据
+            因子数据，应包含以下列（部分可选）：
+            - close, high, low: 价格数据
+            - amount: 成交额
+            - pct_change 或 pctChg: 涨跌幅
+            - name 或 stock_name: 股票名称（用于ST过滤）
+            - is_limit: 涨跌停标志
+            - listing_days 或 list_date: 上市信息
         date : pd.Timestamp
             当前日期
         
@@ -913,6 +939,14 @@ class MultiFactorStrategy(BaseStrategy):
         -------
         pd.DataFrame
             过滤后的数据
+        
+        Notes
+        -----
+        小资金实盘优化说明：
+        - 30万资金持有3只股票，每只约10万
+        - 日成交额 < 2000万的股票，10万资金可能产生剧烈滑点
+        - 一字涨停股票实盘无法买入，必须剔除
+        - ST股票风险极高，不适合激进策略
         """
         # 获取当日数据
         if self.date_col in data.columns:
@@ -933,50 +967,129 @@ class MultiFactorStrategy(BaseStrategy):
             return day_data
         
         initial_count = len(day_data)
+        filter_stats = {}  # 记录各过滤条件剔除的数量
         
-        # 过滤条件1: 剔除涨跌停股票
+        # ==========================================
+        # 过滤条件 1: 剔除涨跌停股票（通用 is_limit 标志）
+        # ==========================================
         if 'is_limit' in day_data.columns:
+            before = len(day_data)
             day_data = day_data[~day_data['is_limit'].fillna(False)]
-            logger.debug(f"剔除涨跌停后剩余: {len(day_data)}/{initial_count}")
+            filter_stats['is_limit'] = before - len(day_data)
         
-        # 30万小资金账户适配：剔除高价股 (> 100元)
-        # 依据规则：确保每只股票能买入至少 2-3 手（200-300股）
-        # 30万资金，5只股票，每只约6万，100元股票可买600股
-        MAX_PRICE_LIMIT = 100.0
-        if 'close' in day_data.columns:
-            high_price_mask = day_data['close'] > MAX_PRICE_LIMIT
-            if high_price_mask.any():
-                excluded_count = high_price_mask.sum()
-                day_data = day_data[~high_price_mask]
-                logger.debug(f"剔除高价股(>{MAX_PRICE_LIMIT})后剩余: {len(day_data)} (剔除{excluded_count}只)")
-        else:
-            # 尝试查找其他可能的价格列名
-            price_col = next((col for col in ['price', 'close_price'] if col in day_data.columns), None)
-            if price_col:
-                high_price_mask = day_data[price_col] > MAX_PRICE_LIMIT
-                if high_price_mask.any():
-                    excluded_count = high_price_mask.sum()
-                    day_data = day_data[~high_price_mask]
-                    logger.debug(f"剔除高价股(>{MAX_PRICE_LIMIT})后剩余: {len(day_data)} (剔除{excluded_count}只)")
+        # ==========================================
+        # 过滤条件 2: 剔除一字涨停股票（买不进）
+        # 判断条件：High == Low 且 涨幅 >= 9.5%
+        # ==========================================
+        if 'high' in day_data.columns and 'low' in day_data.columns:
+            # 获取涨跌幅列（兼容多种列名）
+            pct_col = None
+            for col in ['pct_change', 'pctChg', 'change_pct', 'pct']:
+                if col in day_data.columns:
+                    pct_col = col
+                    break
+            
+            if pct_col:
+                # 一字涨停：最高价 == 最低价 且 涨幅 >= 9.5%
+                is_one_word_limit_up = (
+                    (day_data['high'] == day_data['low']) & 
+                    (day_data[pct_col] >= self.LIMIT_UP_THRESHOLD * 100)  # 假设百分比格式
+                )
+                
+                # 如果涨跌幅是小数格式（如 0.095）
+                if day_data[pct_col].abs().max() < 1:
+                    is_one_word_limit_up = (
+                        (day_data['high'] == day_data['low']) & 
+                        (day_data[pct_col] >= self.LIMIT_UP_THRESHOLD)
+                    )
+                
+                before = len(day_data)
+                day_data = day_data[~is_one_word_limit_up.fillna(False)]
+                filter_stats['一字涨停'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 3: 剔除流动性黑洞（日成交额 < 2000万）
+        # ==========================================
+        if 'amount' in day_data.columns:
+            before = len(day_data)
+            # 成交额可能是万元单位，统一转换
+            amount_col = day_data['amount']
+            # 判断单位：如果最大值 < 100万，可能是万元单位
+            if amount_col.max() < 1_000_000:
+                # 万元单位，转换为元
+                low_liquidity_mask = amount_col * 10000 < self.MIN_DAILY_AMOUNT
             else:
-                logger.warning(f"数据中缺少 'close' 列，无法执行高价股过滤")
+                # 元单位
+                low_liquidity_mask = amount_col < self.MIN_DAILY_AMOUNT
+            
+            day_data = day_data[~low_liquidity_mask]
+            filter_stats['流动性不足'] = before - len(day_data)
+        else:
+            logger.debug("数据中缺少 'amount' 列，跳过流动性过滤")
         
-        # 过滤条件2: 剔除上市不满 6 个月的股票
+        # ==========================================
+        # 过滤条件 4: 剔除 ST/*ST/退市股票
+        # ==========================================
+        name_col = None
+        for col in ['name', 'stock_name', '股票名称', 'sec_name']:
+            if col in day_data.columns:
+                name_col = col
+                break
+        
+        if name_col:
+            before = len(day_data)
+            # 构建 ST 过滤条件
+            st_mask = day_data[name_col].astype(str).apply(
+                lambda x: any(kw in x for kw in self.ST_KEYWORDS)
+            )
+            day_data = day_data[~st_mask]
+            filter_stats['ST/退市'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 5: 剔除高价股 (> 100元)
+        # 依据规则：确保每只股票能买入至少 2-3 手（200-300股）
+        # 30万资金，3只股票，每只约10万，100元股票可买1000股
+        # ==========================================
+        MAX_PRICE_LIMIT = 100.0
+        price_col = 'close'
+        if price_col not in day_data.columns:
+            price_col = next((col for col in ['price', 'close_price'] if col in day_data.columns), None)
+        
+        if price_col:
+            before = len(day_data)
+            high_price_mask = day_data[price_col] > MAX_PRICE_LIMIT
+            day_data = day_data[~high_price_mask]
+            filter_stats['高价股'] = before - len(day_data)
+        else:
+            logger.warning(f"数据中缺少价格列，无法执行高价股过滤")
+        
+        # ==========================================
+        # 过滤条件 6: 剔除上市不满 6 个月的股票
+        # ==========================================
+        before = len(day_data)
         if 'listing_days' in day_data.columns:
-            # 直接使用 listing_days 列
             day_data = day_data[day_data['listing_days'] >= self.min_listing_days]
         elif 'list_date' in day_data.columns:
-            # 从上市日期计算
             list_dates = pd.to_datetime(day_data['list_date'])
             listing_days = (date - list_dates).dt.days
             day_data = day_data[listing_days >= self.min_listing_days]
         elif 'ipo_date' in day_data.columns:
-            # 兼容 ipo_date 列名
             ipo_dates = pd.to_datetime(day_data['ipo_date'])
             listing_days = (date - ipo_dates).dt.days
             day_data = day_data[listing_days >= self.min_listing_days]
+        filter_stats['次新股'] = before - len(day_data)
         
-        logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 过滤后剩余 {len(day_data)} 只股票")
+        # 汇总日志
+        total_filtered = initial_count - len(day_data)
+        if total_filtered > 0:
+            filter_detail = ", ".join(f"{k}:{v}" for k, v in filter_stats.items() if v > 0)
+            logger.debug(
+                f"日期 {date.strftime('%Y-%m-%d')}: "
+                f"过滤 {total_filtered} 只 ({filter_detail}), "
+                f"剩余 {len(day_data)}/{initial_count}"
+            )
+        else:
+            logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 无股票被过滤, 剩余 {len(day_data)}")
         
         return day_data
     
