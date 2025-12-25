@@ -131,6 +131,20 @@ class DailyUpdateRunner:
         self.load_current_holdings()
         
         self.logger.info("DailyUpdateRunner 初始化完成")
+
+    def run_daily_update(self):
+        """
+        执行每日数据更新和策略回测的主流程
+        """
+        self.logger.info("开始执行每日更新任务...")
+
+        # 1. 获取数据 (示例逻辑)
+        # df = self.data_loader.get_data(...)
+
+        # 2. 执行策略
+        # self.strategy.execute(df)
+
+        self.logger.info("每日更新任务完成。")
     
     def _get_default_config(self) -> Dict[str, Any]:
         """获取默认配置"""
@@ -163,7 +177,7 @@ class DailyUpdateRunner:
     def _init_components(self) -> None:
         """初始化各组件"""
         # 数据加载器
-        self.data_loader = AkshareDataLoader()
+        self.data_loader = AkshareDataLoader(self.config)
         self.data_cleaner = AShareDataCleaner()
         
         # 增强版数据加载器（用于获取财务数据）
@@ -2688,5 +2702,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 初始化并运行
+    runner = DailyUpdateRunner()
+    runner.run_daily_update()
 
