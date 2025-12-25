@@ -231,10 +231,14 @@ class BacktestEngine:
         """
         简单回测实现（不依赖VectorBT）
         
+        增加跌停板卖出限制：
+        - 若股票当日跌停（low == close 且 涨跌幅 <= -9.5%），无法卖出
+        - 持有到下一个可交易日
+        
         Parameters
         ----------
         price_data : pd.DataFrame
-            价格数据
+            价格数据，可选包含 'low', 'high' 列用于跌停判断
         signals : pd.Series
             交易信号
         
@@ -245,8 +249,65 @@ class BacktestEngine:
         """
         close = price_data["close"]
         
-        # 计算持仓
-        position = signals.replace(0, np.nan).ffill().fillna(0)
+        # ========================================
+        # 跌停板检测（Limit Down Detection）
+        # ========================================
+        # A股跌停规则：
+        # - 主板/创业板（注册制前）：-10%
+        # - ST股：-5%
+        # - 科创板/创业板（注册制后）：-20%
+        # 
+        # 简化判断条件：
+        # 1. low == close（一字跌停或收盘跌停）
+        # 2. pct_change <= -9.5%（考虑涨跌幅限制的通用阈值）
+        # 
+        # 跌停时无法卖出，必须持有到下一个可交易日
+        is_limit_down = pd.Series(False, index=close.index)
+        
+        if 'low' in price_data.columns:
+            pct_change = close.pct_change()
+            
+            # 跌停判断：最低价 == 收盘价 且 跌幅 >= 9.5%
+            is_limit_down = (
+                (price_data['low'] == close) & 
+                (pct_change <= -0.095)
+            ).fillna(False)
+            
+            limit_down_days = is_limit_down.sum()
+            if limit_down_days > 0:
+                logger.info(f"检测到 {limit_down_days} 个跌停交易日，卖出信号将被延迟")
+        
+        # ========================================
+        # 处理跌停日卖出限制
+        # ========================================
+        # 修正信号：如果当日跌停且有卖出信号，延迟卖出
+        adjusted_signals = signals.copy()
+        
+        # 找到需要延迟卖出的日期
+        sell_signals = (signals == -1)
+        blocked_sells = sell_signals & is_limit_down
+        
+        if blocked_sells.any():
+            blocked_count = blocked_sells.sum()
+            logger.info(f"因跌停限制，{blocked_count} 次卖出信号被延迟")
+            
+            # 将被阻止的卖出信号改为持有（0）
+            adjusted_signals = adjusted_signals.where(~blocked_sells, 0)
+            
+            # 将卖出信号延迟到下一个非跌停日
+            for idx in blocked_sells[blocked_sells].index:
+                # 找到下一个可交易日（非跌停）
+                future_dates = is_limit_down.loc[idx:].iloc[1:]  # 排除当日
+                if len(future_dates) > 0:
+                    non_limit_down = future_dates[~future_dates]
+                    if len(non_limit_down) > 0:
+                        next_tradable = non_limit_down.index[0]
+                        # 只有当该日没有其他信号时才设置卖出
+                        if adjusted_signals.loc[next_tradable] == 0:
+                            adjusted_signals.loc[next_tradable] = -1
+        
+        # 使用调整后的信号计算持仓
+        position = adjusted_signals.replace(0, np.nan).ffill().fillna(0)
         position = position.clip(-1, 1)
         
         # 计算毛收益 (不含成本)
@@ -823,12 +884,14 @@ class VBTProBacktester:
         self,
         close: pd.DataFrame,
         entries: pd.DataFrame,
-        exits: Optional[pd.DataFrame] = None
+        exits: Optional[pd.DataFrame] = None,
+        low: Optional[pd.DataFrame] = None
     ) -> Dict[str, Any]:
         """
         不依赖VectorBT的回测实现
         
         实现A股"最低5元佣金"规则，确保小资金账户回测准确性。
+        增加跌停板卖出限制。
         
         Parameters
         ----------
@@ -838,13 +901,15 @@ class VBTProBacktester:
             买入信号
         exits : Optional[pd.DataFrame]
             卖出信号
+        low : Optional[pd.DataFrame]
+            最低价（用于跌停判断）
         
         Returns
         -------
         Dict[str, Any]
             回测结果
         """
-        logger.info("使用内置回测引擎（含最低5元佣金规则）...")
+        logger.info("使用内置回测引擎（含最低5元佣金规则、跌停限制）...")
         
         entries = entries.astype(bool)
         if exits is None:
@@ -852,19 +917,58 @@ class VBTProBacktester:
         else:
             exits = exits.astype(bool)
         
+        # ========================================
+        # 跌停板检测（Limit Down Detection）
+        # ========================================
+        is_limit_down = pd.DataFrame(False, index=close.index, columns=close.columns)
+        
+        if low is not None:
+            pct_change = close.pct_change()
+            # 跌停判断：最低价 == 收盘价 且 跌幅 >= 9.5%
+            is_limit_down = (low == close) & (pct_change <= -0.095)
+            is_limit_down = is_limit_down.fillna(False)
+            
+            limit_down_count = is_limit_down.sum().sum()
+            if limit_down_count > 0:
+                logger.info(f"检测到 {limit_down_count} 次跌停，卖出信号将被延迟处理")
+        
         # 计算每只股票的持仓状态 (1=持有, 0=空仓)
+        # 增加跌停卖出限制
         position = pd.DataFrame(0, index=close.index, columns=close.columns)
+        blocked_exits_count = 0
         
         for col in close.columns:
             pos = 0
             positions = []
+            pending_exit = False  # 标记是否有待执行的卖出
+            
             for i in range(len(close)):
+                # 检查是否有待执行的卖出（上一日因跌停被阻止）
+                if pending_exit:
+                    if not is_limit_down.iloc[i][col]:
+                        # 非跌停日，执行延迟的卖出
+                        pos = 0
+                        pending_exit = False
+                    # 跌停日继续持有
+                
+                # 处理当日信号
                 if entries.iloc[i][col] and pos == 0:
                     pos = 1
+                    pending_exit = False  # 买入后取消待执行的卖出
                 elif exits.iloc[i][col] and pos == 1:
-                    pos = 0
+                    # 检查是否跌停
+                    if is_limit_down.iloc[i][col]:
+                        # 跌停无法卖出，标记待执行卖出
+                        pending_exit = True
+                        blocked_exits_count += 1
+                    else:
+                        pos = 0
+                
                 positions.append(pos)
             position[col] = positions
+        
+        if blocked_exits_count > 0:
+            logger.info(f"因跌停限制，{blocked_exits_count} 次卖出被延迟")
         
         # 计算收益率
         returns = close.pct_change().fillna(0)
@@ -935,6 +1039,7 @@ class VBTProBacktester:
             "portfolio": None,
             "final_value": float(portfolio_value.iloc[-1]),
             "init_cash": self.init_cash,
+            "blocked_exits": blocked_exits_count,
         }
     
     def get_portfolio_value(self) -> pd.Series:

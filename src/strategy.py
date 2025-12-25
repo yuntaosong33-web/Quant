@@ -106,6 +106,11 @@ class BaseStrategy(ABC):
         self._stop_loss = self.config.get("stop_loss", 0.08)
         self._take_profit = self.config.get("take_profit", 0.20)
         
+        # ATR 动态止损参数
+        self._use_atr_stop_loss = self.config.get("use_atr_stop_loss", True)
+        self._atr_period = self.config.get("atr_period", 14)
+        self._atr_multiplier = self.config.get("atr_multiplier", 2.5)
+        
         logger.info(f"策略 '{name}' 初始化完成")
     
     @abstractmethod
@@ -206,6 +211,139 @@ class BaseStrategy(ABC):
         self._signals.clear()
         self._positions.clear()
         logger.info(f"策略 '{self.name}' 状态已重置")
+    
+    def calculate_atr(
+        self,
+        high: pd.Series,
+        low: pd.Series,
+        close: pd.Series,
+        period: int = 14
+    ) -> pd.Series:
+        """
+        计算 ATR（平均真实波幅）
+        
+        ATR = 过去 N 日 True Range 的移动平均
+        True Range = max(high - low, |high - prev_close|, |low - prev_close|)
+        
+        Parameters
+        ----------
+        high : pd.Series
+            最高价序列
+        low : pd.Series
+            最低价序列
+        close : pd.Series
+            收盘价序列
+        period : int, optional
+            计算周期，默认 14
+        
+        Returns
+        -------
+        pd.Series
+            ATR 值序列
+        """
+        prev_close = close.shift(1)
+        
+        # 计算 True Range
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # 计算 ATR（使用 EWM 或 SMA）
+        atr = true_range.rolling(window=period, min_periods=1).mean()
+        
+        return atr
+    
+    def calculate_dynamic_stop_loss(
+        self,
+        data: pd.DataFrame,
+        entry_prices: Optional[pd.Series] = None
+    ) -> pd.Series:
+        """
+        计算基于 ATR 的动态止损价格
+        
+        止损价 = 入场价 - ATR_Multiplier * ATR(14)
+        
+        对于30万小资金账户，使用 ATR 止损比固定百分比更适合：
+        - 波动大的股票止损更宽，避免被洗出
+        - 波动小的股票止损更紧，保护利润
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格数据，必须包含 high, low, close 列
+        entry_prices : Optional[pd.Series]
+            入场价格序列。如果为 None，使用收盘价作为参考
+        
+        Returns
+        -------
+        pd.Series
+            动态止损价格序列
+        
+        Examples
+        --------
+        >>> stop_prices = strategy.calculate_dynamic_stop_loss(ohlcv_data)
+        >>> # 检查是否触发止损
+        >>> triggered = data['close'] < stop_prices
+        
+        Notes
+        -----
+        默认配置：
+        - ATR 周期: 14 日
+        - ATR 乘数: 2.5
+        - 止损价 = 入场价 - 2.5 * ATR(14)
+        """
+        if not self._use_atr_stop_loss:
+            # 回退到固定百分比止损
+            entry = entry_prices if entry_prices is not None else data['close']
+            return entry * (1 - self._stop_loss)
+        
+        # 计算 ATR
+        atr = self.calculate_atr(
+            data['high'],
+            data['low'],
+            data['close'],
+            period=self._atr_period
+        )
+        
+        # 计算止损距离
+        stop_distance = self._atr_multiplier * atr
+        
+        # 计算止损价格
+        entry = entry_prices if entry_prices is not None else data['close']
+        stop_loss_price = entry - stop_distance
+        
+        # 确保止损价格不为负
+        stop_loss_price = stop_loss_price.clip(lower=0)
+        
+        return stop_loss_price
+    
+    def check_stop_loss_triggered(
+        self,
+        data: pd.DataFrame,
+        entry_prices: pd.Series,
+        current_prices: pd.Series
+    ) -> pd.Series:
+        """
+        检查是否触发动态止损
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格数据（用于计算 ATR）
+        entry_prices : pd.Series
+            入场价格
+        current_prices : pd.Series
+            当前价格
+        
+        Returns
+        -------
+        pd.Series
+            布尔序列，True 表示触发止损
+        """
+        stop_prices = self.calculate_dynamic_stop_loss(data, entry_prices)
+        return current_prices < stop_prices
 
 
 class MACrossStrategy(BaseStrategy):
@@ -956,7 +1094,7 @@ class MultiFactorStrategy(BaseStrategy):
             f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency})"
         )
 
-        # === 大盘风控准备 ===
+        # === 大盘风控准备（改进版：增加MA20斜率判断）===
         # 默认为 False (无风险)
         market_risk_series = pd.Series(False, index=all_dates)
         
@@ -977,16 +1115,32 @@ class MultiFactorStrategy(BaseStrategy):
                 # 计算20日均线
                 index_df['ma20'] = index_df['close'].rolling(window=20).mean()
                 
+                # ===== 改进：增加 MA20 斜率判断 =====
+                # 斜率 = (MA20_today - MA20_5days_ago) / 5
+                # 使用5日变化率来判断趋势方向
+                ma20_slope_period = 5
+                index_df['ma20_slope'] = (
+                    index_df['ma20'] - index_df['ma20'].shift(ma20_slope_period)
+                ) / ma20_slope_period
+                
                 # 对齐到策略日期范围
                 # 使用 ffill 填充非交易日的空缺 (如果有的话)
                 aligned_index = index_df.reindex(all_dates, method='ffill')
                 
-                # 判断风控条件：收盘价 < 20日均线
-                # 只有当数据存在且满足条件时才为 True
-                # 如果数据缺失 (NaN)，fillna(False) 视为无风险
-                market_risk_series = (aligned_index['close'] < aligned_index['ma20']).fillna(False)
+                # ===== 改进后的风控条件 =====
+                # 旧规则: close < ma20 (容易在震荡市产生频繁误判)
+                # 新规则: (close < ma20) AND (ma20_slope < 0)
+                # 只有当价格跌破均线 且 均线向下倾斜时才触发风控
+                # 这样可以避免震荡市中的频繁进出
                 
-                logger.info("已使用传入的基准数据计算MA20风控指标")
+                condition_below_ma20 = aligned_index['close'] < aligned_index['ma20']
+                condition_ma20_declining = aligned_index['ma20_slope'] < 0
+                
+                market_risk_series = (condition_below_ma20 & condition_ma20_declining).fillna(False)
+                
+                logger.info(
+                    "已使用改进版大盘风控: (Close < MA20) AND (MA20_Slope < 0)"
+                )
                 
             except Exception as e:
                 logger.warning(f"计算大盘风控指标失败: {e}，风控功能暂时失效")
@@ -1330,12 +1484,15 @@ class MultiFactorStrategy(BaseStrategy):
         risk_free_rate: float = 0.02,
         max_weight: Optional[float] = None,
         start_date: Optional[pd.Timestamp] = None,
-        end_date: Optional[pd.Timestamp] = None
+        end_date: Optional[pd.Timestamp] = None,
+        current_holdings_weights: Optional[Dict[str, float]] = None,
+        rebalance_threshold: float = 0.04
     ) -> pd.DataFrame:
         """
-        生成带权重的目标持仓矩阵
+        生成带权重的目标持仓矩阵（含再平衡缓冲区）
         
         每月最后一个交易日进行调仓，使用优化权重而非等权重。
+        为避免小资金账户支付最低5元佣金的成本，仅当权重变化超过阈值时才调整。
         
         Parameters
         ----------
@@ -1353,6 +1510,13 @@ class MultiFactorStrategy(BaseStrategy):
             开始日期
         end_date : Optional[pd.Timestamp]
             结束日期
+        current_holdings_weights : Optional[Dict[str, float]]
+            当前持仓权重字典，用于再平衡缓冲区计算。
+            如果为 None，则使用前一日的目标权重。
+        rebalance_threshold : float, optional
+            再平衡阈值，默认0.04（4%）。
+            仅当 |new_weight - current_weight| > 阈值时才调整该股票仓位。
+            用于避免小资金账户频繁交易产生最低5元佣金。
         
         Returns
         -------
@@ -1360,11 +1524,19 @@ class MultiFactorStrategy(BaseStrategy):
             权重 DataFrame，Index=Date, Columns=Symbol
             值为权重（0-1之间），0表示不持有
         
+        Notes
+        -----
+        再平衡缓冲区逻辑（适用于30万小资金账户）：
+        - 若新权重与旧权重差值 <= 4%，保持旧权重不变
+        - 避免因微小调整触发"最低5元佣金"规则
+        - 例：30万资金，4%权重 = 1.2万，按万三计算佣金仅3.6元，不足5元
+        
         Examples
         --------
         >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
         >>> weights = strategy.generate_target_weights(
-        ...     factor_data, prices_df, objective='max_sharpe'
+        ...     factor_data, prices_df, objective='max_sharpe',
+        ...     rebalance_threshold=0.04  # 4%缓冲区
         ... )
         >>> print(weights.sum(axis=1))  # 每日权重之和（应接近1）
         """
@@ -1408,7 +1580,8 @@ class MultiFactorStrategy(BaseStrategy):
         rebalance_dates = set(self.get_rebalance_dates(all_dates, self.rebalance_frequency))
         
         logger.info(
-            f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency})"
+            f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency}), "
+            f"再平衡阈值: {rebalance_threshold:.1%}"
         )
         
         # 初始化权重矩阵
@@ -1421,8 +1594,11 @@ class MultiFactorStrategy(BaseStrategy):
         target_weights.index.name = 'date'
         target_weights.columns.name = 'symbol'
         
-        # 当前权重
-        current_weights: Dict[str, float] = {}
+        # 当前权重（用于再平衡缓冲区）
+        current_weights: Dict[str, float] = current_holdings_weights.copy() if current_holdings_weights else {}
+        
+        # 统计跳过的调整次数
+        skipped_adjustments = 0
         
         for date in all_dates:
             if date in rebalance_dates:
@@ -1440,7 +1616,7 @@ class MultiFactorStrategy(BaseStrategy):
                             historical_prices = prices.iloc[:price_end_idx + 1]
                             
                             # 优化权重
-                            current_weights = self.optimize_weights(
+                            new_weights = self.optimize_weights(
                                 historical_prices,
                                 selected_stocks,
                                 objective=objective,
@@ -1448,12 +1624,43 @@ class MultiFactorStrategy(BaseStrategy):
                                 max_weight=max_weight
                             )
                         else:
-                            current_weights = self._equal_weights(selected_stocks)
+                            new_weights = self._equal_weights(selected_stocks)
+                        
+                        # ===== 再平衡缓冲区逻辑 =====
+                        # 仅当权重变化超过阈值时才更新
+                        final_weights: Dict[str, float] = {}
+                        
+                        # 获取所有涉及的股票（新选中 + 当前持有）
+                        all_involved_stocks = set(new_weights.keys()) | set(current_weights.keys())
+                        
+                        for stock in all_involved_stocks:
+                            new_w = new_weights.get(stock, 0.0)
+                            old_w = current_weights.get(stock, 0.0)
+                            weight_change = abs(new_w - old_w)
+                            
+                            if weight_change > rebalance_threshold:
+                                # 变化超过阈值，执行调整
+                                if new_w > 0:
+                                    final_weights[stock] = new_w
+                                # new_w == 0 表示清仓，不加入 final_weights
+                            else:
+                                # 变化未超过阈值，保持原权重
+                                if old_w > 0:
+                                    final_weights[stock] = old_w
+                                    skipped_adjustments += 1
+                        
+                        # 归一化权重（确保总和接近1）
+                        weight_sum = sum(final_weights.values())
+                        if weight_sum > 0:
+                            final_weights = {k: v / weight_sum for k, v in final_weights.items()}
+                        
+                        current_weights = final_weights
                         
                         logger.debug(
                             f"调仓日 {date.strftime('%Y-%m-%d')}: "
                             f"选中 {len(selected_stocks)} 只股票, "
-                            f"有效权重 {len(current_weights)}"
+                            f"最终持仓 {len(final_weights)} 只 "
+                            f"(跳过微调: {skipped_adjustments})"
                         )
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
@@ -1470,7 +1677,8 @@ class MultiFactorStrategy(BaseStrategy):
         logger.info(
             f"目标权重矩阵生成完成: "
             f"平均持仓 {n_holdings:.1f} 只, "
-            f"平均权重和 {avg_weight_sum:.4f}"
+            f"平均权重和 {avg_weight_sum:.4f}, "
+            f"跳过微调次数 {skipped_adjustments} (阈值: {rebalance_threshold:.1%})"
         )
         
         return target_weights
