@@ -1,0 +1,63 @@
+# 数据配置文件
+# A股量化交易系统 - Data Configuration
+
+# 数据源配置
+data_source:
+  provider: "akshare"  # 数据提供商
+  retry_times: 3       # 重试次数
+  retry_delay: 5       # 重试间隔（秒）
+  timeout: 30          # 超时时间（秒）
+
+# 股票池配置
+universe:
+  # 指数成分股
+  index_codes:
+    - "000300"  # 沪深300
+    - "000905"  # 中证500
+  
+  # 行业板块
+  sectors:
+    - "银行"
+    - "证券"
+    - "医药"
+    - "科技"
+  
+  # 过滤条件
+  filters:
+    min_market_cap: 10000000000  # 最小市值（100亿）
+    min_volume: 10000000         # 最小成交量
+    exclude_st: true             # 排除ST股票
+    exclude_new: 60              # 排除上市不足60天的新股
+
+# 数据字段
+fields:
+  daily:
+    - "open"
+    - "high"
+    - "low"
+    - "close"
+    - "volume"
+    - "amount"
+    - "turn"        # 换手率
+    - "pctChg"      # 涨跌幅
+  
+  fundamental:
+    - "pe_ttm"      # 市盈率TTM
+    - "pb"          # 市净率
+    - "ps_ttm"      # 市销率TTM
+    - "total_mv"    # 总市值
+    - "circ_mv"     # 流通市值
+
+# 数据存储配置
+storage:
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+  file_format: "parquet"  # 存储格式
+  compression: "snappy"   # 压缩算法
+
+# 数据更新配置
+update:
+  schedule: "daily"       # 更新频率
+  update_time: "18:00"    # 更新时间
+  incremental: true       # 增量更新
+

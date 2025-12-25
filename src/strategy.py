@@ -1,0 +1,1300 @@
+"""
+策略逻辑实现模块
+
+该模块定义交易策略的抽象接口和具体实现，支持多种策略类型。
+使用抽象基类确保策略的一致性和可扩展性。
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class SignalType(Enum):
+    """交易信号类型枚举"""
+    BUY = 1
+    SELL = -1
+    HOLD = 0
+
+
+@dataclass
+class TradeSignal:
+    """
+    交易信号数据类
+    
+    Attributes
+    ----------
+    timestamp : pd.Timestamp
+        信号时间
+    symbol : str
+        股票代码
+    signal_type : SignalType
+        信号类型
+    price : float
+        信号价格
+    strength : float
+        信号强度 (0-1)
+    reason : str
+        信号原因说明
+    """
+    timestamp: pd.Timestamp
+    symbol: str
+    signal_type: SignalType
+    price: float
+    strength: float = 1.0
+    reason: str = ""
+
+
+class BaseStrategy(ABC):
+    """
+    策略抽象基类
+    
+    所有交易策略必须继承此类并实现抽象方法。
+    定义策略的基本接口和通用功能。
+    
+    Attributes
+    ----------
+    name : str
+        策略名称
+    config : Dict[str, Any]
+        策略配置参数
+    
+    Methods
+    -------
+    generate_signals(data)
+        生成交易信号
+    calculate_position_size(signal, portfolio_value)
+        计算仓位大小
+    on_data(data)
+        数据更新时的回调
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        初始化策略
+        
+        Parameters
+        ----------
+        name : str
+            策略名称
+        config : Optional[Dict[str, Any]]
+            策略配置参数
+        """
+        self.name = name
+        self.config = config or {}
+        self._signals: List[TradeSignal] = []
+        self._positions: Dict[str, float] = {}
+        
+        # 从配置加载参数
+        self._max_positions = self.config.get("max_positions", 10)
+        self._position_size = self.config.get("position_size", 0.1)
+        self._stop_loss = self.config.get("stop_loss", 0.08)
+        self._take_profit = self.config.get("take_profit", 0.20)
+        
+        logger.info(f"策略 '{name}' 初始化完成")
+    
+    @abstractmethod
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        """
+        生成交易信号
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含OHLCV和因子的数据框
+        
+        Returns
+        -------
+        pd.Series
+            信号序列，1表示买入，-1表示卖出，0表示持有
+        """
+        pass
+    
+    @abstractmethod
+    def calculate_position_size(
+        self,
+        signal: TradeSignal,
+        portfolio_value: float
+    ) -> float:
+        """
+        计算仓位大小
+        
+        Parameters
+        ----------
+        signal : TradeSignal
+            交易信号
+        portfolio_value : float
+            当前组合价值
+        
+        Returns
+        -------
+        float
+            建议仓位金额
+        """
+        pass
+    
+    def on_data(self, data: pd.DataFrame) -> Optional[TradeSignal]:
+        """
+        数据更新时的回调方法
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            最新数据
+        
+        Returns
+        -------
+        Optional[TradeSignal]
+            交易信号，如果没有信号则返回None
+        """
+        signals = self.generate_signals(data)
+        
+        if signals.iloc[-1] != 0:
+            signal = TradeSignal(
+                timestamp=data.index[-1],
+                symbol=data.get("symbol", "UNKNOWN"),
+                signal_type=SignalType.BUY if signals.iloc[-1] > 0 else SignalType.SELL,
+                price=data["close"].iloc[-1],
+                strength=abs(signals.iloc[-1]),
+            )
+            self._signals.append(signal)
+            return signal
+        
+        return None
+    
+    def get_signals_df(self) -> pd.DataFrame:
+        """
+        获取信号历史DataFrame
+        
+        Returns
+        -------
+        pd.DataFrame
+            信号历史记录
+        """
+        if not self._signals:
+            return pd.DataFrame()
+        
+        return pd.DataFrame([
+            {
+                "timestamp": s.timestamp,
+                "symbol": s.symbol,
+                "signal": s.signal_type.value,
+                "price": s.price,
+                "strength": s.strength,
+                "reason": s.reason,
+            }
+            for s in self._signals
+        ])
+    
+    def reset(self) -> None:
+        """重置策略状态"""
+        self._signals.clear()
+        self._positions.clear()
+        logger.info(f"策略 '{self.name}' 状态已重置")
+
+
+class MACrossStrategy(BaseStrategy):
+    """
+    双均线交叉策略
+    
+    当短期均线上穿长期均线时买入，下穿时卖出。
+    
+    Parameters
+    ----------
+    short_window : int
+        短期均线周期
+    long_window : int
+        长期均线周期
+    
+    Examples
+    --------
+    >>> config = {"short_window": 5, "long_window": 20}
+    >>> strategy = MACrossStrategy("MA Cross", config)
+    >>> signals = strategy.generate_signals(price_data)
+    """
+    
+    def __init__(
+        self,
+        name: str = "MA Cross Strategy",
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        初始化均线交叉策略
+        
+        Parameters
+        ----------
+        name : str
+            策略名称
+        config : Optional[Dict[str, Any]]
+            配置参数，包含 short_window 和 long_window
+        """
+        super().__init__(name, config)
+        self.short_window = self.config.get("short_window", 5)
+        self.long_window = self.config.get("long_window", 20)
+        
+        logger.info(
+            f"均线交叉策略参数: 短期={self.short_window}, 长期={self.long_window}"
+        )
+    
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        """
+        生成均线交叉信号
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格数据，必须包含 'close' 列
+        
+        Returns
+        -------
+        pd.Series
+            交易信号序列
+        """
+        close = data["close"]
+        
+        # 计算均线
+        short_ma = close.rolling(window=self.short_window, min_periods=1).mean()
+        long_ma = close.rolling(window=self.long_window, min_periods=1).mean()
+        
+        # 生成信号
+        signals = pd.Series(0, index=data.index)
+        
+        # 金叉买入信号
+        golden_cross = (short_ma > long_ma) & (short_ma.shift(1) <= long_ma.shift(1))
+        signals[golden_cross] = 1
+        
+        # 死叉卖出信号
+        death_cross = (short_ma < long_ma) & (short_ma.shift(1) >= long_ma.shift(1))
+        signals[death_cross] = -1
+        
+        return signals
+    
+    def calculate_position_size(
+        self,
+        signal: TradeSignal,
+        portfolio_value: float
+    ) -> float:
+        """
+        计算仓位大小
+        
+        使用固定比例仓位管理。
+        
+        Parameters
+        ----------
+        signal : TradeSignal
+            交易信号
+        portfolio_value : float
+            组合价值
+        
+        Returns
+        -------
+        float
+            建议仓位金额
+        """
+        base_size = portfolio_value * self._position_size
+        adjusted_size = base_size * signal.strength
+        
+        return adjusted_size
+
+
+class RSIStrategy(BaseStrategy):
+    """
+    RSI超买超卖策略
+    
+    当RSI低于超卖线时买入，高于超买线时卖出。
+    
+    Parameters
+    ----------
+    rsi_period : int
+        RSI计算周期
+    oversold : float
+        超卖阈值
+    overbought : float
+        超买阈值
+    """
+    
+    def __init__(
+        self,
+        name: str = "RSI Strategy",
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        初始化RSI策略
+        
+        Parameters
+        ----------
+        name : str
+            策略名称
+        config : Optional[Dict[str, Any]]
+            配置参数
+        """
+        super().__init__(name, config)
+        self.rsi_period = self.config.get("rsi_period", 14)
+        self.oversold = self.config.get("oversold", 30)
+        self.overbought = self.config.get("overbought", 70)
+    
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        """
+        生成RSI信号
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格数据
+        
+        Returns
+        -------
+        pd.Series
+            交易信号序列
+        """
+        close = data["close"]
+        
+        # 计算RSI
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        
+        avg_gain = gain.rolling(window=self.rsi_period, min_periods=1).mean()
+        avg_loss = loss.rolling(window=self.rsi_period, min_periods=1).mean()
+        
+        rs = avg_gain / avg_loss.replace(0, np.inf)
+        rsi = 100 - (100 / (1 + rs))
+        
+        # 生成信号
+        signals = pd.Series(0, index=data.index)
+        
+        # 超卖买入
+        oversold_signal = (rsi < self.oversold) & (rsi.shift(1) >= self.oversold)
+        signals[oversold_signal] = 1
+        
+        # 超买卖出
+        overbought_signal = (rsi > self.overbought) & (rsi.shift(1) <= self.overbought)
+        signals[overbought_signal] = -1
+        
+        return signals
+    
+    def calculate_position_size(
+        self,
+        signal: TradeSignal,
+        portfolio_value: float
+    ) -> float:
+        """计算仓位大小"""
+        return portfolio_value * self._position_size * signal.strength
+
+
+class CompositeStrategy(BaseStrategy):
+    """
+    组合策略
+    
+    将多个策略组合在一起，通过加权投票生成综合信号。
+    
+    Parameters
+    ----------
+    strategies : List[Tuple[BaseStrategy, float]]
+        策略和权重的列表
+    """
+    
+    def __init__(
+        self,
+        name: str = "Composite Strategy",
+        strategies: Optional[List[Tuple[BaseStrategy, float]]] = None,
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        初始化组合策略
+        
+        Parameters
+        ----------
+        name : str
+            策略名称
+        strategies : Optional[List[Tuple[BaseStrategy, float]]]
+            子策略和权重列表
+        config : Optional[Dict[str, Any]]
+            配置参数
+        """
+        super().__init__(name, config)
+        self.strategies = strategies or []
+        self.threshold = self.config.get("threshold", 0.5)
+    
+    def add_strategy(self, strategy: BaseStrategy, weight: float = 1.0) -> None:
+        """
+        添加子策略
+        
+        Parameters
+        ----------
+        strategy : BaseStrategy
+            子策略实例
+        weight : float
+            策略权重
+        """
+        self.strategies.append((strategy, weight))
+        logger.info(f"添加子策略: {strategy.name}, 权重: {weight}")
+    
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        """
+        生成组合信号
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格数据
+        
+        Returns
+        -------
+        pd.Series
+            加权组合信号
+        """
+        if not self.strategies:
+            return pd.Series(0, index=data.index)
+        
+        total_weight = sum(w for _, w in self.strategies)
+        weighted_signals = pd.Series(0.0, index=data.index)
+        
+        for strategy, weight in self.strategies:
+            signals = strategy.generate_signals(data)
+            weighted_signals += signals * (weight / total_weight)
+        
+        # 根据阈值转换为离散信号
+        final_signals = pd.Series(0, index=data.index)
+        final_signals[weighted_signals > self.threshold] = 1
+        final_signals[weighted_signals < -self.threshold] = -1
+        
+        return final_signals
+    
+    def calculate_position_size(
+        self,
+        signal: TradeSignal,
+        portfolio_value: float
+    ) -> float:
+        """计算仓位大小"""
+        return portfolio_value * self._position_size * signal.strength
+
+
+class MultiFactorStrategy(BaseStrategy):
+    """
+    多因子选股策略
+    
+    基于价值、质量和动量因子的综合打分进行选股。
+    每月最后一个交易日进行调仓，选取得分最高的 Top N 只股票。
+    
+    打分公式: Total_Score = 0.4 * Value_Z + 0.4 * Quality_Z + 0.2 * Momentum_Z
+    
+    Parameters
+    ----------
+    name : str
+        策略名称
+    config : Optional[Dict[str, Any]]
+        配置参数，包含：
+        - value_weight: 价值因子权重，默认0.4
+        - quality_weight: 质量因子权重，默认0.4
+        - momentum_weight: 动量因子权重，默认0.2
+        - top_n: 选取股票数量，默认30
+        - min_listing_days: 最小上市天数，默认126（约6个月）
+        - value_col: 价值因子列名
+        - quality_col: 质量因子列名
+        - momentum_col: 动量因子列名
+    
+    Attributes
+    ----------
+    value_weight : float
+        价值因子权重
+    quality_weight : float
+        质量因子权重
+    momentum_weight : float
+        动量因子权重
+    top_n : int
+        选取股票数量
+    min_listing_days : int
+        最小上市天数
+    
+    Examples
+    --------
+    >>> config = {
+    ...     "value_weight": 0.4,
+    ...     "quality_weight": 0.4,
+    ...     "momentum_weight": 0.2,
+    ...     "top_n": 30
+    ... }
+    >>> strategy = MultiFactorStrategy("Multi-Factor", config)
+    >>> target_positions = strategy.generate_target_positions(factor_data)
+    """
+    
+    def __init__(
+        self,
+        name: str = "Multi-Factor Strategy",
+        config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        初始化多因子策略
+        
+        Parameters
+        ----------
+        name : str
+            策略名称
+        config : Optional[Dict[str, Any]]
+            策略配置参数
+        """
+        super().__init__(name, config)
+        
+        # 因子权重配置
+        self.value_weight: float = self.config.get("value_weight", 0.4)
+        self.quality_weight: float = self.config.get("quality_weight", 0.4)
+        self.momentum_weight: float = self.config.get("momentum_weight", 0.2)
+        
+        # 选股参数配置
+        self.top_n: int = self.config.get("top_n", 30)
+        self.min_listing_days: int = self.config.get("min_listing_days", 126)  # 约6个月
+        
+        # 因子列名配置（支持自定义列名）
+        self.value_col: str = self.config.get("value_col", "value_zscore")
+        self.quality_col: str = self.config.get("quality_col", "quality_zscore")
+        self.momentum_col: str = self.config.get("momentum_col", "momentum_zscore")
+        
+        # 日期和股票列名配置
+        self.date_col: str = self.config.get("date_col", "date")
+        self.stock_col: str = self.config.get("stock_col", "stock_code")
+        
+        # 验证权重之和
+        weight_sum = self.value_weight + self.quality_weight + self.momentum_weight
+        if abs(weight_sum - 1.0) > 1e-6:
+            logger.warning(f"因子权重之和为 {weight_sum}，建议权重之和为 1.0")
+        
+        logger.info(
+            f"多因子策略初始化: 价值权重={self.value_weight}, "
+            f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
+            f"Top N={self.top_n}"
+        )
+    
+    def calculate_total_score(self, data: pd.DataFrame) -> pd.Series:
+        """
+        计算综合因子得分
+        
+        Total_Score = value_weight * Value_Z + quality_weight * Quality_Z 
+                    + momentum_weight * Momentum_Z
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含因子 Z-Score 的数据框
+        
+        Returns
+        -------
+        pd.Series
+            综合得分序列
+        
+        Notes
+        -----
+        - 缺失的因子值会被视为 0
+        - 使用向量化操作计算得分
+        """
+        total_score = pd.Series(0.0, index=data.index)
+        
+        # 价值因子
+        if self.value_col in data.columns:
+            total_score += self.value_weight * data[self.value_col].fillna(0)
+        else:
+            logger.warning(f"未找到价值因子列: {self.value_col}")
+        
+        # 质量因子
+        if self.quality_col in data.columns:
+            total_score += self.quality_weight * data[self.quality_col].fillna(0)
+        else:
+            logger.warning(f"未找到质量因子列: {self.quality_col}")
+        
+        # 动量因子
+        if self.momentum_col in data.columns:
+            total_score += self.momentum_weight * data[self.momentum_col].fillna(0)
+        else:
+            logger.warning(f"未找到动量因子列: {self.momentum_col}")
+        
+        return total_score
+    
+    def get_month_end_dates(self, dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """
+        获取每月最后一个交易日
+        
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex
+            所有交易日期
+        
+        Returns
+        -------
+        pd.DatetimeIndex
+            每月最后一个交易日
+        """
+        dates_series = pd.Series(dates, index=dates)
+        # 按年月分组，取每组最后一个日期
+        month_end_dates = dates_series.groupby(
+            [dates_series.index.year, dates_series.index.month]
+        ).last()
+        
+        return pd.DatetimeIndex(month_end_dates.values)
+    
+    def filter_stocks(
+        self,
+        data: pd.DataFrame,
+        date: pd.Timestamp
+    ) -> pd.DataFrame:
+        """
+        根据条件过滤股票
+        
+        过滤条件：
+        1. 剔除涨跌停股票 (is_limit = True)
+        2. 剔除上市不满 6 个月的股票
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            因子数据
+        date : pd.Timestamp
+            当前日期
+        
+        Returns
+        -------
+        pd.DataFrame
+            过滤后的数据
+        """
+        # 获取当日数据
+        if self.date_col in data.columns:
+            day_data = data[data[self.date_col] == date].copy()
+        elif isinstance(data.index, pd.DatetimeIndex):
+            day_data = data.loc[data.index == date].copy()
+        elif isinstance(data.index, pd.MultiIndex):
+            # MultiIndex: (date, stock_code)
+            if date in data.index.get_level_values(0):
+                day_data = data.loc[date].copy()
+            else:
+                day_data = pd.DataFrame()
+        else:
+            logger.warning(f"无法获取日期 {date} 的数据")
+            return pd.DataFrame()
+        
+        if day_data.empty:
+            return day_data
+        
+        initial_count = len(day_data)
+        
+        # 过滤条件1: 剔除涨跌停股票
+        if 'is_limit' in day_data.columns:
+            day_data = day_data[~day_data['is_limit'].fillna(False)]
+            logger.debug(f"剔除涨跌停后剩余: {len(day_data)}/{initial_count}")
+        
+        # 过滤条件2: 剔除上市不满 6 个月的股票
+        if 'listing_days' in day_data.columns:
+            # 直接使用 listing_days 列
+            day_data = day_data[day_data['listing_days'] >= self.min_listing_days]
+        elif 'list_date' in day_data.columns:
+            # 从上市日期计算
+            list_dates = pd.to_datetime(day_data['list_date'])
+            listing_days = (date - list_dates).dt.days
+            day_data = day_data[listing_days >= self.min_listing_days]
+        elif 'ipo_date' in day_data.columns:
+            # 兼容 ipo_date 列名
+            ipo_dates = pd.to_datetime(day_data['ipo_date'])
+            listing_days = (date - ipo_dates).dt.days
+            day_data = day_data[listing_days >= self.min_listing_days]
+        
+        logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 过滤后剩余 {len(day_data)} 只股票")
+        
+        return day_data
+    
+    def select_top_stocks(
+        self,
+        data: pd.DataFrame,
+        n: Optional[int] = None
+    ) -> List[str]:
+        """
+        选取得分最高的 Top N 只股票
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含因子数据的 DataFrame
+        n : Optional[int]
+            选取数量，默认使用 self.top_n
+        
+        Returns
+        -------
+        List[str]
+            选中的股票代码列表
+        """
+        n = n or self.top_n
+        
+        if data.empty:
+            return []
+        
+        # 计算综合得分
+        data = data.copy()
+        data['total_score'] = self.calculate_total_score(data)
+        
+        # 剔除得分为 NaN 的股票
+        valid_data = data.dropna(subset=['total_score'])
+        
+        if valid_data.empty:
+            return []
+        
+        # 选取 Top N
+        stock_col = self.stock_col if self.stock_col in valid_data.columns else 'symbol'
+        
+        if stock_col not in valid_data.columns:
+            # 尝试从索引获取股票代码
+            if isinstance(valid_data.index, pd.MultiIndex):
+                top_stocks = valid_data.nlargest(n, 'total_score').index.get_level_values(-1).tolist()
+            else:
+                top_stocks = valid_data.nlargest(n, 'total_score').index.tolist()
+        else:
+            top_stocks = valid_data.nlargest(n, 'total_score')[stock_col].tolist()
+        
+        return top_stocks
+    
+    def generate_target_positions(
+        self,
+        data: pd.DataFrame,
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None
+    ) -> pd.DataFrame:
+        """
+        生成目标持仓矩阵
+        
+        每月最后一个交易日进行调仓，选取 Total_Score 最高的 Top N 只股票。
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            因子数据，必须包含：
+            - 日期列（date 或 DatetimeIndex）
+            - 股票代码列（stock_code 或 symbol）
+            - 价值因子 Z-Score 列
+            - 质量因子 Z-Score 列
+            - 动量因子 Z-Score 列
+            - is_limit: 涨跌停标志（可选）
+            - listing_days 或 list_date: 上市天数/日期（可选）
+        start_date : Optional[pd.Timestamp]
+            开始日期
+        end_date : Optional[pd.Timestamp]
+            结束日期
+        
+        Returns
+        -------
+        pd.DataFrame
+            布尔型 DataFrame，Index=Date, Columns=Symbol
+            True 代表持有该股票
+        
+        Examples
+        --------
+        >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
+        >>> positions = strategy.generate_target_positions(factor_data)
+        >>> print(positions.sum(axis=1))  # 每日持仓数量
+        """
+        # 确定日期列
+        if self.date_col in data.columns:
+            dates_array = pd.to_datetime(data[self.date_col].unique())
+        elif isinstance(data.index, pd.DatetimeIndex):
+            dates_array = data.index.unique()
+        elif isinstance(data.index, pd.MultiIndex):
+            dates_array = data.index.get_level_values(0).unique()
+        else:
+            raise ValueError("无法确定日期列，请检查数据格式或配置 date_col")
+        
+        # 确定股票列
+        stock_col = self.stock_col if self.stock_col in data.columns else 'symbol'
+        if stock_col in data.columns:
+            all_stocks = data[stock_col].unique()
+        elif isinstance(data.index, pd.MultiIndex):
+            all_stocks = data.index.get_level_values(-1).unique()
+        else:
+            raise ValueError("无法确定股票代码列，请检查数据格式或配置 stock_col")
+        
+        # 排序日期
+        all_dates = pd.DatetimeIndex(sorted(dates_array))
+        
+        # 应用日期过滤
+        if start_date is not None:
+            all_dates = all_dates[all_dates >= start_date]
+        if end_date is not None:
+            all_dates = all_dates[all_dates <= end_date]
+        
+        if all_dates.empty:
+            logger.warning("过滤后无有效日期")
+            return pd.DataFrame()
+        
+        # 获取调仓日期（每月最后一个交易日）
+        rebalance_dates = set(self.get_month_end_dates(all_dates))
+        
+        logger.info(f"调仓日期数量: {len(rebalance_dates)}")
+        
+        # 初始化目标持仓矩阵
+        target_positions = pd.DataFrame(
+            False,
+            index=all_dates,
+            columns=sorted(all_stocks),
+            dtype=bool
+        )
+        target_positions.index.name = 'date'
+        target_positions.columns.name = 'symbol'
+        
+        # 当前持仓
+        current_holdings: List[str] = []
+        
+        for date in all_dates:
+            if date in rebalance_dates:
+                # 调仓日: 重新选股
+                filtered_data = self.filter_stocks(data, date)
+                
+                if not filtered_data.empty:
+                    current_holdings = self.select_top_stocks(filtered_data)
+                    logger.debug(
+                        f"调仓日 {date.strftime('%Y-%m-%d')}: "
+                        f"选中 {len(current_holdings)} 只股票"
+                    )
+                else:
+                    logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
+            
+            # 设置当日持仓
+            for stock in current_holdings:
+                if stock in target_positions.columns:
+                    target_positions.loc[date, stock] = True
+        
+        # 统计信息
+        total_trades = (target_positions.astype(int).diff().abs().sum().sum()) // 2
+        avg_holdings = target_positions.sum(axis=1).mean()
+        logger.info(
+            f"目标持仓矩阵生成完成: "
+            f"日期范围 {all_dates[0].strftime('%Y-%m-%d')} ~ {all_dates[-1].strftime('%Y-%m-%d')}, "
+            f"平均持仓 {avg_holdings:.1f} 只, 预计换手次数 {total_trades:.0f}"
+        )
+        
+        return target_positions
+    
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        """
+        生成交易信号（兼容基类接口）
+        
+        对于多因子策略，主要使用 generate_target_positions 方法。
+        此方法提供简化的单股票信号生成，用于兼容基类接口。
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            价格和因子数据
+        
+        Returns
+        -------
+        pd.Series
+            交易信号序列，1=买入，-1=卖出，0=持有
+        """
+        # 检查是否有所需因子列
+        has_factors = all(
+            col in data.columns
+            for col in [self.value_col, self.quality_col, self.momentum_col]
+        )
+        
+        if not has_factors:
+            logger.warning("数据中缺少因子列，返回空信号")
+            return pd.Series(0, index=data.index)
+        
+        # 计算综合得分
+        total_score = self.calculate_total_score(data)
+        
+        # 基于分位数生成信号
+        signals = pd.Series(0, index=data.index)
+        
+        # 高分（Top 10%）买入
+        high_threshold = total_score.quantile(0.9)
+        signals[total_score >= high_threshold] = 1
+        
+        # 低分（Bottom 10%）卖出
+        low_threshold = total_score.quantile(0.1)
+        signals[total_score <= low_threshold] = -1
+        
+        return signals
+    
+    def calculate_position_size(
+        self,
+        signal: TradeSignal,
+        portfolio_value: float
+    ) -> float:
+        """
+        计算仓位大小
+        
+        使用等权重分配策略，每只股票分配相等的资金。
+        
+        Parameters
+        ----------
+        signal : TradeSignal
+            交易信号
+        portfolio_value : float
+            组合总价值
+        
+        Returns
+        -------
+        float
+            建议仓位金额
+        """
+        # 等权重分配
+        base_size = portfolio_value / self.top_n
+        adjusted_size = base_size * signal.strength
+        
+        return adjusted_size
+    
+    def get_rebalance_summary(
+        self,
+        target_positions: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        获取调仓汇总信息
+        
+        Parameters
+        ----------
+        target_positions : pd.DataFrame
+            目标持仓矩阵
+        
+        Returns
+        -------
+        pd.DataFrame
+            调仓汇总，包含每个调仓日的买入/卖出股票数量
+        """
+        if target_positions.empty:
+            return pd.DataFrame()
+        
+        # 计算每日变化
+        position_change = target_positions.astype(int).diff()
+        
+        # 获取调仓日
+        rebalance_dates = self.get_month_end_dates(target_positions.index)
+        
+        summary_records = []
+        
+        for date in rebalance_dates:
+            if date not in position_change.index:
+                continue
+            
+            day_change = position_change.loc[date]
+            
+            # 买入股票（0 -> 1）
+            buy_stocks = day_change[day_change == 1].index.tolist()
+            
+            # 卖出股票（1 -> 0）
+            sell_stocks = day_change[day_change == -1].index.tolist()
+            
+            # 持有股票
+            hold_stocks = target_positions.loc[date][target_positions.loc[date]].index.tolist()
+            
+            summary_records.append({
+                'date': date,
+                'buy_count': len(buy_stocks),
+                'sell_count': len(sell_stocks),
+                'hold_count': len(hold_stocks),
+                'buy_stocks': buy_stocks,
+                'sell_stocks': sell_stocks,
+            })
+        
+        return pd.DataFrame(summary_records)
+    
+    # ==================== 权重优化 ====================
+    
+    def optimize_weights(
+        self,
+        prices: pd.DataFrame,
+        selected_stocks: List[str],
+        objective: str = "max_sharpe",
+        risk_free_rate: float = 0.02,
+        max_weight: Optional[float] = None,
+        min_weight: float = 0.0,
+        lookback_days: int = 252
+    ) -> Dict[str, float]:
+        """
+        使用 PyPortfolioOpt 优化投资组合权重
+        
+        基于选中股票的历史价格，计算最优权重配置。
+        
+        Parameters
+        ----------
+        prices : pd.DataFrame
+            价格数据，索引为日期，列为股票代码
+        selected_stocks : List[str]
+            选中的股票列表
+        objective : str, optional
+            优化目标，可选：
+            - 'max_sharpe': 最大夏普比率（默认）
+            - 'min_volatility': 最小波动率
+        risk_free_rate : float, optional
+            无风险利率，默认0.02（2%）
+        max_weight : Optional[float]
+            单只股票最大权重，默认0.05（5%）
+            如果为None，使用 1/top_n 或 0.05 中的较小值
+        min_weight : float, optional
+            单只股票最小权重，默认0.0
+        lookback_days : int, optional
+            回溯天数用于计算协方差，默认252
+        
+        Returns
+        -------
+        Dict[str, float]
+            优化后的权重字典，股票代码 -> 权重
+        
+        Examples
+        --------
+        >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
+        >>> weights = strategy.optimize_weights(
+        ...     prices_df, selected_stocks, objective='max_sharpe'
+        ... )
+        >>> print(weights)
+        
+        Notes
+        -----
+        - 使用 Ledoit-Wolf 压缩协方差矩阵以提高稳定性
+        - 单只股票权重默认不超过 5%
+        - 优化失败时返回等权重分配
+        """
+        try:
+            from pypfopt import EfficientFrontier, risk_models, expected_returns
+        except ImportError:
+            logger.warning(
+                "未安装 pypfopt，使用等权重分配。"
+                "安装命令: pip install pyportfolioopt"
+            )
+            return self._equal_weights(selected_stocks)
+        
+        # 设置默认最大权重
+        if max_weight is None:
+            max_weight = min(0.05, 1.0 / len(selected_stocks))
+        
+        # 过滤价格数据
+        available_stocks = [s for s in selected_stocks if s in prices.columns]
+        
+        if len(available_stocks) < 2:
+            logger.warning("可用股票数少于2，使用等权重分配")
+            return self._equal_weights(selected_stocks)
+        
+        # 获取回溯期价格数据
+        stock_prices = prices[available_stocks].tail(lookback_days).dropna(axis=1)
+        
+        if stock_prices.shape[1] < 2:
+            logger.warning("有效价格数据的股票数少于2，使用等权重分配")
+            return self._equal_weights(selected_stocks)
+        
+        try:
+            # 计算预期收益率
+            mu = expected_returns.mean_historical_return(stock_prices)
+            
+            # 使用 Ledoit-Wolf 压缩协方差矩阵
+            S = risk_models.CovarianceShrinkage(stock_prices).ledoit_wolf()
+            
+            # 创建有效边界优化器
+            ef = EfficientFrontier(
+                mu, S,
+                weight_bounds=(min_weight, max_weight)
+            )
+            
+            # 执行优化
+            if objective == "max_sharpe":
+                weights = ef.max_sharpe(risk_free_rate=risk_free_rate)
+            elif objective == "min_volatility":
+                weights = ef.min_volatility()
+            else:
+                raise ValueError(f"不支持的优化目标: {objective}")
+            
+            # 清理权重
+            clean_weights = ef.clean_weights(cutoff=1e-4, rounding=4)
+            
+            # 获取绩效指标
+            performance = ef.portfolio_performance(
+                verbose=False,
+                risk_free_rate=risk_free_rate
+            )
+            
+            logger.info(
+                f"权重优化完成 [{objective}]: "
+                f"预期收益 {performance[0]:.2%}, "
+                f"波动率 {performance[1]:.2%}, "
+                f"夏普比率 {performance[2]:.2f}"
+            )
+            
+            return clean_weights
+            
+        except Exception as e:
+            logger.warning(f"权重优化失败: {e}，使用等权重分配")
+            return self._equal_weights(available_stocks)
+    
+    def _equal_weights(self, stocks: List[str]) -> Dict[str, float]:
+        """
+        生成等权重分配
+        
+        Parameters
+        ----------
+        stocks : List[str]
+            股票列表
+        
+        Returns
+        -------
+        Dict[str, float]
+            等权重字典
+        """
+        if not stocks:
+            return {}
+        weight = 1.0 / len(stocks)
+        return {stock: weight for stock in stocks}
+    
+    def generate_target_weights(
+        self,
+        factor_data: pd.DataFrame,
+        prices: pd.DataFrame,
+        objective: str = "max_sharpe",
+        risk_free_rate: float = 0.02,
+        max_weight: Optional[float] = None,
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None
+    ) -> pd.DataFrame:
+        """
+        生成带权重的目标持仓矩阵
+        
+        每月最后一个交易日进行调仓，使用优化权重而非等权重。
+        
+        Parameters
+        ----------
+        factor_data : pd.DataFrame
+            因子数据
+        prices : pd.DataFrame
+            价格数据，索引为日期，列为股票代码
+        objective : str, optional
+            优化目标，默认 'max_sharpe'
+        risk_free_rate : float, optional
+            无风险利率，默认0.02
+        max_weight : Optional[float]
+            单只股票最大权重，默认0.05
+        start_date : Optional[pd.Timestamp]
+            开始日期
+        end_date : Optional[pd.Timestamp]
+            结束日期
+        
+        Returns
+        -------
+        pd.DataFrame
+            权重 DataFrame，Index=Date, Columns=Symbol
+            值为权重（0-1之间），0表示不持有
+        
+        Examples
+        --------
+        >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
+        >>> weights = strategy.generate_target_weights(
+        ...     factor_data, prices_df, objective='max_sharpe'
+        ... )
+        >>> print(weights.sum(axis=1))  # 每日权重之和（应接近1）
+        """
+        # 设置默认最大权重
+        if max_weight is None:
+            max_weight = min(0.05, 1.0 / self.top_n)
+        
+        # 确定日期列
+        if self.date_col in factor_data.columns:
+            dates_array = pd.to_datetime(factor_data[self.date_col].unique())
+        elif isinstance(factor_data.index, pd.DatetimeIndex):
+            dates_array = factor_data.index.unique()
+        elif isinstance(factor_data.index, pd.MultiIndex):
+            dates_array = factor_data.index.get_level_values(0).unique()
+        else:
+            raise ValueError("无法确定日期列")
+        
+        # 确定股票列
+        stock_col = self.stock_col if self.stock_col in factor_data.columns else 'symbol'
+        if stock_col in factor_data.columns:
+            all_stocks = factor_data[stock_col].unique()
+        elif isinstance(factor_data.index, pd.MultiIndex):
+            all_stocks = factor_data.index.get_level_values(-1).unique()
+        else:
+            raise ValueError("无法确定股票代码列")
+        
+        # 排序日期
+        all_dates = pd.DatetimeIndex(sorted(dates_array))
+        
+        # 应用日期过滤
+        if start_date is not None:
+            all_dates = all_dates[all_dates >= start_date]
+        if end_date is not None:
+            all_dates = all_dates[all_dates <= end_date]
+        
+        if all_dates.empty:
+            logger.warning("过滤后无有效日期")
+            return pd.DataFrame()
+        
+        # 获取调仓日期
+        rebalance_dates = set(self.get_month_end_dates(all_dates))
+        
+        logger.info(f"调仓日期数量: {len(rebalance_dates)}")
+        
+        # 初始化权重矩阵
+        target_weights = pd.DataFrame(
+            0.0,
+            index=all_dates,
+            columns=sorted(all_stocks),
+            dtype=float
+        )
+        target_weights.index.name = 'date'
+        target_weights.columns.name = 'symbol'
+        
+        # 当前权重
+        current_weights: Dict[str, float] = {}
+        
+        for date in all_dates:
+            if date in rebalance_dates:
+                # 调仓日: 重新选股并优化权重
+                filtered_data = self.filter_stocks(factor_data, date)
+                
+                if not filtered_data.empty:
+                    # 选取 Top N 股票
+                    selected_stocks = self.select_top_stocks(filtered_data)
+                    
+                    if selected_stocks:
+                        # 获取历史价格用于优化
+                        price_end_idx = prices.index.get_indexer([date], method='ffill')[0]
+                        if price_end_idx >= 0:
+                            historical_prices = prices.iloc[:price_end_idx + 1]
+                            
+                            # 优化权重
+                            current_weights = self.optimize_weights(
+                                historical_prices,
+                                selected_stocks,
+                                objective=objective,
+                                risk_free_rate=risk_free_rate,
+                                max_weight=max_weight
+                            )
+                        else:
+                            current_weights = self._equal_weights(selected_stocks)
+                        
+                        logger.debug(
+                            f"调仓日 {date.strftime('%Y-%m-%d')}: "
+                            f"选中 {len(selected_stocks)} 只股票, "
+                            f"有效权重 {len(current_weights)}"
+                        )
+                else:
+                    logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
+                    current_weights = {}
+            
+            # 设置当日权重
+            for stock, weight in current_weights.items():
+                if stock in target_weights.columns:
+                    target_weights.loc[date, stock] = weight
+        
+        # 统计信息
+        avg_weight_sum = target_weights.sum(axis=1).mean()
+        n_holdings = (target_weights > 0).sum(axis=1).mean()
+        logger.info(
+            f"目标权重矩阵生成完成: "
+            f"平均持仓 {n_holdings:.1f} 只, "
+            f"平均权重和 {avg_weight_sum:.4f}"
+        )
+        
+        return target_weights

@@ -1,0 +1,18 @@
+---
+alwaysApply: true
+---
+Role: Senior Quantitative Developer & Python Expert
+
+Rules:
+
+1. Type Hinting: All functions must have type hints (e.g., def calculate_rsi(prices: pd.Series, period: int) -> pd.Series:).
+
+2. Vectorization: Always prefer vectorized operations (NumPy/Pandas) over explicit for loops. If a loop is unavoidable, use numba.jit.
+
+3. Documentation: Use NumPy style docstrings for all classes and functions.
+
+4. Error Handling: Implement robust error handling for data ingestion (e.g., retries for API timeouts).
+
+5. Data Structure: Assume all time-series data utilizes Pandas DataFrame with DatetimeIndex.
+
+6. Library Preference: Use vectorbt for backtesting logic and akshare for data sourcing.

@@ -1,0 +1,138 @@
+# A股量化交易系统 - 策略配置文件
+# ===============================
+
+# 数据配置
+data:
+  # 股票池: hs300(沪深300), zz500(中证500), all(全市场)
+  stock_pool: "hs300"
+  
+  # 历史数据开始日期
+  start_date: "2020-01-01"
+  
+  # 每次增量更新的天数
+  update_days: 5
+  
+  # 数据存储路径
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+
+# 策略配置
+strategy:
+  # 策略名称
+  name: "Multi-Factor Strategy"
+  
+  # 因子权重配置
+  # Total_Score = value_weight * Value_Z + quality_weight * Quality_Z + momentum_weight * Momentum_Z
+  value_weight: 0.4      # 价值因子权重
+  quality_weight: 0.4    # 质量因子权重
+  momentum_weight: 0.2   # 动量因子权重
+  
+  # 选股参数
+  top_n: 30              # 选取股票数量
+  min_listing_days: 126  # 最小上市天数（约6个月）
+  
+  # 因子列名配置
+  value_col: "ep_ttm_zscore"
+  quality_col: "roe_stability_zscore"
+  momentum_col: "rsi_20_zscore"
+  
+  # 调仓频率: monthly(月度), weekly(周度)
+  rebalance_frequency: "monthly"
+
+# 投资组合配置
+portfolio:
+  # 总资金（元）
+  total_capital: 1000000
+  
+  # 单只股票最大权重
+  max_weight: 0.05
+  
+  # 单只股票最小权重
+  min_weight: 0.0
+  
+  # 无风险利率
+  risk_free_rate: 0.02
+  
+  # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率)
+  optimization_objective: "max_sharpe"
+  
+  # 协方差压缩方法: ledoit_wolf, oracle_approximating, exponential
+  shrinkage_type: "ledoit_wolf"
+  
+  # 预期收益率计算方法: mean_historical, ema_historical
+  returns_method: "mean_historical"
+  
+  # 协方差计算回溯天数
+  lookback_days: 252
+
+# 风险控制配置
+risk:
+  # 止损比例
+  stop_loss: 0.08
+  
+  # 止盈比例
+  take_profit: 0.20
+  
+  # 单日最大亏损比例
+  max_daily_loss: 0.05
+  
+  # 最大回撤限制
+  max_drawdown: 0.15
+
+# 交易配置
+trading:
+  # 交易费用（双边）
+  commission_rate: 0.001
+  
+  # 印花税（卖出时）
+  stamp_duty: 0.001
+  
+  # 滑点比例
+  slippage: 0.001
+  
+  # 最小交易单位（股）
+  min_trade_unit: 100
+
+# 报告配置
+report:
+  # 报告格式: markdown, html
+  format: "html"
+  
+  # 报告输出目录
+  output_dir: "reports"
+  
+  # 是否发送邮件通知
+  send_email: false
+  
+  # 邮件配置
+  email:
+    smtp_server: ""
+    smtp_port: 587
+    sender: ""
+    password: ""
+    recipients: []
+
+# 日志配置
+logging:
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  
+  # 日志文件目录
+  log_dir: "logs"
+  
+  # 日志文件保留天数
+  retention_days: 30
+
+# 回测配置
+backtest:
+  # 回测开始日期
+  start_date: "2023-01-01"
+  
+  # 回测结束日期
+  end_date: "2024-01-01"
+  
+  # 初始资金
+  initial_capital: 1000000
+  
+  # 基准指数
+  benchmark: "000300"  # 沪深300
