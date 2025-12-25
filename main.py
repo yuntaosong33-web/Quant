@@ -1847,6 +1847,120 @@ def run_daily_update(
         return False
 
 
+def _generate_backtest_factor_data(
+    price_data_dict: Dict[str, pd.DataFrame],
+    close_df: pd.DataFrame,
+    strategy_config: Dict[str, Any]
+) -> pd.DataFrame:
+    """
+    生成回测用因子数据（简化版）
+    
+    为避免前视偏差，仅使用量价因子：
+    - momentum_zscore: 基于 RSI_20 的动量因子
+    - value_zscore: 置为 0（无财务数据时）
+    - quality_zscore: 置为 0（无财务数据时）
+    
+    Parameters
+    ----------
+    price_data_dict : Dict[str, pd.DataFrame]
+        股票价格数据字典 {stock_code: DataFrame}
+    close_df : pd.DataFrame
+        收盘价矩阵 (Index=日期, Columns=股票代码)
+    strategy_config : Dict[str, Any]
+        策略配置
+    
+    Returns
+    -------
+    pd.DataFrame
+        因子数据，格式为 MultiIndex (date, stock_code) 或含 date/stock_code 列
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("生成回测因子数据（简化版，仅量价因子）...")
+    
+    factor_records = []
+    
+    # 计算 RSI_20 for 每只股票
+    def calculate_rsi(series: pd.Series, period: int = 20) -> pd.Series:
+        """计算 RSI 指标"""
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        
+        avg_gain = gain.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        
+        return rsi
+    
+    for stock_code, df in price_data_dict.items():
+        if df is None or df.empty or 'close' not in df.columns:
+            continue
+        
+        # 确保索引是日期类型
+        df = df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        
+        # 计算 RSI_20
+        rsi_20 = calculate_rsi(df['close'], period=20)
+        
+        for date in df.index:
+            rsi_val = rsi_20.get(date, np.nan) if date in rsi_20.index else np.nan
+            close_price = df.loc[date, 'close'] if date in df.index else np.nan
+            
+            factor_records.append({
+                'date': date,
+                'stock_code': stock_code,
+                'close': close_price,
+                'rsi_20': rsi_val,
+                # 模拟的财务因子（无实际财务数据时置为 0）
+                'ep_ttm': 0.0,
+                'roe_stability': 0.0,
+                # 估算上市天数（默认足够长以通过过滤）
+                'listing_days': 1000,
+                # 涨跌停标志（简化：默认无涨跌停）
+                'is_limit': False,
+            })
+    
+    if not factor_records:
+        logger.warning("无法生成因子数据")
+        return pd.DataFrame()
+    
+    factor_df = pd.DataFrame(factor_records)
+    
+    # Z-Score 标准化（按日期分组）
+    def zscore_by_date(group: pd.DataFrame, col: str) -> pd.Series:
+        """按日期分组计算 Z-Score"""
+        mean_val = group[col].mean()
+        std_val = group[col].std()
+        if std_val > 0:
+            return (group[col] - mean_val) / std_val
+        else:
+            return pd.Series(0.0, index=group.index)
+    
+    # 计算 RSI Z-Score（动量因子）
+    factor_df['momentum_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+        lambda g: zscore_by_date(g, 'rsi_20')
+    ).reset_index(level=0, drop=True)
+    
+    # 价值和质量因子置为 0（无财务数据）
+    factor_df['value_zscore'] = 0.0
+    factor_df['quality_zscore'] = 0.0
+    
+    # 填充 NaN
+    factor_df['momentum_zscore'] = factor_df['momentum_zscore'].fillna(0.0)
+    
+    logger.info(
+        f"因子数据生成完成: {len(factor_df)} 条记录, "
+        f"{factor_df['stock_code'].nunique()} 只股票, "
+        f"{factor_df['date'].nunique()} 个交易日"
+    )
+    
+    return factor_df
+
+
 def run_backtest(
     start_date: str,
     end_date: str,
@@ -1856,7 +1970,8 @@ def run_backtest(
     """
     运行策略回测
     
-    使用 BacktestEngine 对指定时间段的历史数据进行回测。
+    使用 BacktestEngine + MultiFactorStrategy 对指定时间段的历史数据进行回测。
+    支持大盘风控（通过 benchmark_data 传入基准指数数据）。
     
     Parameters
     ----------
@@ -1873,47 +1988,98 @@ def run_backtest(
     -------
     bool
         回测是否成功
+    
+    Notes
+    -----
+    回测流程：
+    1. 加载历史 OHLCV 数据
+    2. 获取基准指数数据（用于大盘风控）
+    3. 生成因子数据（RSI_20 动量因子，财务因子置为 0）
+    4. 使用 BacktestEngine 执行权重驱动回测
+    5. 生成回测报告
     """
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
     logger.info(f"开始回测: {start_date} ~ {end_date}")
+    logger.info("使用引擎: BacktestEngine (权重驱动 + 大盘风控)")
     logger.info("=" * 60)
     
     try:
-        # 加载配置
+        # ========================================
+        # Step 0: 加载配置
+        # ========================================
         if config is None:
             try:
                 config = load_config(CONFIG_PATH)
             except FileNotFoundError:
+                logger.warning(f"配置文件 {CONFIG_PATH} 不存在，使用默认配置")
                 config = {}
         
-        # 回测配置
+        # 提取配置
         backtest_config = config.get("backtest", {})
         portfolio_config = config.get("portfolio", {})
+        strategy_config = config.get("strategy", {})
+        data_config = config.get("data", {})
         
-        initial_capital = portfolio_config.get("total_capital", 1000000)
-        commission = config.get("trading", {}).get("commission_rate", 0.001)
+        initial_capital = portfolio_config.get("total_capital", 300000)
+        commission = config.get("trading", {}).get("commission_rate", 0.0003)
         slippage = config.get("trading", {}).get("slippage", 0.001)
         risk_free_rate = portfolio_config.get("risk_free_rate", 0.02)
+        optimization_objective = portfolio_config.get("optimization_objective", "equal_weight")
         
+        # 基准指数代码（默认中证500）
+        benchmark_code = backtest_config.get("benchmark", "000905")
+        
+        logger.info(f"回测配置: 初始资金=¥{initial_capital:,.0f}, 基准={benchmark_code}")
+        
+        # ========================================
         # Step 1: 加载历史数据
-        logger.info("Step 1/5: 加载历史数据")
+        # ========================================
+        logger.info("Step 1/6: 加载历史 OHLCV 数据")
         
         data_loader = DataLoader(output_dir=str(DATA_RAW_PATH))
         
-        # 获取股票列表
-        stock_list = data_loader.get_hs300_constituents()
+        # 获取股票列表（根据配置选择股票池）
+        stock_pool = data_config.get("stock_pool", "zz500")
+        
+        # 尝试获取指定股票池的成分股
+        # 注意：DataLoader 目前只实现了 get_hs300_constituents
+        # 对于中证500等其他指数，使用 AkShare 直接获取
+        stock_list = []
+        
+        if stock_pool == "zz500":
+            # 尝试使用 AkShare 直接获取中证500成分股
+            try:
+                import akshare as ak
+                df = ak.index_stock_cons(symbol="000905")
+                if df is not None and not df.empty:
+                    code_col = next((c for c in df.columns if '代码' in c), None)
+                    if code_col:
+                        stock_list = df[code_col].tolist()
+                        logger.info(f"获取中证500成分股成功，共 {len(stock_list)} 只")
+            except Exception as e:
+                logger.warning(f"获取中证500成分股失败: {e}")
+            
+            if not stock_list:
+                logger.warning("无法获取中证500成分股，尝试获取沪深300")
+                stock_list = data_loader.get_hs300_constituents()
+        elif stock_pool == "hs300":
+            stock_list = data_loader.get_hs300_constituents()
+        else:
+            stock_list = data_loader.get_hs300_constituents()
+        
         if not stock_list:
-            logger.warning("无法获取沪深300成分股，使用示例股票")
-            stock_list = ["000001", "000002", "600519", "601318", "000858"]
+            logger.warning("无法获取成分股列表，使用示例股票")
+            stock_list = ["000001", "000002", "600519", "601318", "000858",
+                         "000063", "000651", "000725", "002415", "600036"]
         
         # 限制回测股票数量（避免过长时间）
-        max_stocks = backtest_config.get("max_stocks", 50)
+        max_stocks = backtest_config.get("max_stocks", 100)
         stock_list = stock_list[:max_stocks]
-        logger.info(f"回测股票数量: {len(stock_list)}")
+        logger.info(f"股票池: {stock_pool}, 回测股票数量: {len(stock_list)}")
         
         # 下载历史数据
-        price_data_dict = {}
+        price_data_dict: Dict[str, pd.DataFrame] = {}
         start_fmt = start_date.replace("-", "")
         end_fmt = end_date.replace("-", "")
         
@@ -1925,7 +2091,7 @@ def run_backtest(
             except Exception as e:
                 logger.debug(f"获取 {stock} 数据失败: {e}")
             
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 20 == 0:
                 logger.info(f"数据加载进度: {i + 1}/{len(stock_list)}")
         
         if not price_data_dict:
@@ -1934,8 +2100,10 @@ def run_backtest(
         
         logger.info(f"成功加载 {len(price_data_dict)} 只股票的历史数据")
         
+        # ========================================
         # Step 2: 准备价格矩阵
-        logger.info("Step 2/5: 准备价格矩阵")
+        # ========================================
+        logger.info("Step 2/6: 准备价格矩阵")
         
         # 构建收盘价 DataFrame (行=日期, 列=股票)
         close_prices = {}
@@ -1952,26 +2120,95 @@ def run_backtest(
         
         logger.info(f"价格矩阵: {close_df.shape[0]} 天 x {close_df.shape[1]} 只股票")
         
-        # Step 3: 创建策略
-        logger.info("Step 3/5: 初始化策略")
+        # ========================================
+        # Step 3: 获取基准指数数据（用于大盘风控）
+        # ========================================
+        logger.info(f"Step 3/6: 获取基准指数数据 ({benchmark_code})")
         
-        strategy_config = config.get("strategy", {})
+        benchmark_data: Optional[pd.DataFrame] = None
+        
+        try:
+            benchmark_data = data_loader.fetch_index_price(
+                index_code=benchmark_code,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if benchmark_data is not None and not benchmark_data.empty:
+                logger.info(
+                    f"基准指数数据获取成功: {len(benchmark_data)} 条记录, "
+                    f"日期范围: {benchmark_data.index[0].strftime('%Y-%m-%d')} ~ "
+                    f"{benchmark_data.index[-1].strftime('%Y-%m-%d')}"
+                )
+            else:
+                logger.warning("基准指数数据为空，大盘风控将不生效")
+                benchmark_data = None
+                
+        except Exception as e:
+            logger.warning(f"获取基准指数数据失败: {e}，大盘风控将不生效")
+            benchmark_data = None
+        
+        # ========================================
+        # Step 4: 生成因子数据
+        # ========================================
+        logger.info("Step 4/6: 生成因子数据（简化版，仅量价因子）")
+        
+        factor_data = _generate_backtest_factor_data(
+            price_data_dict=price_data_dict,
+            close_df=close_df,
+            strategy_config=strategy_config
+        )
+        
+        if factor_data.empty:
+            logger.error("因子数据生成失败")
+            return False
+        
+        # ========================================
+        # Step 5: 初始化策略和引擎，执行回测
+        # ========================================
+        logger.info("Step 5/6: 初始化策略和引擎，执行回测")
         
         if strategy_type == "multi_factor":
-            # 多因子策略需要因子数据，这里使用简化版
-            # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子
+            # 多因子策略
+            # 从配置读取因子权重（如果财务因子不可用，动量权重会自动主导）
+            value_weight = strategy_config.get("value_weight", 0.0)
+            quality_weight = strategy_config.get("quality_weight", 0.0)
+            momentum_weight = strategy_config.get("momentum_weight", 1.0)
+            
+            # 如果财务因子权重非零但数据不可用，调整为纯动量策略
+            if value_weight > 0 or quality_weight > 0:
+                logger.warning(
+                    f"配置了财务因子权重 (value={value_weight}, quality={quality_weight})，"
+                    f"但回测模式下无财务数据，自动调整为纯动量策略 (momentum=1.0)"
+                )
+                value_weight = 0.0
+                quality_weight = 0.0
+                momentum_weight = 1.0
+            
             strategy = MultiFactorStrategy(
                 name="Multi-Factor Backtest",
                 config={
-                    "value_weight": strategy_config.get("value_weight", 0.0),
-                    "quality_weight": strategy_config.get("quality_weight", 0.0),
-                    "momentum_weight": strategy_config.get("momentum_weight", 1.0),
-                    "top_n": strategy_config.get("top_n", 30),
+                    "value_weight": value_weight,
+                    "quality_weight": quality_weight,
+                    "momentum_weight": momentum_weight,
+                    "top_n": strategy_config.get("top_n", 5),
+                    "min_listing_days": strategy_config.get("min_listing_days", 126),
+                    "rebalance_frequency": strategy_config.get("rebalance_frequency", "monthly"),
+                    "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.05),
+                    # 因子列名配置
+                    "value_col": "value_zscore",
+                    "quality_col": "quality_zscore",
+                    "momentum_col": "momentum_zscore",
+                    "date_col": "date",
+                    "stock_col": "stock_code",
                 }
             )
-            logger.info("使用多因子策略 (仅启用量价因子)")
+            logger.info(
+                f"使用多因子策略: value={value_weight}, quality={quality_weight}, "
+                f"momentum={momentum_weight}, top_n={strategy.top_n}"
+            )
         else:
-            # 均线交叉策略
+            # 均线交叉策略（不支持权重驱动回测，使用简化逻辑）
             strategy = MACrossStrategy(
                 name="MA Cross Backtest",
                 config={
@@ -1980,11 +2217,9 @@ def run_backtest(
                 }
             )
             logger.info("使用均线交叉策略")
+            logger.warning("均线策略暂不支持权重驱动回测，使用简化逻辑")
         
-        # Step 4: 运行回测
-        logger.info("Step 4/5: 执行回测")
-        
-        # 初始化回测引擎
+        # 初始化 BacktestEngine
         backtest_engine = BacktestEngine(config={
             "initial_capital": initial_capital,
             "commission": commission,
@@ -1992,70 +2227,61 @@ def run_backtest(
             "risk_free_rate": risk_free_rate,
         })
         
-        # 对于多股票回测，使用 VBTProBacktester
-        if len(close_df.columns) > 1:
-            logger.info("使用 VBTProBacktester 进行多股票回测")
+        logger.info(
+            f"BacktestEngine 初始化: 初始资金=¥{initial_capital:,.0f}, "
+            f"佣金={commission*10000:.1f}‱, 滑点={slippage*100:.2f}%"
+        )
+        
+        # 执行回测（权重驱动模式）
+        if strategy_type == "multi_factor":
+            logger.info("执行权重驱动回测...")
             
-            vbt_backtester = VBTProBacktester(
-                init_cash=initial_capital,
-                fees=commission,
-                fixed_amount=initial_capital / strategy_config.get("top_n", 30),
-                slippage=slippage,
-                risk_free_rate=risk_free_rate,
+            result = backtest_engine.run(
+                strategy=strategy,
+                price_data=close_df,
+                factor_data=factor_data,
+                objective=optimization_objective,
+                benchmark_data=benchmark_data  # 传入基准数据用于大盘风控
             )
-            
-            # 生成买入信号（使用简化策略：基于动量）
-            # 计算20日收益率排名，选择排名前30%的股票
-            returns_20d = close_df.pct_change(20)
-            
-            # 每月调仓信号
-            entries = pd.DataFrame(False, index=close_df.index, columns=close_df.columns)
-            
-            # 获取每月最后一个交易日
-            monthly_dates = close_df.resample('M').last().index
-            
-            for date in monthly_dates:
-                if date in returns_20d.index:
-                    day_returns = returns_20d.loc[date].dropna()
-                    if len(day_returns) > 0:
-                        # 选择收益率最高的 top_n 只股票
-                        top_n = min(strategy_config.get("top_n", 30), len(day_returns))
-                        top_stocks = day_returns.nlargest(top_n).index
-                        
-                        # 在该日期设置买入信号
-                        for stock in top_stocks:
-                            if stock in entries.columns and date in entries.index:
-                                entries.loc[date, stock] = True
-            
-            logger.info(f"生成买入信号完成，共 {entries.sum().sum():.0f} 个信号")
-            
-            # 运行回测
-            result = vbt_backtester.run(close_df, entries)
-            
-            # 提取结果
-            total_return = result.get('total_return', 0)
-            annual_return = result.get('annual_return', 0)
-            sharpe_ratio = result.get('sharpe_ratio', 0)
-            max_drawdown = result.get('max_drawdown', 0)
-            
-        else:
-            # 单股票回测
-            logger.info("使用 BacktestEngine 进行单股票回测")
-            
-            # 准备单股票数据
-            stock_code = close_df.columns[0]
-            price_df = price_data_dict[stock_code]
-            
-            # 运行回测
-            result = backtest_engine.run(strategy, price_df)
             
             total_return = result.total_return
             annual_return = result.annual_return
             sharpe_ratio = result.sharpe_ratio
             max_drawdown = result.max_drawdown
+            total_trades = result.total_trades
+            win_rate = result.win_rate
+            
+        else:
+            # MA Cross 策略使用简化回测
+            logger.warning("MA Cross 策略使用简化回测逻辑")
+            
+            # 使用第一只股票进行单股票回测演示
+            stock_code = list(price_data_dict.keys())[0]
+            single_price_df = price_data_dict[stock_code]
+            
+            # 生成信号
+            signals = strategy.generate_signals(single_price_df)
+            
+            # 简化计算收益
+            returns = single_price_df['close'].pct_change()
+            strategy_returns = returns * signals.shift(1)
+            
+            total_return = (1 + strategy_returns).prod() - 1
+            annual_return = (1 + total_return) ** (252 / len(strategy_returns)) - 1
+            sharpe_ratio = strategy_returns.mean() / strategy_returns.std() * np.sqrt(252) if strategy_returns.std() > 0 else 0
+            
+            cum_returns = (1 + strategy_returns).cumprod()
+            peak = cum_returns.expanding().max()
+            drawdown = (cum_returns - peak) / peak
+            max_drawdown = abs(drawdown.min())
+            
+            total_trades = (signals.diff().abs() > 0).sum()
+            win_rate = (strategy_returns > 0).sum() / len(strategy_returns) if len(strategy_returns) > 0 else 0
         
-        # Step 5: 生成回测报告
-        logger.info("Step 5/5: 生成回测报告")
+        # ========================================
+        # Step 6: 生成回测报告
+        # ========================================
+        logger.info("Step 6/6: 生成回测报告")
         
         report_content = _generate_backtest_report(
             start_date=start_date,
@@ -2076,18 +2302,26 @@ def run_backtest(
         
         logger.info(f"回测报告已保存至 {report_path}")
         
-        # 打印回测结果
+        # ========================================
+        # 打印回测结果摘要
+        # ========================================
         logger.info("=" * 60)
         logger.info("回测结果摘要")
         logger.info("=" * 60)
-        logger.info(f"策略名称: {strategy.name}")
-        logger.info(f"回测区间: {start_date} ~ {end_date}")
-        logger.info(f"股票数量: {len(close_df.columns)}")
-        logger.info(f"初始资金: ¥{initial_capital:,.0f}")
-        logger.info(f"总收益率: {total_return:.2%}")
-        logger.info(f"年化收益: {annual_return:.2%}")
-        logger.info(f"夏普比率: {sharpe_ratio:.2f}")
-        logger.info(f"最大回撤: {max_drawdown:.2%}")
+        logger.info(f"回测引擎:    BacktestEngine (权重驱动 + 大盘风控)")
+        logger.info(f"策略名称:    {strategy.name}")
+        logger.info(f"回测区间:    {start_date} ~ {end_date}")
+        logger.info(f"股票池:      {stock_pool} ({len(close_df.columns)} 只股票)")
+        logger.info(f"基准指数:    {benchmark_code} {'✓ 已启用风控' if benchmark_data is not None else '✗ 风控未启用'}")
+        logger.info("-" * 60)
+        logger.info(f"初始资金:    ¥{initial_capital:,.0f}")
+        logger.info(f"总收益率:    {total_return:.2%}")
+        logger.info(f"年化收益:    {annual_return:.2%}")
+        logger.info(f"夏普比率:    {sharpe_ratio:.2f}")
+        logger.info(f"最大回撤:    {max_drawdown:.2%}")
+        if strategy_type == "multi_factor":
+            logger.info(f"总交易次数:  {total_trades}")
+            logger.info(f"胜率:        {win_rate:.2%}")
         logger.info("=" * 60)
         
         return True
