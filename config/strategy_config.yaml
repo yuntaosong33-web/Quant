@@ -28,7 +28,7 @@ strategy:
   momentum_weight: 0.2   # 动量因子权重
   
   # 选股参数
-  top_n: 30              # 选取股票数量
+  top_n: 5              # 选取股票数量
   min_listing_days: 126  # 最小上市天数（约6个月）
   
   # 因子列名配置
@@ -42,10 +42,11 @@ strategy:
 # 投资组合配置
 portfolio:
   # 总资金（元）
-  total_capital: 1000000
+  total_capital: 300000
   
   # 单只股票最大权重
-  max_weight: 0.05
+  # 对于5只股票，建议设置为 0.25 或更高，以避免资金利用率不足
+  max_weight: 0.25
   
   # 单只股票最小权重
   min_weight: 0.0
@@ -132,7 +133,7 @@ backtest:
   end_date: "2024-01-01"
   
   # 初始资金
-  initial_capital: 1000000
+  initial_capital: 300000
   
   # 基准指数
   benchmark: "000300"  # 沪深300

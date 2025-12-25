@@ -136,9 +136,9 @@ class DailyUpdateRunner:
             },
             "strategy": {
                 "name": "Multi-Factor Strategy",
-                "value_weight": 0.4,
-                "quality_weight": 0.4,
-                "momentum_weight": 0.2,
+                "value_weight": 0.0,
+                "quality_weight": 0.0,
+                "momentum_weight": 1.0,
                 "top_n": 30,
                 "min_listing_days": 126,
             },
@@ -172,9 +172,10 @@ class DailyUpdateRunner:
         self.strategy = MultiFactorStrategy(
             name=strategy_config.get("name", "Multi-Factor Strategy"),
             config={
-                "value_weight": strategy_config.get("value_weight", 0.4),
-                "quality_weight": strategy_config.get("quality_weight", 0.4),
-                "momentum_weight": strategy_config.get("momentum_weight", 0.2),
+                # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子
+                "value_weight": strategy_config.get("value_weight", 0.0),
+                "quality_weight": strategy_config.get("quality_weight", 0.0),
+                "momentum_weight": strategy_config.get("momentum_weight", 1.0),
                 "top_n": strategy_config.get("top_n", 30),
                 "min_listing_days": strategy_config.get("min_listing_days", 126),
                 "value_col": "ep_ttm_zscore",
@@ -576,10 +577,16 @@ class DailyUpdateRunner:
         self.logger.info("开始计算因子...")
         
         try:
-            if self.ohlcv_data is None or self.financial_data is None:
+            # 即使财务数据更新失败，如果OHLCV数据存在，仍继续执行因子计算
+            if self.ohlcv_data is None:
                 self.logger.warning("数据不完整，无法计算因子")
                 return False
             
+            # 如果财务数据为空，尝试使用空DataFrame继续
+            if self.financial_data is None:
+                self.logger.warning("财务数据为空，将跳过财务因子计算")
+                self.financial_data = pd.DataFrame()
+
             # 准备数据
             ohlcv = self.ohlcv_data.copy()
             
@@ -587,12 +594,15 @@ class DailyUpdateRunner:
             if 'date' not in ohlcv.columns and 'trade_date' in ohlcv.columns:
                 ohlcv['date'] = pd.to_datetime(ohlcv['trade_date'])
             
-            # 合并财务数据
-            factor_data = ohlcv.merge(
-                self.financial_data,
-                on='stock_code',
-                how='left'
-            )
+            # 合并财务数据 (仅在财务数据存在时合并，避免硬依赖)
+            if self.financial_data is not None and not self.financial_data.empty:
+                factor_data = ohlcv.merge(
+                    self.financial_data,
+                    on='stock_code',
+                    how='left'
+                )
+            else:
+                factor_data = ohlcv.copy()
             
             # 合并行业数据
             if self.industry_data is not None:
@@ -602,12 +612,18 @@ class DailyUpdateRunner:
                     how='left'
                 )
             
-            # 计算价值因子 EP_TTM
-            factor_data['ep_ttm'] = 1.0 / factor_data['pe_ttm'].replace(0, np.nan)
-            factor_data['ep_ttm'] = factor_data['ep_ttm'].replace([np.inf, -np.inf], np.nan)
+            # 计算价值因子 EP_TTM (如果缺少列，填充 0 或 NaN)
+            if 'pe_ttm' in factor_data.columns:
+                factor_data['ep_ttm'] = 1.0 / factor_data['pe_ttm'].replace(0, np.nan)
+                factor_data['ep_ttm'] = factor_data['ep_ttm'].replace([np.inf, -np.inf], np.nan)
+            else:
+                factor_data['ep_ttm'] = np.nan
             
-            # 计算质量因子 ROE_Stability（简化版：直接使用ROE）
-            factor_data['roe_stability'] = factor_data['roe']
+            # 计算质量因子 ROE_Stability (如果缺少列，填充 NaN)
+            if 'roe' in factor_data.columns:
+                factor_data['roe_stability'] = factor_data['roe']
+            else:
+                factor_data['roe_stability'] = np.nan
             
             # 计算动量因子 RSI_20
             factor_data['rsi_20'] = factor_data.groupby('stock_code')['close'].transform(
@@ -622,6 +638,7 @@ class DailyUpdateRunner:
             # Z-Score 标准化（行业中性化）
             date_col = 'date' if 'date' in factor_data.columns else 'trade_date'
             
+            # 即使某些因子全为 NaN，z_score_normalize 也应能处理（返回 NaN）
             factor_data = z_score_normalize(
                 factor_data,
                 factor_cols=['ep_ttm', 'roe_stability', 'rsi_20'],
@@ -1486,16 +1503,17 @@ def run_backtest(
         
         if strategy_type == "multi_factor":
             # 多因子策略需要因子数据，这里使用简化版
+            # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子
             strategy = MultiFactorStrategy(
                 name="Multi-Factor Backtest",
                 config={
-                    "value_weight": strategy_config.get("value_weight", 0.4),
-                    "quality_weight": strategy_config.get("quality_weight", 0.4),
-                    "momentum_weight": strategy_config.get("momentum_weight", 0.2),
+                    "value_weight": strategy_config.get("value_weight", 0.0),
+                    "quality_weight": strategy_config.get("quality_weight", 0.0),
+                    "momentum_weight": strategy_config.get("momentum_weight", 1.0),
                     "top_n": strategy_config.get("top_n", 30),
                 }
             )
-            logger.info("使用多因子策略")
+            logger.info("使用多因子策略 (仅启用量价因子)")
         else:
             # 均线交叉策略
             strategy = MACrossStrategy(

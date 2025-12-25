@@ -13,6 +13,10 @@ import logging
 
 import pandas as pd
 import numpy as np
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 
 logger = logging.getLogger(__name__)
 
@@ -548,12 +552,23 @@ class MultiFactorStrategy(BaseStrategy):
         super().__init__(name, config)
         
         # 因子权重配置
-        self.value_weight: float = self.config.get("value_weight", 0.4)
-        self.quality_weight: float = self.config.get("quality_weight", 0.4)
-        self.momentum_weight: float = self.config.get("momentum_weight", 0.2)
+        # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子 (动量权重=1.0)
+        self.value_weight: float = self.config.get("value_weight", 0.0)
+        self.quality_weight: float = self.config.get("quality_weight", 0.0)
+        self.momentum_weight: float = self.config.get("momentum_weight", 1.0)
         
         # 选股参数配置
         self.top_n: int = self.config.get("top_n", 30)
+        
+        # 30万小资金账户适配：最大持仓数量限制为 8
+        MAX_POSITIONS_LIMIT = 8
+        if self.top_n > MAX_POSITIONS_LIMIT:
+            logger.warning(
+                f"配置的 top_n ({self.top_n}) 超过了小资金账户限制 ({MAX_POSITIONS_LIMIT})，"
+                f"强制调整为 {MAX_POSITIONS_LIMIT}"
+            )
+            self.top_n = MAX_POSITIONS_LIMIT
+
         self.min_listing_days: int = self.config.get("min_listing_days", 126)  # 约6个月
         
         # 因子列名配置（支持自定义列名）
@@ -572,7 +587,7 @@ class MultiFactorStrategy(BaseStrategy):
         
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
-            f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
+            f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight} (仅量价因子), "
             f"Top N={self.top_n}"
         )
     
@@ -690,6 +705,23 @@ class MultiFactorStrategy(BaseStrategy):
         if 'is_limit' in day_data.columns:
             day_data = day_data[~day_data['is_limit'].fillna(False)]
             logger.debug(f"剔除涨跌停后剩余: {len(day_data)}/{initial_count}")
+        
+        # 30万小资金账户适配：剔除高价股 (> 100元)
+        if 'close' in day_data.columns:
+            high_price_mask = day_data['close'] > 150
+            if high_price_mask.any():
+                day_data = day_data[~high_price_mask]
+                logger.debug(f"剔除高价股(>150)后剩余: {len(day_data)}")
+        else:
+            # 尝试查找其他可能的价格列名
+            price_col = next((col for col in ['price', 'close_price'] if col in day_data.columns), None)
+            if price_col:
+                high_price_mask = day_data[price_col] > 150
+                if high_price_mask.any():
+                    day_data = day_data[~high_price_mask]
+                    logger.debug(f"剔除高价股(>150)后剩余: {len(day_data)}")
+            else:
+                logger.warning(f"数据中缺少 'close' 列，无法执行高价股过滤")
         
         # 过滤条件2: 剔除上市不满 6 个月的股票
         if 'listing_days' in day_data.columns:
@@ -834,6 +866,44 @@ class MultiFactorStrategy(BaseStrategy):
         rebalance_dates = set(self.get_month_end_dates(all_dates))
         
         logger.info(f"调仓日期数量: {len(rebalance_dates)}")
+
+        # === 大盘风控准备 (新增) ===
+        # 默认为 False (无风险)
+        market_risk_series = pd.Series(False, index=all_dates)
+        
+        if ak is not None:
+            try:
+                # 获取沪深300指数数据
+                # sh000300 是沪深300指数代码
+                index_df = ak.stock_zh_index_daily(symbol="sh000300")
+                
+                if not index_df.empty:
+                    # 确保日期格式
+                    index_df['date'] = pd.to_datetime(index_df['date'])
+                    index_df.set_index('date', inplace=True)
+                    index_df.sort_index(inplace=True)
+                    
+                    # 计算20日均线
+                    index_df['ma20'] = index_df['close'].rolling(window=20).mean()
+                    
+                    # 对齐到策略日期范围
+                    # 使用 ffill 填充非交易日的空缺 (如果有的话)
+                    aligned_index = index_df.reindex(all_dates, method='ffill')
+                    
+                    # 判断风控条件：收盘价 < 20日均线
+                    # 只有当数据存在且满足条件时才为 True
+                    # 如果数据缺失 (NaN)，fillna(False) 视为无风险
+                    market_risk_series = (aligned_index['close'] < aligned_index['ma20']).fillna(False)
+                    
+                    logger.info("已加载沪深300数据并计算MA20风控指标")
+                else:
+                    logger.warning("获取到的沪深300数据为空，大盘风控未生效")
+                    
+            except Exception as e:
+                logger.warning(f"无法获取大盘数据，风控功能暂时失效: {e}")
+        else:
+            logger.warning("未安装 AkShare，无法启用大盘风控")
+        # ===========================
         
         # 初始化目标持仓矩阵
         target_positions = pd.DataFrame(
@@ -849,8 +919,12 @@ class MultiFactorStrategy(BaseStrategy):
         current_holdings: List[str] = []
         
         for date in all_dates:
+            # 1. 每日风控检查
+            is_risk_triggered = market_risk_series.loc[date]
+            
+            # 2. 调仓逻辑
             if date in rebalance_dates:
-                # 调仓日: 重新选股
+                # 调仓日: 重新选股 (无论是否有风控，都更新选股列表以备后用)
                 filtered_data = self.filter_stocks(data, date)
                 
                 if not filtered_data.empty:
@@ -861,11 +935,22 @@ class MultiFactorStrategy(BaseStrategy):
                     )
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
+                    current_holdings = []
             
-            # 设置当日持仓
+            # 3. 风控处理
+            if is_risk_triggered:
+                # 仅在调仓日记录日志，避免日志爆炸
+                if date in rebalance_dates:
+                    logger.warning(f"日期 {date.strftime('%Y-%m-%d')}: 大盘跌破20日均线，系统强制空仓")
+                # 触发风控时，直接跳过持仓设置 (保持为 False)
+                continue
+            
+            # 4. 设置当日持仓 (如果无风控)
             for stock in current_holdings:
                 if stock in target_positions.columns:
                     target_positions.loc[date, stock] = True
+        
+        # 统计信息
         
         # 统计信息
         total_trades = (target_positions.astype(int).diff().abs().sum().sum()) // 2

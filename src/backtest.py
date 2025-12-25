@@ -223,14 +223,34 @@ class BacktestEngine:
         position = signals.replace(0, np.nan).ffill().fillna(0)
         position = position.clip(-1, 1)
         
-        # 计算收益
+        # 计算毛收益 (不含成本)
         returns = close.pct_change().fillna(0)
-        strategy_returns = position.shift(1) * returns
+        strategy_returns_gross = position.shift(1) * returns
         
-        # 扣除交易成本
-        trades = position.diff().abs()
-        costs = trades * (self._commission + self._slippage)
-        strategy_returns = strategy_returns - costs
+        # 估算资金曲线 (用于计算交易金额)
+        # 注意：使用无成本资金曲线近似计算交易金额，以保持向量化性能
+        gross_portfolio_value = (1 + strategy_returns_gross).cumprod() * self._initial_capital
+        current_capital_series = gross_portfolio_value.shift(1).fillna(self._initial_capital)
+        
+        # 计算交易动作和金额
+        trades_pct = position.diff().abs().fillna(0)  # 仓位变化比例
+        trade_amounts = trades_pct * current_capital_series  # 估算交易金额
+        
+        # 计算交易成本 (含最低佣金限制)
+        # 1. 佣金：max(5元, 交易额 * 费率)
+        commission_costs = np.maximum(5.0, trade_amounts * self._commission)
+        # 修正：只有发生交易(trades_pct > 0)时才计算佣金，否则为0
+        commission_costs = np.where(trades_pct > 0, commission_costs, 0.0)
+        
+        # 2. 滑点：交易额 * 滑点率
+        slippage_costs = trade_amounts * self._slippage
+        
+        # 3. 转换为收益率扣减
+        total_costs = commission_costs + slippage_costs
+        cost_penalties = total_costs / current_capital_series
+        
+        # 计算净收益率
+        strategy_returns = strategy_returns_gross - cost_penalties
         
         # 计算净值曲线
         portfolio_values = (1 + strategy_returns).cumprod() * self._initial_capital

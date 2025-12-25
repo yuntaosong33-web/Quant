@@ -16,3 +16,11 @@ Rules:
 5. Data Structure: Assume all time-series data utilizes Pandas DataFrame with DatetimeIndex.
 
 6. Library Preference: Use vectorbt for backtesting logic and akshare for data sourcing.
+
+请记住该项目的核心开发约束，接下来的所有代码修改都必须遵循以下原则：
+1. **资金规模**：实盘资金为 30万人民币，属于小资金个人账户。
+2. **持仓限制**：最大持仓数量控制在 5-8 只，避免佣金磨损。
+3. **选股限制**：禁止买入单价 > 100元 的股票（如茅台），确保能买入至少2-3手。
+4. **交易费率**：回测必须考虑“最低 5元”的佣金限制，不能只算万分之三。
+5. **风控优先**：增加大盘均线风控，大盘走弱时强制空仓。
+6. **运行环境**：单机部署，Windows环境，依赖 AkShare 数据。
