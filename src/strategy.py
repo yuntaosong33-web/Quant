@@ -720,6 +720,12 @@ class MultiFactorStrategy(BaseStrategy):
         
         # 调仓频率配置: 'monthly' 或 'weekly'
         self.rebalance_frequency: str = self.config.get("rebalance_frequency", "monthly")
+        
+        # ===== 再平衡缓冲区（Rebalance Buffer）=====
+        # 用于避免小资金账户因微小调整产生的最低5元佣金磨损
+        # 仅当 |w_new - w_old| > buffer_threshold 时才调整仓位
+        # 例：5%缓冲区 = 30万 * 5% = 1.5万，按万三计算佣金4.5元，不足最低5元
+        self.rebalance_buffer: float = self.config.get("rebalance_buffer", 0.05)
         if self.rebalance_frequency not in ("monthly", "weekly"):
             logger.warning(
                 f"不支持的调仓频率 '{self.rebalance_frequency}'，使用默认 'monthly'"
@@ -734,7 +740,8 @@ class MultiFactorStrategy(BaseStrategy):
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
             f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
-            f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}"
+            f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
+            f"再平衡缓冲区={self.rebalance_buffer:.1%}"
         )
     
     def calculate_total_score(self, data: pd.DataFrame) -> pd.Series:
@@ -1480,18 +1487,18 @@ class MultiFactorStrategy(BaseStrategy):
         self,
         factor_data: pd.DataFrame,
         prices: pd.DataFrame,
-        objective: str = "max_sharpe",
+        objective: str = "equal_weight",
         risk_free_rate: float = 0.02,
         max_weight: Optional[float] = None,
         start_date: Optional[pd.Timestamp] = None,
         end_date: Optional[pd.Timestamp] = None,
         current_holdings_weights: Optional[Dict[str, float]] = None,
-        rebalance_threshold: float = 0.04
+        rebalance_threshold: Optional[float] = None
     ) -> pd.DataFrame:
         """
         生成带权重的目标持仓矩阵（含再平衡缓冲区）
         
-        每月最后一个交易日进行调仓，使用优化权重而非等权重。
+        每月最后一个交易日进行调仓，使用优化权重或等权重。
         为避免小资金账户支付最低5元佣金的成本，仅当权重变化超过阈值时才调整。
         
         Parameters
@@ -1501,11 +1508,14 @@ class MultiFactorStrategy(BaseStrategy):
         prices : pd.DataFrame
             价格数据，索引为日期，列为股票代码
         objective : str, optional
-            优化目标，默认 'max_sharpe'
+            优化目标，可选:
+            - 'equal_weight': 等权重分配（推荐小资金账户，默认）
+            - 'max_sharpe': 最大夏普比率
+            - 'min_volatility': 最小波动率
         risk_free_rate : float, optional
             无风险利率，默认0.02
         max_weight : Optional[float]
-            单只股票最大权重，默认0.05
+            单只股票最大权重，默认根据 top_n 计算
         start_date : Optional[pd.Timestamp]
             开始日期
         end_date : Optional[pd.Timestamp]
@@ -1513,8 +1523,8 @@ class MultiFactorStrategy(BaseStrategy):
         current_holdings_weights : Optional[Dict[str, float]]
             当前持仓权重字典，用于再平衡缓冲区计算。
             如果为 None，则使用前一日的目标权重。
-        rebalance_threshold : float, optional
-            再平衡阈值，默认0.04（4%）。
+        rebalance_threshold : Optional[float]
+            再平衡阈值，默认使用 self.rebalance_buffer (5%)。
             仅当 |new_weight - current_weight| > 阈值时才调整该股票仓位。
             用于避免小资金账户频繁交易产生最低5元佣金。
         
@@ -1527,22 +1537,30 @@ class MultiFactorStrategy(BaseStrategy):
         Notes
         -----
         再平衡缓冲区逻辑（适用于30万小资金账户）：
-        - 若新权重与旧权重差值 <= 4%，保持旧权重不变
-        - 避免因微小调整触发"最低5元佣金"规则
-        - 例：30万资金，4%权重 = 1.2万，按万三计算佣金仅3.6元，不足5元
+        
+        1. 基本规则：
+           - 若 |w_new - w_old| <= 缓冲阈值，保持旧权重不变
+           - 避免因微小调整触发"最低5元佣金"规则
+           - 例：30万资金，5%权重 = 1.5万，按万三计算佣金仅4.5元，不足最低5元
+        
+        2. 特殊情况（始终执行，不受缓冲区限制）：
+           - 新买入：w_old = 0 且 w_new > 0 → 必须执行买入
+           - 清仓卖出：w_old > 0 且 w_new = 0 → 必须执行卖出
         
         Examples
         --------
-        >>> strategy = MultiFactorStrategy("MF", {"top_n": 30})
+        >>> strategy = MultiFactorStrategy("MF", {"top_n": 5, "rebalance_buffer": 0.05})
         >>> weights = strategy.generate_target_weights(
-        ...     factor_data, prices_df, objective='max_sharpe',
-        ...     rebalance_threshold=0.04  # 4%缓冲区
+        ...     factor_data, prices_df, objective='equal_weight'
         ... )
         >>> print(weights.sum(axis=1))  # 每日权重之和（应接近1）
         """
+        # 使用配置的再平衡阈值，或使用参数覆盖
+        buffer_threshold = rebalance_threshold if rebalance_threshold is not None else self.rebalance_buffer
+        
         # 设置默认最大权重
         if max_weight is None:
-            max_weight = min(0.05, 1.0 / self.top_n)
+            max_weight = min(0.25, 1.0 / self.top_n)  # 对于5只股票，最大权重0.25
         
         # 确定日期列
         if self.date_col in factor_data.columns:
@@ -1581,7 +1599,7 @@ class MultiFactorStrategy(BaseStrategy):
         
         logger.info(
             f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency}), "
-            f"再平衡阈值: {rebalance_threshold:.1%}"
+            f"再平衡缓冲区: {buffer_threshold:.1%}, 优化目标: {objective}"
         )
         
         # 初始化权重矩阵
@@ -1597,8 +1615,9 @@ class MultiFactorStrategy(BaseStrategy):
         # 当前权重（用于再平衡缓冲区）
         current_weights: Dict[str, float] = current_holdings_weights.copy() if current_holdings_weights else {}
         
-        # 统计跳过的调整次数
+        # 统计
         skipped_adjustments = 0
+        forced_executions = 0
         
         for date in all_dates:
             if date in rebalance_dates:
@@ -1610,24 +1629,33 @@ class MultiFactorStrategy(BaseStrategy):
                     selected_stocks = self.select_top_stocks(filtered_data)
                     
                     if selected_stocks:
-                        # 获取历史价格用于优化
-                        price_end_idx = prices.index.get_indexer([date], method='ffill')[0]
-                        if price_end_idx >= 0:
-                            historical_prices = prices.iloc[:price_end_idx + 1]
-                            
-                            # 优化权重
-                            new_weights = self.optimize_weights(
-                                historical_prices,
-                                selected_stocks,
-                                objective=objective,
-                                risk_free_rate=risk_free_rate,
-                                max_weight=max_weight
-                            )
-                        else:
+                        # 根据优化目标计算权重
+                        if objective == "equal_weight":
+                            # 等权重：对于小资金账户更稳健
                             new_weights = self._equal_weights(selected_stocks)
+                        else:
+                            # 使用优化权重
+                            price_end_idx = prices.index.get_indexer([date], method='ffill')[0]
+                            if price_end_idx >= 0:
+                                historical_prices = prices.iloc[:price_end_idx + 1]
+                                
+                                new_weights = self.optimize_weights(
+                                    historical_prices,
+                                    selected_stocks,
+                                    objective=objective,
+                                    risk_free_rate=risk_free_rate,
+                                    max_weight=max_weight
+                                )
+                            else:
+                                new_weights = self._equal_weights(selected_stocks)
                         
-                        # ===== 再平衡缓冲区逻辑 =====
-                        # 仅当权重变化超过阈值时才更新
+                        # ===== 再平衡缓冲区逻辑（增强版）=====
+                        # 
+                        # 规则：
+                        # 1. 新买入（w_old=0, w_new>0）：始终执行
+                        # 2. 清仓卖出（w_old>0, w_new=0）：始终执行
+                        # 3. 调整持仓（w_old>0, w_new>0）：仅当变化 > 阈值时执行
+                        
                         final_weights: Dict[str, float] = {}
                         
                         # 获取所有涉及的股票（新选中 + 当前持有）
@@ -1638,14 +1666,26 @@ class MultiFactorStrategy(BaseStrategy):
                             old_w = current_weights.get(stock, 0.0)
                             weight_change = abs(new_w - old_w)
                             
-                            if weight_change > rebalance_threshold:
-                                # 变化超过阈值，执行调整
-                                if new_w > 0:
+                            # 判断交易类型
+                            is_new_buy = (old_w == 0.0 and new_w > 0.0)
+                            is_full_sell = (old_w > 0.0 and new_w == 0.0)
+                            is_rebalance = (old_w > 0.0 and new_w > 0.0)
+                            
+                            if is_new_buy:
+                                # 新买入：始终执行
+                                final_weights[stock] = new_w
+                                forced_executions += 1
+                            elif is_full_sell:
+                                # 清仓卖出：始终执行（不加入 final_weights）
+                                forced_executions += 1
+                                pass  # 不加入表示权重为0
+                            elif is_rebalance:
+                                # 调整持仓：应用缓冲区逻辑
+                                if weight_change > buffer_threshold:
+                                    # 变化超过阈值，执行调整
                                     final_weights[stock] = new_w
-                                # new_w == 0 表示清仓，不加入 final_weights
-                            else:
-                                # 变化未超过阈值，保持原权重
-                                if old_w > 0:
+                                else:
+                                    # 变化未超过阈值，保持原权重
                                     final_weights[stock] = old_w
                                     skipped_adjustments += 1
                         
@@ -1658,9 +1698,9 @@ class MultiFactorStrategy(BaseStrategy):
                         
                         logger.debug(
                             f"调仓日 {date.strftime('%Y-%m-%d')}: "
-                            f"选中 {len(selected_stocks)} 只股票, "
+                            f"选中 {len(selected_stocks)} 只, "
                             f"最终持仓 {len(final_weights)} 只 "
-                            f"(跳过微调: {skipped_adjustments})"
+                            f"(跳过: {skipped_adjustments}, 强制执行: {forced_executions})"
                         )
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
@@ -1678,7 +1718,8 @@ class MultiFactorStrategy(BaseStrategy):
             f"目标权重矩阵生成完成: "
             f"平均持仓 {n_holdings:.1f} 只, "
             f"平均权重和 {avg_weight_sum:.4f}, "
-            f"跳过微调次数 {skipped_adjustments} (阈值: {rebalance_threshold:.1%})"
+            f"跳过微调 {skipped_adjustments} 次, "
+            f"强制执行 {forced_executions} 次 (缓冲区: {buffer_threshold:.1%})"
         )
         
         return target_weights

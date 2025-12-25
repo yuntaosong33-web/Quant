@@ -41,6 +41,10 @@ strategy:
   # 调仓频率: monthly(月度), weekly(周度)
   # 周度调仓可更快捕捉动量变化，适合动量权重较高的策略
   rebalance_frequency: "weekly"
+  
+  # 再平衡缓冲区：权重变化小于此阈值时不调整，避免小资金账户佣金磨损
+  # 例：5%阈值 = 30万 * 5% = 1.5万，按万三计算佣金4.5元，不足最低5元
+  rebalance_buffer: 0.05
 
 # 投资组合配置
 portfolio:
@@ -57,8 +61,9 @@ portfolio:
   # 无风险利率
   risk_free_rate: 0.02
   
-  # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率)
-  optimization_objective: "max_sharpe"
+  # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率), equal_weight(等权重)
+  # 对于小资金账户（5只股票），equal_weight 更稳健，避免过拟合
+  optimization_objective: "equal_weight"
   
   # 协方差压缩方法: ledoit_wolf, oracle_approximating, exponential
   shrinkage_type: "ledoit_wolf"
@@ -149,4 +154,5 @@ backtest:
   initial_capital: 300000
   
   # 基准指数
-  benchmark: "000300"  # 沪深300
+  # ZZ500 (000905) 更适合中小盘策略的股票池匹配度
+  benchmark: "000905"  # 中证500
