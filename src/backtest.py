@@ -130,7 +130,8 @@ class BacktestEngine:
         price_data: pd.DataFrame,
         factor_data: Optional[pd.DataFrame] = None,
         target_weights: Optional[pd.DataFrame] = None,
-        objective: str = "equal_weight"
+        objective: str = "equal_weight",
+        benchmark_data: Optional[pd.DataFrame] = None
     ) -> BacktestResult:
         """
         执行回测 - 权重驱动模式
@@ -154,6 +155,10 @@ class BacktestEngine:
             如果提供，则跳过generate_target_weights调用
         objective : str
             权重优化目标，可选：'equal_weight', 'max_sharpe', 'min_volatility'
+        benchmark_data : Optional[pd.DataFrame]
+            基准指数数据（如沪深300），用于大盘风控。
+            需包含 'close' 列，索引为 DatetimeIndex。
+            如果为 None，则跳过大盘风控逻辑。
         
         Returns
         -------
@@ -200,7 +205,8 @@ class BacktestEngine:
                 factor_data=factor_data,
                 prices=close_prices,
                 objective=objective,
-                risk_free_rate=self._risk_free_rate
+                risk_free_rate=self._risk_free_rate,
+                benchmark_data=benchmark_data
             )
             logger.info(f"目标权重生成完成: {weights.shape}")
         else:

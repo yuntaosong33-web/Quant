@@ -1493,13 +1493,17 @@ class MultiFactorStrategy(BaseStrategy):
         start_date: Optional[pd.Timestamp] = None,
         end_date: Optional[pd.Timestamp] = None,
         current_holdings_weights: Optional[Dict[str, float]] = None,
-        rebalance_threshold: Optional[float] = None
+        rebalance_threshold: Optional[float] = None,
+        benchmark_data: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """
-        生成带权重的目标持仓矩阵（含再平衡缓冲区）
+        生成带权重的目标持仓矩阵（含再平衡缓冲区 + 大盘风控）
         
         每月最后一个交易日进行调仓，使用优化权重或等权重。
         为避免小资金账户支付最低5元佣金的成本，仅当权重变化超过阈值时才调整。
+        
+        **关键特性**：当大盘（如沪深300）跌破20日均线且均线向下倾斜时，
+        强制清仓以规避系统性风险。
         
         Parameters
         ----------
@@ -1527,6 +1531,10 @@ class MultiFactorStrategy(BaseStrategy):
             再平衡阈值，默认使用 self.rebalance_buffer (5%)。
             仅当 |new_weight - current_weight| > 阈值时才调整该股票仓位。
             用于避免小资金账户频繁交易产生最低5元佣金。
+        benchmark_data : Optional[pd.DataFrame]
+            基准指数数据（如沪深300），用于大盘风控。
+            需包含 'close' 列，索引为 DatetimeIndex。
+            如果为 None，则跳过大盘风控逻辑。
         
         Returns
         -------
@@ -1547,13 +1555,21 @@ class MultiFactorStrategy(BaseStrategy):
            - 新买入：w_old = 0 且 w_new > 0 → 必须执行买入
            - 清仓卖出：w_old > 0 且 w_new = 0 → 必须执行卖出
         
+        3. 大盘风控规则（Market Risk Control）：
+           - 条件：(Close < MA20) AND (MA20_Slope < 0)
+           - 触发时：强制清空所有仓位，跳过选股逻辑
+           - 目的：规避系统性下跌风险
+        
         Examples
         --------
         >>> strategy = MultiFactorStrategy("MF", {"top_n": 5, "rebalance_buffer": 0.05})
+        >>> # 启用大盘风控
+        >>> hs300_data = data_loader.fetch_index_price("000300", "2020-01-01", "2024-12-31")
         >>> weights = strategy.generate_target_weights(
-        ...     factor_data, prices_df, objective='equal_weight'
+        ...     factor_data, prices_df, objective='equal_weight',
+        ...     benchmark_data=hs300_data
         ... )
-        >>> print(weights.sum(axis=1))  # 每日权重之和（应接近1）
+        >>> print(weights.sum(axis=1))  # 每日权重之和（应接近1，风控时为0）
         """
         # 使用配置的再平衡阈值，或使用参数覆盖
         buffer_threshold = rebalance_threshold if rebalance_threshold is not None else self.rebalance_buffer
@@ -1602,7 +1618,61 @@ class MultiFactorStrategy(BaseStrategy):
             f"再平衡缓冲区: {buffer_threshold:.1%}, 优化目标: {objective}"
         )
         
+        # ========================================
+        # 大盘风控准备（Market Risk Control）
+        # ========================================
+        # 使用 MA20 + Slope 判断大盘趋势
+        # 默认为 False (无风险)
+        market_risk_series = pd.Series(False, index=all_dates)
+        risk_triggered_days = 0
+        
+        if benchmark_data is not None and not benchmark_data.empty:
+            try:
+                index_df = benchmark_data.copy()
+                
+                # 确保索引是 DatetimeIndex
+                if not isinstance(index_df.index, pd.DatetimeIndex):
+                    if 'date' in index_df.columns:
+                        index_df['date'] = pd.to_datetime(index_df['date'])
+                        index_df = index_df.set_index('date')
+                    else:
+                        index_df.index = pd.to_datetime(index_df.index)
+                
+                index_df = index_df.sort_index()
+                
+                # 计算20日均线
+                index_df['ma20'] = index_df['close'].rolling(window=20).mean()
+                
+                # 计算 MA20 斜率（5日变化率）
+                ma20_slope_period = 5
+                index_df['ma20_slope'] = (
+                    index_df['ma20'] - index_df['ma20'].shift(ma20_slope_period)
+                ) / ma20_slope_period
+                
+                # 对齐到策略日期范围（使用 ffill 填充非交易日）
+                aligned_index = index_df.reindex(all_dates, method='ffill')
+                
+                # 风控条件：(Close < MA20) AND (MA20_Slope < 0)
+                # 只有当价格跌破均线 且 均线向下倾斜时才触发风控
+                condition_below_ma20 = aligned_index['close'] < aligned_index['ma20']
+                condition_ma20_declining = aligned_index['ma20_slope'] < 0
+                
+                market_risk_series = (condition_below_ma20 & condition_ma20_declining).fillna(False)
+                risk_triggered_days = market_risk_series.sum()
+                
+                logger.info(
+                    f"大盘风控已启用: (Close < MA20) AND (MA20_Slope < 0), "
+                    f"预计触发 {risk_triggered_days} 天"
+                )
+                
+            except Exception as e:
+                logger.warning(f"计算大盘风控指标失败: {e}，风控功能暂时失效")
+        else:
+            logger.debug("未传入基准数据，大盘风控未启用")
+        
+        # ========================================
         # 初始化权重矩阵
+        # ========================================
         target_weights = pd.DataFrame(
             0.0,
             index=all_dates,
@@ -1618,8 +1688,34 @@ class MultiFactorStrategy(BaseStrategy):
         # 统计
         skipped_adjustments = 0
         forced_executions = 0
+        risk_clear_count = 0
         
         for date in all_dates:
+            # ========================================
+            # Step 1: 每日风控检查
+            # ========================================
+            is_risk_triggered = market_risk_series.loc[date]
+            
+            if is_risk_triggered:
+                # 风控触发：强制清仓
+                if current_weights:
+                    # 仅在有持仓时记录日志，避免日志爆炸
+                    logger.warning(
+                        f"Market Risk Triggered on {date.strftime('%Y-%m-%d')}, "
+                        f"clearing positions (持有 {len(current_weights)} 只股票)"
+                    )
+                    risk_clear_count += 1
+                
+                # 清空当前权重
+                current_weights = {}
+                
+                # 跳过后续选股逻辑，直接进入下一天
+                # target_weights 保持为 0（已初始化）
+                continue
+            
+            # ========================================
+            # Step 2: 调仓日逻辑（仅在无风控时执行）
+            # ========================================
             if date in rebalance_dates:
                 # 调仓日: 重新选股并优化权重
                 filtered_data = self.filter_stocks(factor_data, date)
@@ -1706,20 +1802,30 @@ class MultiFactorStrategy(BaseStrategy):
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
                     current_weights = {}
             
-            # 设置当日权重
+            # ========================================
+            # Step 3: 设置当日权重
+            # ========================================
             for stock, weight in current_weights.items():
                 if stock in target_weights.columns:
                     target_weights.loc[date, stock] = weight
         
+        # ========================================
         # 统计信息
+        # ========================================
         avg_weight_sum = target_weights.sum(axis=1).mean()
         n_holdings = (target_weights > 0).sum(axis=1).mean()
-        logger.info(
+        
+        log_msg = (
             f"目标权重矩阵生成完成: "
             f"平均持仓 {n_holdings:.1f} 只, "
             f"平均权重和 {avg_weight_sum:.4f}, "
             f"跳过微调 {skipped_adjustments} 次, "
             f"强制执行 {forced_executions} 次 (缓冲区: {buffer_threshold:.1%})"
         )
+        
+        if risk_clear_count > 0:
+            log_msg += f", 风控清仓 {risk_clear_count} 次"
+        
+        logger.info(log_msg)
         
         return target_weights
