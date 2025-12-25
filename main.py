@@ -127,6 +127,9 @@ class DailyUpdateRunner:
         self.current_positions: Dict[str, float] = {}
         self.target_positions: Dict[str, float] = {}
         
+        # 加载当前持仓
+        self.load_current_holdings()
+        
         self.logger.info("DailyUpdateRunner 初始化完成")
     
     def _get_default_config(self) -> Dict[str, Any]:
@@ -186,6 +189,122 @@ class DailyUpdateRunner:
                 "momentum_col": "rsi_20_zscore",
             }
         )
+    
+    def load_current_holdings(self) -> None:
+        """
+        加载当前持仓
+        
+        从 data/processed/real_holdings.json 文件读取持仓数据。
+        如果文件不存在，初始化为空字典。
+        
+        Notes
+        -----
+        这是一个半自动系统，用户可以手动修改 real_holdings.json 
+        文件来校准实际持仓。
+        """
+        holdings_path = DATA_PROCESSED_PATH / "real_holdings.json"
+        
+        if holdings_path.exists():
+            try:
+                with open(holdings_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # 提取 positions 字段
+                self.current_positions = data.get("positions", {})
+                
+                # 确保值为 float 类型
+                self.current_positions = {
+                    str(k): float(v) for k, v in self.current_positions.items()
+                }
+                
+                self.logger.info(
+                    f"已加载持仓数据: {len(self.current_positions)} 只股票, "
+                    f"总市值 ¥{sum(self.current_positions.values()):,.0f}"
+                )
+                
+                # 打印持仓明细（调试用）
+                if self.current_positions:
+                    self.logger.debug(f"持仓明细: {list(self.current_positions.keys())[:5]}...")
+                    
+            except json.JSONDecodeError as e:
+                self.logger.warning(f"持仓文件格式错误: {e}，初始化为空持仓")
+                self.current_positions = {}
+            except Exception as e:
+                self.logger.warning(f"加载持仓文件失败: {e}，初始化为空持仓")
+                self.current_positions = {}
+        else:
+            self.logger.info("持仓文件不存在，初始化为空持仓")
+            self.current_positions = {}
+    
+    def save_current_holdings(
+        self,
+        buy_orders: Dict[str, float],
+        sell_orders: Dict[str, float]
+    ) -> None:
+        """
+        保存当前持仓
+        
+        根据买入和卖出订单更新持仓，并保存到 data/processed/real_holdings.json。
+        
+        Parameters
+        ----------
+        buy_orders : Dict[str, float]
+            买入订单 {股票代码: 金额}
+        sell_orders : Dict[str, float]
+            卖出订单 {股票代码: 金额}
+        
+        Notes
+        -----
+        更新逻辑: new_holdings = current + buy - sell
+        
+        这是一个半自动系统，我们假设用户完全执行了信号。
+        实际操作中，用户可能需要手动修改这个 json 文件来校准实际持仓。
+        """
+        # 复制当前持仓
+        new_positions = self.current_positions.copy()
+        
+        # 处理买入订单
+        for stock, amount in buy_orders.items():
+            if stock in new_positions:
+                new_positions[stock] += amount
+            else:
+                new_positions[stock] = amount
+        
+        # 处理卖出订单
+        for stock, amount in sell_orders.items():
+            if stock in new_positions:
+                new_positions[stock] -= amount
+                # 如果持仓为0或负数，删除该股票
+                if new_positions[stock] <= 0:
+                    del new_positions[stock]
+        
+        # 准备保存的数据
+        holdings_data = {
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "update_date": self.today.strftime("%Y-%m-%d"),
+            "positions": new_positions,
+            "total_value": sum(new_positions.values()),
+            "num_stocks": len(new_positions),
+            "note": "此文件由系统自动生成，假设用户完全执行了交易信号。如需校准实际持仓，请手动修改。"
+        }
+        
+        # 保存到文件
+        holdings_path = DATA_PROCESSED_PATH / "real_holdings.json"
+        
+        try:
+            with open(holdings_path, 'w', encoding='utf-8') as f:
+                json.dump(holdings_data, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(
+                f"持仓已更新并保存: {len(new_positions)} 只股票, "
+                f"总市值 ¥{sum(new_positions.values()):,.0f}"
+            )
+            
+            # 更新内存中的持仓
+            self.current_positions = new_positions
+            
+        except Exception as e:
+            self.logger.error(f"保存持仓文件失败: {e}")
     
     def update_market_data(self) -> bool:
         """
@@ -1652,23 +1771,23 @@ def run_daily_update(
         runner = DailyUpdateRunner(config)
         
         # Step 1: 更新市场数据
-        logger.info("Step 1/6: 更新市场数据")
+        logger.info("Step 1/8: 更新市场数据")
         if not runner.update_market_data():
             logger.error("市场数据更新失败")
             return False
         
         # Step 2: 更新财务数据
-        logger.info("Step 2/6: 更新财务数据")
+        logger.info("Step 2/8: 更新财务数据")
         if not runner.update_financial_data():
             logger.error("财务数据更新失败")
             return False
         
         # Step 3: 更新基准指数数据（用于大盘风控）
-        logger.info("Step 3/6: 更新基准指数数据（大盘风控）")
+        logger.info("Step 3/8: 更新基准指数数据（大盘风控）")
         runner.update_benchmark_data()  # 即使失败也继续，只是风控不生效
         
         # Step 4: 计算因子
-        logger.info("Step 4/6: 计算因子数据")
+        logger.info("Step 4/8: 计算因子数据")
         if not runner.calculate_factors():
             logger.error("因子计算失败")
             return False
@@ -1677,16 +1796,16 @@ def run_daily_update(
         is_rebalance = force_rebalance or runner.is_rebalance_day()
         
         if is_rebalance:
-            logger.info("Step 5/6: 生成目标持仓（调仓日）")
+            logger.info("Step 5/8: 生成目标持仓（调仓日）")
             if not runner.generate_target_positions():
                 logger.error("目标持仓生成失败")
                 return False
         else:
-            logger.info("Step 5/6: 非调仓日，跳过持仓生成")
+            logger.info("Step 5/8: 非调仓日，跳过持仓生成")
             runner.target_positions = runner.current_positions.copy()
         
         # Step 6: 生成报告
-        logger.info("Step 6/6: 生成交易报告")
+        logger.info("Step 6/8: 生成交易报告")
         buy_orders, sell_orders = runner.calculate_trade_orders()
         
         report_config = runner.config.get("report", {})
@@ -1697,8 +1816,12 @@ def run_daily_update(
             report_content = runner.generate_report(buy_orders, sell_orders, format=fmt)
             runner.save_report(report_content, format=fmt)
         
-        # Step 7: 发送微信推送通知
-        logger.info("Step 7/7: 发送微信通知")
+        # Step 7: 更新并保存持仓
+        logger.info("Step 7/8: 更新持仓记录")
+        runner.save_current_holdings(buy_orders, sell_orders)
+        
+        # Step 8: 发送微信推送通知
+        logger.info("Step 8/8: 发送微信通知")
         _send_daily_notification(
             runner=runner,
             buy_orders=buy_orders,
