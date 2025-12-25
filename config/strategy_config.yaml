@@ -1,11 +1,12 @@
 # A股量化交易系统 - 策略配置文件
 # ===============================
+# 激进型高收益小市值策略 (Aggressive Small Cap Strategy)
 
 # 数据配置
 data:
   # 股票池: hs300(沪深300), zz500(中证500), all(全市场)
-  # 注意：使用 zz500 可减轻幸存者偏差，更适合中小资金量化
-  stock_pool: "zz500"
+  # 激进策略使用全市场选股，捕捉小市值机会
+  stock_pool: "all"
   
   # 历史数据开始日期
   start_date: "2020-01-01"
@@ -17,43 +18,49 @@ data:
   raw_data_path: "data/raw"
   processed_data_path: "data/processed"
 
-# 策略配置
+# 策略配置 - 激进型小市值策略
 strategy:
   # 策略名称
-  name: "Multi-Factor Strategy"
+  name: "Aggressive Small Cap Strategy"
   
-  # 因子权重配置
-  # Total_Score = value_weight * Value_Z + quality_weight * Quality_Z + momentum_weight * Momentum_Z
-  # 注意：基本面因子使用滞后数据（如财报发布后T+1日更新），避免前视偏差
-  value_weight: 0.3      # 价值因子权重 (EP_TTM, 使用滞后财务数据)
-  quality_weight: 0.3    # 质量因子权重 (ROE稳定性, 使用滞后财务数据)
-  momentum_weight: 0.4   # 动量因子权重 (RSI, 纯量价因子)
+  # 因子权重配置 (激进型)
+  # Total_Score = value_weight * SmallCap_Z + quality_weight * Turnover_Z 
+  #             + momentum_weight * RSI_Z + size_weight * SmallCap_Z
+  # 注意：放弃传统价值因子，改用小市值+高换手+动量的激进组合
+  value_weight: 0.0      # 放弃估值因子（借用此位置放小市值因子）
+  quality_weight: 0.3    # 借用此位置放换手率因子（资金活跃度）
+  momentum_weight: 0.4   # 动量因子权重 (RSI)
+  size_weight: 0.3       # 新增：小市值因子权重（市值越小分数越高）
   
-  # 选股参数
-  top_n: 5              # 选取股票数量
+  # 选股参数（极度集中，追求高弹性）
+  top_n: 3              # 仅选取3只股票，单只约33%仓位
   min_listing_days: 126  # 最小上市天数（约6个月）
   
-  # 因子列名配置
-  value_col: "ep_ttm_zscore"
-  quality_col: "roe_stability_zscore"
-  momentum_col: "rsi_20_zscore"
+  # 因子列名配置（与 features.py 产出列名一致）
+  # small_cap_zscore: 小市值因子 = -log(流通市值) 的标准化
+  # turnover_5d_zscore: 5日平均换手率的标准化
+  # rsi_20_zscore: 20日RSI的标准化
+  value_col: "small_cap_zscore"       # 借用 value 位置放市值因子
+  quality_col: "turnover_5d_zscore"   # 借用 quality 位置放换手率因子
+  momentum_col: "rsi_20_zscore"       # 保持动量因子
+  size_col: "small_cap_zscore"        # 新增：独立市值因子列名
   
   # 调仓频率: monthly(月度), weekly(周度)
-  # 周度调仓可更快捕捉动量变化，适合动量权重较高的策略
+  # 周度调仓更适合激进策略，快速响应市场变化
   rebalance_frequency: "weekly"
   
-  # 再平衡缓冲区：权重变化小于此阈值时不调整，避免小资金账户佣金磨损
-  # 例：5%阈值 = 30万 * 5% = 1.5万，按万三计算佣金4.5元，不足最低5元
-  rebalance_buffer: 0.05
+  # 再平衡缓冲区：权重变化小于此阈值时不调整
+  # 激进策略降低缓冲区（2%），更敏感响应信号变化
+  rebalance_buffer: 0.02
 
-# 投资组合配置
+# 投资组合配置 - 激进型（集中持仓）
 portfolio:
   # 总资金（元）
   total_capital: 300000
   
   # 单只股票最大权重
-  # 对于5只股票，建议设置为 0.25 或更高，以避免资金利用率不足
-  max_weight: 0.25
+  # 对于3只股票的激进策略，允许更高集中度
+  max_weight: 0.40
   
   # 单只股票最小权重
   min_weight: 0.0
@@ -62,7 +69,7 @@ portfolio:
   risk_free_rate: 0.02
   
   # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率), equal_weight(等权重)
-  # 对于小资金账户（5只股票），equal_weight 更稳健，避免过拟合
+  # 激进策略使用等权重，避免优化器在高波动股票上的不稳定
   optimization_objective: "equal_weight"
   
   # 协方差压缩方法: ledoit_wolf, oracle_approximating, exponential
@@ -74,10 +81,10 @@ portfolio:
   # 协方差计算回溯天数
   lookback_days: 252
 
-# 风险控制配置
+# 风险控制配置 - 激进型参数
 risk:
-  # 止损比例
-  stop_loss: 0.08
+  # 止损比例（收紧：做错即砍，快速止损）
+  stop_loss: 0.05
   
   # 止盈比例
   take_profit: 0.20
@@ -85,8 +92,16 @@ risk:
   # 单日最大亏损比例
   max_daily_loss: 0.05
   
-  # 最大回撤限制
-  max_drawdown: 0.15
+  # 最大回撤限制（放宽：容忍更高波动以获取高收益）
+  max_drawdown: 0.25
+  
+  # 大盘风控参数（激进型：使用 MA60 + 20日跌幅判断）
+  # 仅当大盘跌破60日均线且20日跌幅超过5%时才触发熔断
+  market_risk:
+    enabled: true
+    ma_period: 60           # 使用60日均线（牛熊线）替代原20日均线
+    drop_threshold: 0.05    # 20日跌幅阈值（5%）
+    drop_lookback: 20       # 跌幅回溯天数
 
 # 交易配置
 trading:

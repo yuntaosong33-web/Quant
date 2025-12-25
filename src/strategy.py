@@ -690,10 +690,15 @@ class MultiFactorStrategy(BaseStrategy):
         super().__init__(name, config)
         
         # 因子权重配置
-        # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子 (动量权重=1.0)
+        # 激进型小市值策略配置：
+        # - value_weight: 借用位置放小市值因子
+        # - quality_weight: 借用位置放换手率因子
+        # - momentum_weight: RSI 动量因子
+        # - size_weight: 独立的小市值因子权重（新增）
         self.value_weight: float = self.config.get("value_weight", 0.0)
-        self.quality_weight: float = self.config.get("quality_weight", 0.0)
-        self.momentum_weight: float = self.config.get("momentum_weight", 1.0)
+        self.quality_weight: float = self.config.get("quality_weight", 0.3)
+        self.momentum_weight: float = self.config.get("momentum_weight", 0.4)
+        self.size_weight: float = self.config.get("size_weight", 0.3)  # 新增：市值因子权重
         
         # 选股参数配置
         self.top_n: int = self.config.get("top_n", 30)
@@ -713,6 +718,7 @@ class MultiFactorStrategy(BaseStrategy):
         self.value_col: str = self.config.get("value_col", "value_zscore")
         self.quality_col: str = self.config.get("quality_col", "quality_zscore")
         self.momentum_col: str = self.config.get("momentum_col", "momentum_zscore")
+        self.size_col: str = self.config.get("size_col", "small_cap_zscore")  # 新增：市值因子列名
         
         # 日期和股票列名配置
         self.date_col: str = self.config.get("date_col", "date")
@@ -732,14 +738,15 @@ class MultiFactorStrategy(BaseStrategy):
             )
             self.rebalance_frequency = "monthly"
         
-        # 验证权重之和
-        weight_sum = self.value_weight + self.quality_weight + self.momentum_weight
+        # 验证权重之和（包含新增的 size_weight）
+        weight_sum = self.value_weight + self.quality_weight + self.momentum_weight + self.size_weight
         if abs(weight_sum - 1.0) > 1e-6:
             logger.warning(f"因子权重之和为 {weight_sum}，建议权重之和为 1.0")
         
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
             f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
+            f"市值权重={self.size_weight}, "
             f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
             f"再平衡缓冲区={self.rebalance_buffer:.1%}"
         )
@@ -748,8 +755,9 @@ class MultiFactorStrategy(BaseStrategy):
         """
         计算综合因子得分
         
+        激进型小市值策略公式：
         Total_Score = value_weight * Value_Z + quality_weight * Quality_Z 
-                    + momentum_weight * Momentum_Z
+                    + momentum_weight * Momentum_Z + size_weight * Size_Z
         
         Parameters
         ----------
@@ -765,26 +773,34 @@ class MultiFactorStrategy(BaseStrategy):
         -----
         - 缺失的因子值会被视为 0
         - 使用向量化操作计算得分
+        - 激进型策略中，value_col 可映射到 small_cap_zscore
+        - quality_col 可映射到 turnover_5d_zscore
         """
         total_score = pd.Series(0.0, index=data.index)
         
-        # 价值因子
-        if self.value_col in data.columns:
+        # 价值因子（激进策略中可用于放置小市值因子）
+        if self.value_col in data.columns and self.value_weight > 0:
             total_score += self.value_weight * data[self.value_col].fillna(0)
-        else:
+        elif self.value_weight > 0:
             logger.warning(f"未找到价值因子列: {self.value_col}")
         
-        # 质量因子
-        if self.quality_col in data.columns:
+        # 质量因子（激进策略中可用于放置换手率因子）
+        if self.quality_col in data.columns and self.quality_weight > 0:
             total_score += self.quality_weight * data[self.quality_col].fillna(0)
-        else:
+        elif self.quality_weight > 0:
             logger.warning(f"未找到质量因子列: {self.quality_col}")
         
         # 动量因子
-        if self.momentum_col in data.columns:
+        if self.momentum_col in data.columns and self.momentum_weight > 0:
             total_score += self.momentum_weight * data[self.momentum_col].fillna(0)
-        else:
+        elif self.momentum_weight > 0:
             logger.warning(f"未找到动量因子列: {self.momentum_col}")
+        
+        # 新增：市值因子（独立权重，激进型小市值策略核心因子）
+        if self.size_col in data.columns and self.size_weight > 0:
+            total_score += self.size_weight * data[self.size_col].fillna(0)
+        elif self.size_weight > 0:
+            logger.warning(f"未找到市值因子列: {self.size_col}")
         
         return total_score
     
@@ -1101,7 +1117,8 @@ class MultiFactorStrategy(BaseStrategy):
             f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency})"
         )
 
-        # === 大盘风控准备（改进版：增加MA20斜率判断）===
+        # === 大盘风控准备（激进版：MA60 + 20日跌幅判断）===
+        # 激进策略使用更宽松的风控条件，避免踏空行情
         # 默认为 False (无风险)
         market_risk_series = pd.Series(False, index=all_dates)
         
@@ -1119,34 +1136,38 @@ class MultiFactorStrategy(BaseStrategy):
                 
                 index_df = index_df.sort_index()
                 
-                # 计算20日均线
-                index_df['ma20'] = index_df['close'].rolling(window=20).mean()
+                # ===== 激进版风控：MA60（牛熊线）+ 20日跌幅 =====
+                # 计算60日均线（牛熊线）
+                index_df['ma60'] = index_df['close'].rolling(window=60).mean()
                 
-                # ===== 改进：增加 MA20 斜率判断 =====
-                # 斜率 = (MA20_today - MA20_5days_ago) / 5
-                # 使用5日变化率来判断趋势方向
-                ma20_slope_period = 5
-                index_df['ma20_slope'] = (
-                    index_df['ma20'] - index_df['ma20'].shift(ma20_slope_period)
-                ) / ma20_slope_period
+                # 计算20天前跌幅
+                # drop_20d = (close_today - close_20d_ago) / close_20d_ago
+                drop_lookback = 20
+                index_df['drop_20d'] = (
+                    index_df['close'] - index_df['close'].shift(drop_lookback)
+                ) / index_df['close'].shift(drop_lookback)
                 
                 # 对齐到策略日期范围
                 # 使用 ffill 填充非交易日的空缺 (如果有的话)
                 aligned_index = index_df.reindex(all_dates, method='ffill')
                 
-                # ===== 改进后的风控条件 =====
-                # 旧规则: close < ma20 (容易在震荡市产生频繁误判)
-                # 新规则: (close < ma20) AND (ma20_slope < 0)
-                # 只有当价格跌破均线 且 均线向下倾斜时才触发风控
-                # 这样可以避免震荡市中的频繁进出
+                # ===== 激进版风控条件 =====
+                # 旧规则（保守）: (Close < MA20) AND (MA20_Slope < 0)
+                # 新规则（激进）: (Close < MA60) AND (20日跌幅 > 5%)
+                # 
+                # 逻辑说明：
+                # 1. MA60（60日均线）是传统的牛熊分界线，跌破才考虑风控
+                # 2. 同时要求20日跌幅超过5%，确认是暴跌趋势而非阴跌
+                # 3. 只要大盘在MA60之上，或仅仅是阴跌，都保持满仓进攻
+                drop_threshold = -0.05  # 20日跌幅阈值（-5%）
                 
-                condition_below_ma20 = aligned_index['close'] < aligned_index['ma20']
-                condition_ma20_declining = aligned_index['ma20_slope'] < 0
+                condition_below_ma60 = aligned_index['close'] < aligned_index['ma60']
+                condition_crash = aligned_index['drop_20d'] < drop_threshold
                 
-                market_risk_series = (condition_below_ma20 & condition_ma20_declining).fillna(False)
+                market_risk_series = (condition_below_ma60 & condition_crash).fillna(False)
                 
                 logger.info(
-                    "已使用改进版大盘风控: (Close < MA20) AND (MA20_Slope < 0)"
+                    f"已使用激进版大盘风控: (Close < MA60) AND (20日跌幅 < {drop_threshold:.0%})"
                 )
                 
             except Exception as e:
@@ -1619,9 +1640,9 @@ class MultiFactorStrategy(BaseStrategy):
         )
         
         # ========================================
-        # 大盘风控准备（Market Risk Control）
+        # 大盘风控准备（激进版 Market Risk Control）
         # ========================================
-        # 使用 MA20 + Slope 判断大盘趋势
+        # 激进策略使用 MA60 + 20日跌幅判断，避免踏空行情
         # 默认为 False (无风险)
         market_risk_series = pd.Series(False, index=all_dates)
         risk_triggered_days = 0
@@ -1640,28 +1661,32 @@ class MultiFactorStrategy(BaseStrategy):
                 
                 index_df = index_df.sort_index()
                 
-                # 计算20日均线
-                index_df['ma20'] = index_df['close'].rolling(window=20).mean()
+                # ===== 激进版风控：MA60（牛熊线）+ 20日跌幅 =====
+                # 计算60日均线（牛熊线）
+                index_df['ma60'] = index_df['close'].rolling(window=60).mean()
                 
-                # 计算 MA20 斜率（5日变化率）
-                ma20_slope_period = 5
-                index_df['ma20_slope'] = (
-                    index_df['ma20'] - index_df['ma20'].shift(ma20_slope_period)
-                ) / ma20_slope_period
+                # 计算20天前跌幅
+                drop_lookback = 20
+                index_df['drop_20d'] = (
+                    index_df['close'] - index_df['close'].shift(drop_lookback)
+                ) / index_df['close'].shift(drop_lookback)
                 
                 # 对齐到策略日期范围（使用 ffill 填充非交易日）
                 aligned_index = index_df.reindex(all_dates, method='ffill')
                 
-                # 风控条件：(Close < MA20) AND (MA20_Slope < 0)
-                # 只有当价格跌破均线 且 均线向下倾斜时才触发风控
-                condition_below_ma20 = aligned_index['close'] < aligned_index['ma20']
-                condition_ma20_declining = aligned_index['ma20_slope'] < 0
+                # ===== 激进版风控条件 =====
+                # (Close < MA60) AND (20日跌幅 > 5%)
+                # 只有确认暴跌趋势时才触发熔断
+                drop_threshold = -0.05  # 20日跌幅阈值（-5%）
                 
-                market_risk_series = (condition_below_ma20 & condition_ma20_declining).fillna(False)
+                condition_below_ma60 = aligned_index['close'] < aligned_index['ma60']
+                condition_crash = aligned_index['drop_20d'] < drop_threshold
+                
+                market_risk_series = (condition_below_ma60 & condition_crash).fillna(False)
                 risk_triggered_days = market_risk_series.sum()
                 
                 logger.info(
-                    f"大盘风控已启用: (Close < MA20) AND (MA20_Slope < 0), "
+                    f"大盘风控已启用（激进版）: (Close < MA60) AND (20日跌幅 < {drop_threshold:.0%}), "
                     f"预计触发 {risk_triggered_days} 天"
                 )
                 

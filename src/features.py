@@ -1578,6 +1578,96 @@ class FactorCalculator:
         logger.debug(f"IVOL_{period} 计算完成（年化，numba 加速）")
         return ivol_annualized
     
+    # ==================== 激进型因子 ====================
+    
+    def calculate_log_circ_mv(self) -> pd.Series:
+        """
+        计算小市值因子 (Small Cap Factor)
+        
+        small_cap = -log(circ_mv)
+        市值越小，因子值越大（取负号），适用于激进型小市值策略。
+        
+        Returns
+        -------
+        pd.Series
+            小市值因子值
+        
+        Raises
+        ------
+        ValueError
+            当财务数据缺少 circ_mv 列时抛出
+        
+        Notes
+        -----
+        - circ_mv (流通市值) 必须大于 0
+        - 使用自然对数并取负值，确保市值越小分数越高
+        - 处理 inf/-inf 的数学边界情况
+        """
+        if 'circ_mv' not in self.financial_data.columns:
+            raise ValueError("财务数据缺少 circ_mv (流通市值) 列")
+        
+        # 向量化计算：-log(circ_mv)
+        circ_mv = self.financial_data['circ_mv'].replace(0, np.nan)
+        # 负市值不合法，设为 NaN
+        circ_mv = circ_mv.where(circ_mv > 0, np.nan)
+        
+        # 计算自然对数
+        log_mv = np.log(circ_mv)
+        
+        # 取负值：市值越小，因子值越大
+        small_cap = -log_mv
+        
+        # 处理异常值
+        small_cap = small_cap.replace([np.inf, -np.inf], np.nan)
+        
+        logger.debug(f"Small_Cap 因子计算完成，有效值数量: {small_cap.notna().sum()}")
+        return small_cap
+    
+    def calculate_turnover_momentum(self, window: int = 5) -> pd.Series:
+        """
+        计算高换手情绪因子 (Active Turnover Factor)
+        
+        turnover_5d = rolling_mean(turn, window)
+        换手率代表资金活跃度，激进策略中该值越高越好。
+        
+        Parameters
+        ----------
+        window : int, optional
+            滚动窗口大小，默认 5 日
+        
+        Returns
+        -------
+        pd.Series
+            换手率动量因子值
+        
+        Raises
+        ------
+        ValueError
+            当 OHLCV 数据缺少 turn 列时抛出
+        
+        Notes
+        -----
+        - turn (换手率) 是日度数据
+        - 使用滚动均值平滑短期波动
+        - 按股票分组计算，避免跨股票数据污染
+        """
+        if 'turn' not in self.ohlcv_data.columns:
+            raise ValueError("OHLCV 数据缺少 turn (换手率) 列")
+        
+        if 'stock_code' in self.ohlcv_data.columns:
+            # 多股票情况：按股票分组计算滚动均值
+            turnover_5d = self.ohlcv_data.groupby('stock_code')['turn'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+        else:
+            # 单股票情况：直接计算滚动均值
+            turnover_5d = self.ohlcv_data['turn'].rolling(
+                window=window, min_periods=1
+            ).mean()
+        
+        logger.debug(f"Turnover_{window}d 因子计算完成")
+        return turnover_5d
+    
     # ==================== 计算所有因子 ====================
     
     def calculate_all_factors(self) -> pd.DataFrame:
@@ -1593,6 +1683,8 @@ class FactorCalculator:
             - roe_stability: ROE 稳定性质量因子
             - rsi_20: 20日 RSI 动量因子
             - ivol: 特质波动率因子
+            - small_cap: 小市值因子（激进型）
+            - turnover_5d: 5日换手率因子（激进型）
         
         Notes
         -----
@@ -1638,6 +1730,21 @@ class FactorCalculator:
         except Exception as e:
             logger.warning(f"IVOL 因子计算失败: {e}")
             result['ivol'] = np.nan
+        
+        # 激进型因子
+        try:
+            result['small_cap'] = self.calculate_log_circ_mv()
+            logger.info("Small_Cap 因子计算完成")
+        except Exception as e:
+            logger.warning(f"Small_Cap 因子计算失败: {e}")
+            result['small_cap'] = np.nan
+        
+        try:
+            result['turnover_5d'] = self.calculate_turnover_momentum(window=5)
+            logger.info("Turnover_5d 因子计算完成")
+        except Exception as e:
+            logger.warning(f"Turnover_5d 因子计算失败: {e}")
+            result['turnover_5d'] = np.nan
         
         logger.info("所有因子计算完成")
         return result
