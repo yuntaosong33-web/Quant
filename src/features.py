@@ -1122,6 +1122,14 @@ class FactorCalculator:
     接收清洗后的 OHLCV 和财务数据，计算价值因子、质量因子和技术/动量因子。
     支持行业中性化的 Z-Score 标准化处理。
     
+    重要：为避免前视偏差（Look-Ahead Bias），财务数据在使用前需要进行滞后处理。
+    A股财报发布时间规则：
+    - 年报：次年4月30日前发布（滞后约4个月）
+    - 半年报：8月31日前发布（滞后约2个月）
+    - 季报：1个月内发布（滞后约1个月）
+    
+    默认滞后 3 个月（约 60 个交易日），确保只使用历史上可获得的数据。
+    
     Parameters
     ----------
     ohlcv_data : pd.DataFrame
@@ -1132,13 +1140,17 @@ class FactorCalculator:
         可选包含 stock_code（股票代码）和 report_date（报告日期）列
     industry_data : Optional[pd.DataFrame]
         行业分类数据，包含 stock_code 和 sw_industry_l1（申万一级行业）列
+    lag_financial_data : bool
+        是否对财务数据进行滞后处理，默认 True
+    lag_days : int
+        财务数据滞后天数，默认 60（约3个月）
     
     Attributes
     ----------
     ohlcv_data : pd.DataFrame
         OHLCV 数据副本
     financial_data : pd.DataFrame
-        财务数据副本
+        财务数据副本（可能已滞后）
     industry_data : Optional[pd.DataFrame]
         行业分类数据副本
     
@@ -1149,11 +1161,16 @@ class FactorCalculator:
     >>> normalized_factors = calculator.z_score_normalize(factors, ['ep_ttm', 'rsi_20'])
     """
     
+    # 默认财务数据滞后天数（约3个月）
+    DEFAULT_LAG_DAYS = 60
+    
     def __init__(
         self,
         ohlcv_data: pd.DataFrame,
         financial_data: pd.DataFrame,
-        industry_data: Optional[pd.DataFrame] = None
+        industry_data: Optional[pd.DataFrame] = None,
+        lag_financial_data: bool = True,
+        lag_days: int = DEFAULT_LAG_DAYS
     ) -> None:
         """
         初始化多因子计算器
@@ -1166,13 +1183,88 @@ class FactorCalculator:
             财务数据
         industry_data : Optional[pd.DataFrame]
             行业分类数据
+        lag_financial_data : bool
+            是否对财务数据进行滞后处理，默认 True
+        lag_days : int
+            财务数据滞后天数，默认 60（约3个月）
         """
         self.ohlcv_data = ohlcv_data.copy()
-        self.financial_data = financial_data.copy()
         self.industry_data = industry_data.copy() if industry_data is not None else None
+        
+        # 对财务数据进行滞后处理（避免前视偏差）
+        if lag_financial_data and not financial_data.empty:
+            self.financial_data = self._lag_financial_data(financial_data.copy(), lag_days)
+            logger.info(f"财务数据已滞后 {lag_days} 天（避免前视偏差）")
+        else:
+            self.financial_data = financial_data.copy()
         
         self._validate_data()
         logger.info("FactorCalculator 初始化完成")
+    
+    def _lag_financial_data(
+        self,
+        financial_data: pd.DataFrame,
+        lag_days: int
+    ) -> pd.DataFrame:
+        """
+        对财务数据进行滞后处理，避免前视偏差
+        
+        将财务数据的日期索引向后移动指定天数，模拟财报发布滞后。
+        
+        Parameters
+        ----------
+        financial_data : pd.DataFrame
+            原始财务数据
+        lag_days : int
+            滞后天数
+        
+        Returns
+        -------
+        pd.DataFrame
+            滞后后的财务数据
+        
+        Notes
+        -----
+        - 如果数据有 'report_date' 或 'pub_date' 列，优先使用发布日期
+        - 否则对 DatetimeIndex 进行偏移
+        - 使用 pd.Timedelta 进行日期偏移，确保精确性
+        """
+        df = financial_data.copy()
+        
+        # 检查是否有发布日期列（更精确的方式）
+        pub_date_cols = ['pub_date', 'publish_date', 'announcement_date']
+        pub_date_col = next((c for c in pub_date_cols if c in df.columns), None)
+        
+        if pub_date_col is not None:
+            # 使用实际发布日期，并额外滞后1天确保数据可获得
+            logger.info(f"使用发布日期列 '{pub_date_col}' 进行滞后处理")
+            df[pub_date_col] = pd.to_datetime(df[pub_date_col])
+            # 发布日T+1日才能使用
+            df[pub_date_col] = df[pub_date_col] + pd.Timedelta(days=1)
+            # 如果需要，重新设置索引
+            if pub_date_col not in df.index.names:
+                if 'date' in df.columns or isinstance(df.index, pd.DatetimeIndex):
+                    # 用发布日期替换交易日期
+                    if isinstance(df.index, pd.DatetimeIndex):
+                        df = df.reset_index(drop=True)
+                    df = df.set_index(pub_date_col)
+            return df
+        
+        # 方式2：对日期索引进行固定天数偏移
+        if isinstance(df.index, pd.DatetimeIndex):
+            # 将索引向后移动 lag_days 天
+            df.index = df.index + pd.Timedelta(days=lag_days)
+            logger.debug(f"DatetimeIndex 已向后偏移 {lag_days} 天")
+        elif 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date']) + pd.Timedelta(days=lag_days)
+            logger.debug(f"date 列已向后偏移 {lag_days} 天")
+        elif 'trade_date' in df.columns:
+            df['trade_date'] = pd.to_datetime(df['trade_date']) + pd.Timedelta(days=lag_days)
+            logger.debug(f"trade_date 列已向后偏移 {lag_days} 天")
+        else:
+            logger.warning("财务数据无日期列，无法进行滞后处理")
+        
+        return df
     
     def _validate_data(self) -> None:
         """
@@ -1771,3 +1863,187 @@ def z_score_normalize(
             )
     
     return result
+
+
+def lag_fundamental_data(
+    data: pd.DataFrame,
+    lag_days: int = 60,
+    date_col: Optional[str] = None,
+    stock_col: str = "stock_code"
+) -> pd.DataFrame:
+    """
+    对财务/基本面数据进行滞后处理，避免前视偏差（Look-Ahead Bias）
+    
+    A股财报发布时间规则决定了财务数据的实际可获得时间：
+    - 年报（Q4）：次年4月30日前发布（滞后约4个月）
+    - 半年报（Q2）：8月31日前发布（滞后约2个月）  
+    - 一季报（Q1）：4月30日前发布（滞后约1个月）
+    - 三季报（Q3）：10月31日前发布（滞后约1个月）
+    
+    默认滞后 60 个自然日（约 3 个月 / ~45 个交易日），
+    这是一个保守估计，确保只使用历史上实际可获得的数据。
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        财务/基本面数据。可以是：
+        - 单股票时序数据（索引为 DatetimeIndex）
+        - 多股票面板数据（包含 stock_code 和 date 列）
+    lag_days : int, optional
+        滞后的自然日天数，默认 60（约3个月）
+    date_col : Optional[str]
+        日期列名。如果为 None，会尝试自动识别：
+        - 优先使用 DatetimeIndex
+        - 其次查找 'date', 'trade_date', 'report_date' 列
+    stock_col : str
+        股票代码列名，默认 'stock_code'
+    
+    Returns
+    -------
+    pd.DataFrame
+        滞后后的财务数据，日期已向后移动 lag_days 天
+    
+    Notes
+    -----
+    - 此函数仅移动日期，不改变数据本身
+    - 移动后的日期表示"该数据最早可被使用的日期"
+    - 对于有发布日期（pub_date）的数据，建议使用 FactorCalculator 的内置方法
+    
+    Examples
+    --------
+    >>> # 对单股票财务数据进行滞后处理
+    >>> fin_data_lagged = lag_fundamental_data(fin_data, lag_days=60)
+    
+    >>> # 对多股票面板数据进行滞后处理
+    >>> fin_panel_lagged = lag_fundamental_data(
+    ...     fin_panel, lag_days=45, date_col='report_date'
+    ... )
+    
+    >>> # 在回测中使用滞后数据
+    >>> from src.features import lag_fundamental_data
+    >>> fin_data = loader.fetch_financial_data(symbols)
+    >>> fin_data_lagged = lag_fundamental_data(fin_data, lag_days=60)
+    >>> merged_data = pd.merge(price_data, fin_data_lagged, on=['date', 'stock_code'])
+    """
+    if data.empty:
+        logger.warning("输入数据为空，直接返回")
+        return data
+    
+    df = data.copy()
+    lag_delta = pd.Timedelta(days=lag_days)
+    
+    # 自动识别日期列
+    if date_col is None:
+        if isinstance(df.index, pd.DatetimeIndex):
+            # 直接修改索引
+            df.index = df.index + lag_delta
+            df.index.name = 'date'
+            logger.info(f"财务数据 DatetimeIndex 已向后偏移 {lag_days} 天")
+            return df
+        
+        # 查找日期列
+        date_candidates = ['date', 'trade_date', 'report_date', '日期']
+        date_col = next((c for c in date_candidates if c in df.columns), None)
+        
+        if date_col is None:
+            raise ValueError(
+                f"无法识别日期列。请指定 date_col 参数或确保数据包含以下列之一: {date_candidates}"
+            )
+    
+    # 对日期列进行偏移
+    if date_col not in df.columns:
+        raise ValueError(f"指定的日期列 '{date_col}' 不存在于数据中")
+    
+    df[date_col] = pd.to_datetime(df[date_col]) + lag_delta
+    
+    logger.info(f"财务数据 '{date_col}' 列已向后偏移 {lag_days} 天")
+    return df
+
+
+def merge_price_and_fundamental(
+    price_data: pd.DataFrame,
+    fundamental_data: pd.DataFrame,
+    price_date_col: str = "date",
+    fund_date_col: str = "date",
+    stock_col: str = "stock_code",
+    lag_days: int = 60,
+    apply_lag: bool = True
+) -> pd.DataFrame:
+    """
+    合并价格数据和财务数据，自动处理前视偏差
+    
+    使用 asof merge 将财务数据按最近可用日期合并到价格数据上。
+    
+    Parameters
+    ----------
+    price_data : pd.DataFrame
+        价格数据，包含 OHLCV 和日期
+    fundamental_data : pd.DataFrame
+        财务数据，包含基本面指标
+    price_date_col : str
+        价格数据的日期列名，默认 'date'
+    fund_date_col : str
+        财务数据的日期列名，默认 'date'
+    stock_col : str
+        股票代码列名，默认 'stock_code'
+    lag_days : int
+        财务数据滞后天数，默认 60
+    apply_lag : bool
+        是否应用滞后，默认 True
+    
+    Returns
+    -------
+    pd.DataFrame
+        合并后的数据，每个价格日期使用当时最新可获得的财务数据
+    
+    Examples
+    --------
+    >>> merged = merge_price_and_fundamental(
+    ...     price_data, fundamental_data,
+    ...     lag_days=60, apply_lag=True
+    ... )
+    """
+    if fundamental_data.empty:
+        logger.warning("财务数据为空，仅返回价格数据")
+        return price_data
+    
+    # 复制数据
+    price_df = price_data.copy()
+    fund_df = fundamental_data.copy()
+    
+    # 应用滞后
+    if apply_lag:
+        fund_df = lag_fundamental_data(fund_df, lag_days=lag_days, date_col=fund_date_col)
+    
+    # 确保日期列是 datetime 类型
+    price_df[price_date_col] = pd.to_datetime(price_df[price_date_col])
+    fund_df[fund_date_col] = pd.to_datetime(fund_df[fund_date_col])
+    
+    # 排序
+    price_df = price_df.sort_values([stock_col, price_date_col])
+    fund_df = fund_df.sort_values([stock_col, fund_date_col])
+    
+    # 如果两个数据的日期列名不同，统一为 'date'
+    if price_date_col != 'date':
+        price_df = price_df.rename(columns={price_date_col: 'date'})
+    if fund_date_col != 'date':
+        fund_df = fund_df.rename(columns={fund_date_col: 'date'})
+    
+    # 使用 merge_asof 按股票和日期合并
+    # 对每个价格日期，找到最近的（但不晚于该日期的）财务数据
+    merged = pd.merge_asof(
+        price_df,
+        fund_df,
+        on='date',
+        by=stock_col,
+        direction='backward',  # 向后查找（只用历史数据）
+        suffixes=('', '_fund')
+    )
+    
+    logger.info(
+        f"价格与财务数据合并完成: "
+        f"价格数据 {len(price_df)} 行, "
+        f"合并后 {len(merged)} 行"
+    )
+    
+    return merged

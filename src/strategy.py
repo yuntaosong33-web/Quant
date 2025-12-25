@@ -580,6 +580,14 @@ class MultiFactorStrategy(BaseStrategy):
         self.date_col: str = self.config.get("date_col", "date")
         self.stock_col: str = self.config.get("stock_col", "stock_code")
         
+        # 调仓频率配置: 'monthly' 或 'weekly'
+        self.rebalance_frequency: str = self.config.get("rebalance_frequency", "monthly")
+        if self.rebalance_frequency not in ("monthly", "weekly"):
+            logger.warning(
+                f"不支持的调仓频率 '{self.rebalance_frequency}'，使用默认 'monthly'"
+            )
+            self.rebalance_frequency = "monthly"
+        
         # 验证权重之和
         weight_sum = self.value_weight + self.quality_weight + self.momentum_weight
         if abs(weight_sum - 1.0) > 1e-6:
@@ -587,8 +595,8 @@ class MultiFactorStrategy(BaseStrategy):
         
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
-            f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight} (仅量价因子), "
-            f"Top N={self.top_n}"
+            f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
+            f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}"
         )
     
     def calculate_total_score(self, data: pd.DataFrame) -> pd.Series:
@@ -657,6 +665,70 @@ class MultiFactorStrategy(BaseStrategy):
         
         return pd.DatetimeIndex(month_end_dates.values)
     
+    def get_week_end_dates(self, dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """
+        获取每周最后一个交易日
+        
+        用于周度调仓策略，更快捕捉动量变化。
+        
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex
+            所有交易日期
+        
+        Returns
+        -------
+        pd.DatetimeIndex
+            每周最后一个交易日
+        
+        Notes
+        -----
+        使用 ISO 周数（周一开始，周日结束）进行分组。
+        """
+        dates_series = pd.Series(dates, index=dates)
+        # 按年-周分组，取每组最后一个日期
+        # isocalendar 返回 (year, week, weekday)
+        week_end_dates = dates_series.groupby(
+            [dates_series.index.isocalendar().year, 
+             dates_series.index.isocalendar().week]
+        ).last()
+        
+        return pd.DatetimeIndex(week_end_dates.values)
+    
+    def get_rebalance_dates(
+        self, 
+        dates: pd.DatetimeIndex, 
+        frequency: str = "monthly"
+    ) -> pd.DatetimeIndex:
+        """
+        根据频率获取调仓日期
+        
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex
+            所有交易日期
+        frequency : str
+            调仓频率，可选 'monthly' 或 'weekly'
+        
+        Returns
+        -------
+        pd.DatetimeIndex
+            调仓日期
+        
+        Raises
+        ------
+        ValueError
+            当 frequency 参数不合法时
+        """
+        if frequency == "monthly":
+            return self.get_month_end_dates(dates)
+        elif frequency == "weekly":
+            return self.get_week_end_dates(dates)
+        else:
+            raise ValueError(
+                f"不支持的调仓频率: {frequency}，可选 'monthly' 或 'weekly'"
+            )
+    
     def filter_stocks(
         self,
         data: pd.DataFrame,
@@ -707,19 +779,24 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"剔除涨跌停后剩余: {len(day_data)}/{initial_count}")
         
         # 30万小资金账户适配：剔除高价股 (> 100元)
+        # 依据规则：确保每只股票能买入至少 2-3 手（200-300股）
+        # 30万资金，5只股票，每只约6万，100元股票可买600股
+        MAX_PRICE_LIMIT = 100.0
         if 'close' in day_data.columns:
-            high_price_mask = day_data['close'] > 150
+            high_price_mask = day_data['close'] > MAX_PRICE_LIMIT
             if high_price_mask.any():
+                excluded_count = high_price_mask.sum()
                 day_data = day_data[~high_price_mask]
-                logger.debug(f"剔除高价股(>150)后剩余: {len(day_data)}")
+                logger.debug(f"剔除高价股(>{MAX_PRICE_LIMIT})后剩余: {len(day_data)} (剔除{excluded_count}只)")
         else:
             # 尝试查找其他可能的价格列名
             price_col = next((col for col in ['price', 'close_price'] if col in day_data.columns), None)
             if price_col:
-                high_price_mask = day_data[price_col] > 150
+                high_price_mask = day_data[price_col] > MAX_PRICE_LIMIT
                 if high_price_mask.any():
+                    excluded_count = high_price_mask.sum()
                     day_data = day_data[~high_price_mask]
-                    logger.debug(f"剔除高价股(>150)后剩余: {len(day_data)}")
+                    logger.debug(f"剔除高价股(>{MAX_PRICE_LIMIT})后剩余: {len(day_data)} (剔除{excluded_count}只)")
             else:
                 logger.warning(f"数据中缺少 'close' 列，无法执行高价股过滤")
         
@@ -872,10 +949,12 @@ class MultiFactorStrategy(BaseStrategy):
             logger.warning("过滤后无有效日期")
             return pd.DataFrame()
         
-        # 获取调仓日期（每月最后一个交易日）
-        rebalance_dates = set(self.get_month_end_dates(all_dates))
+        # 根据配置的频率获取调仓日期
+        rebalance_dates = set(self.get_rebalance_dates(all_dates, self.rebalance_frequency))
         
-        logger.info(f"调仓日期数量: {len(rebalance_dates)}")
+        logger.info(
+            f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency})"
+        )
 
         # === 大盘风控准备 ===
         # 默认为 False (无风险)
@@ -1325,10 +1404,12 @@ class MultiFactorStrategy(BaseStrategy):
             logger.warning("过滤后无有效日期")
             return pd.DataFrame()
         
-        # 获取调仓日期
-        rebalance_dates = set(self.get_month_end_dates(all_dates))
+        # 根据配置的频率获取调仓日期
+        rebalance_dates = set(self.get_rebalance_dates(all_dates, self.rebalance_frequency))
         
-        logger.info(f"调仓日期数量: {len(rebalance_dates)}")
+        logger.info(
+            f"调仓日期数量: {len(rebalance_dates)} ({self.rebalance_frequency})"
+        )
         
         # 初始化权重矩阵
         target_weights = pd.DataFrame(

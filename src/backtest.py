@@ -816,6 +816,9 @@ class VBTProBacktester:
             "init_cash": self.init_cash,
         }
     
+    # A股最低佣金（元）
+    MIN_COMMISSION_CNY = 5.0
+    
     def _run_fallback(
         self,
         close: pd.DataFrame,
@@ -824,6 +827,8 @@ class VBTProBacktester:
     ) -> Dict[str, Any]:
         """
         不依赖VectorBT的回测实现
+        
+        实现A股"最低5元佣金"规则，确保小资金账户回测准确性。
         
         Parameters
         ----------
@@ -839,7 +844,7 @@ class VBTProBacktester:
         Dict[str, Any]
             回测结果
         """
-        logger.info("使用内置回测引擎...")
+        logger.info("使用内置回测引擎（含最低5元佣金规则）...")
         
         entries = entries.astype(bool)
         if exits is None:
@@ -868,10 +873,32 @@ class VBTProBacktester:
         weights = position * self.fixed_amount / self.init_cash
         portfolio_returns = (returns * weights.shift(1)).sum(axis=1)
         
-        # 扣除交易成本
-        trades = position.diff().abs()
-        trade_costs = (trades * self.fees).sum(axis=1)
-        portfolio_returns = portfolio_returns - trade_costs
+        # ========================================
+        # 计算交易成本 (含A股最低佣金限制)
+        # ========================================
+        # A股佣金规则：
+        # - 费率：通常万分之三 (0.0003)
+        # - 最低限制：单笔最低5元
+        # 
+        # 对于固定金额买入策略：
+        # - 每笔交易金额 = fixed_amount (如10万)
+        # - 按万三计算佣金 = fixed_amount * fees
+        # - 实际佣金 = max(5.0, fixed_amount * fees)
+        trades = position.diff().abs()  # 每只股票的仓位变化 (0或1)
+        
+        # 计算每笔交易的交易金额
+        trade_amounts = trades * self.fixed_amount  # 交易金额矩阵
+        
+        # 应用A股最低5元佣金规则 (仅在有交易时)
+        # commission = max(5.0, trade_amount * fee_rate) for each trade
+        commission_by_rate = trade_amounts * self.fees
+        commission_with_min = np.maximum(self.MIN_COMMISSION_CNY, commission_by_rate)
+        # 只有实际发生交易时才收佣金
+        commission_costs = commission_with_min.where(trades > 0, 0.0)
+        
+        # 转换为收益率扣减
+        total_commission = commission_costs.sum(axis=1)  # 每日总佣金
+        portfolio_returns = portfolio_returns - total_commission / self.init_cash
         
         # 计算净值曲线
         portfolio_value = (1 + portfolio_returns).cumprod() * self.init_cash
