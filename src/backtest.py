@@ -3,6 +3,10 @@ VectorBT回测流程模块
 
 该模块提供基于VectorBT的回测功能，支持策略绩效评估和分析。
 采用向量化回测引擎确保高性能。
+
+重构说明：
+- 支持权重驱动的多资产组合交易 (Weight-Driven Multi-Asset Portfolio)
+- 符合A股交易规则：整手交易(100股)、涨跌停限制、最低5元佣金
 """
 
 from typing import Optional, Dict, Any, List, Union
@@ -63,10 +67,17 @@ class BacktestResult:
 
 class BacktestEngine:
     """
-    回测引擎
+    回测引擎 - 权重驱动多资产组合版
     
-    基于VectorBT实现高性能向量化回测。
-    对于小资金账户（< 50万），强制使用 Simple 模式以确保佣金计算准确（最低5元规则）。
+    支持Weight-Driven执行模式，通过调用策略的generate_target_weights方法
+    获取每日目标权重，模拟真实的组合调仓过程。
+    
+    关键特性：
+    - 多资产组合管理（适配ZZ500成分股等）
+    - A股最低5元佣金规则
+    - 涨跌停板交易限制
+    - 整手交易（100股为1手）
+    - 先卖后买执行顺序
     
     Attributes
     ----------
@@ -76,12 +87,17 @@ class BacktestEngine:
     Examples
     --------
     >>> engine = BacktestEngine(config)
-    >>> result = engine.run(strategy, price_data, signals)
+    >>> result = engine.run(strategy, price_data, factor_data)
     >>> print(f"夏普比率: {result.sharpe_ratio:.2f}")
     """
     
     # 小资金阈值：低于此值强制使用 Simple 模式
     SMALL_CAPITAL_THRESHOLD = 500000  # 50万
+    
+    # A股交易常量
+    MIN_COMMISSION_CNY = 5.0  # 最低佣金（元）
+    ROUND_LOT = 100  # 最小交易单位（股）
+    TRADING_DAYS_PER_YEAR = 252
     
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -95,8 +111,8 @@ class BacktestEngine:
         self.config = config or {}
         
         # 回测参数
-        self._initial_capital = self.config.get("initial_capital", 1000000)
-        self._commission = self.config.get("commission", 0.0003)
+        self._initial_capital = self.config.get("initial_capital", 300000)
+        self._commission = self.config.get("commission", 0.0003)  # 标准A股费率
         self._slippage = self.config.get("slippage", 0.001)
         self._risk_free_rate = self.config.get("risk_free_rate", 0.03)
         
@@ -104,384 +120,500 @@ class BacktestEngine:
         self._force_simple_mode = self.config.get("force_simple_mode", False)
         
         logger.info(
-            f"回测引擎初始化: 初始资金={self._initial_capital}, "
-            f"佣金={self._commission}, 滑点={self._slippage}"
+            f"回测引擎初始化: 初始资金={self._initial_capital/10000:.1f}万, "
+            f"佣金={self._commission*10000:.1f}‱, 滑点={self._slippage*100:.2f}%"
         )
     
     def run(
         self,
         strategy: BaseStrategy,
         price_data: pd.DataFrame,
-        signals: Optional[pd.Series] = None
+        factor_data: Optional[pd.DataFrame] = None,
+        target_weights: Optional[pd.DataFrame] = None,
+        objective: str = "equal_weight"
     ) -> BacktestResult:
         """
-        执行回测
+        执行回测 - 权重驱动模式
         
-        对于小资金账户（< 50万），强制使用 Simple 模式以确保佣金计算准确。
-        VectorBT 无法精确模拟 A股"最低5元佣金"规则，对小资金影响显著。
+        使用策略的generate_target_weights获取目标权重，驱动多资产组合交易。
         
         Parameters
         ----------
         strategy : BaseStrategy
-            交易策略实例
+            交易策略实例（需实现generate_target_weights方法）
         price_data : pd.DataFrame
-            价格数据，必须包含 'close' 列
-        signals : Optional[pd.Series]
-            预计算的信号序列，如果为None则调用策略生成
+            价格数据，DataFrame格式：
+            - Index: DatetimeIndex（交易日期）
+            - Columns: 股票代码
+            - Values: 收盘价（必须有'close'列或直接以股票代码为列）
+        factor_data : Optional[pd.DataFrame]
+            因子数据，用于调用generate_target_weights
+            如果为None，需要提供target_weights
+        target_weights : Optional[pd.DataFrame]
+            预计算的目标权重矩阵
+            如果提供，则跳过generate_target_weights调用
+        objective : str
+            权重优化目标，可选：'equal_weight', 'max_sharpe', 'min_volatility'
         
         Returns
         -------
         BacktestResult
             回测结果
+        
+        Raises
+        ------
+        ValueError
+            如果无法生成目标权重
         """
         logger.info(f"开始回测策略: {strategy.name}")
         
-        # 生成信号
-        if signals is None:
-            signals = strategy.generate_signals(price_data)
+        # ========================================
+        # Step 1: 准备价格数据
+        # ========================================
+        # 处理价格数据格式：如果包含'close'列，提取收盘价；否则假设已是股票价格矩阵
+        if isinstance(price_data.columns, pd.MultiIndex):
+            # 多级列索引，提取收盘价
+            close_prices = price_data.xs('close', axis=1, level=1) if 'close' in price_data.columns.get_level_values(1) else price_data
+        elif 'close' in price_data.columns and len(price_data.columns) < 10:
+            # 单资产数据（包含OHLCV）
+            raise ValueError(
+                "价格数据需要为多资产DataFrame格式 (Index=日期, Columns=股票代码). "
+                "当前数据看起来是单资产OHLCV格式。"
+            )
+        else:
+            # 假设已经是价格矩阵（Index=日期, Columns=股票代码）
+            close_prices = price_data.copy()
         
-        # === 小资金账户强制使用 Simple 模式 ===
-        # 原因：VectorBT 无法精确模拟 A股"最低5元佣金"规则
-        # 对于30万资金，每笔交易约3-6万，按万三计算只有9-18元
-        # 但实际最低5元的限制会导致费率实际高达万1.5左右
-        use_simple_mode = (
-            self._force_simple_mode or 
-            self._initial_capital < self.SMALL_CAPITAL_THRESHOLD
+        logger.info(f"价格数据: {len(close_prices)} 天, {len(close_prices.columns)} 只股票")
+        
+        # ========================================
+        # Step 2: 生成目标权重
+        # ========================================
+        if target_weights is not None:
+            # 使用预计算的权重
+            weights = target_weights.copy()
+            logger.info(f"使用预计算目标权重: {weights.shape}")
+        elif hasattr(strategy, 'generate_target_weights') and factor_data is not None:
+            # 调用策略的generate_target_weights方法
+            logger.info("调用策略 generate_target_weights 生成目标权重...")
+            weights = strategy.generate_target_weights(
+                factor_data=factor_data,
+                prices=close_prices,
+                objective=objective,
+                risk_free_rate=self._risk_free_rate
+            )
+            logger.info(f"目标权重生成完成: {weights.shape}")
+        else:
+            raise ValueError(
+                "无法生成目标权重：需要提供 (factor_data + strategy.generate_target_weights) "
+                "或预计算的 target_weights 参数"
+            )
+        
+        # ========================================
+        # Step 3: 执行回测
+        # ========================================
+        # 对齐日期：取权重和价格的交集
+        common_dates = weights.index.intersection(close_prices.index)
+        if len(common_dates) == 0:
+            raise ValueError("权重数据和价格数据没有共同日期")
+        
+        weights_aligned = weights.loc[common_dates]
+        prices_aligned = close_prices.loc[common_dates]
+        
+        # 确保列对齐
+        common_stocks = weights_aligned.columns.intersection(prices_aligned.columns)
+        if len(common_stocks) == 0:
+            raise ValueError("权重数据和价格数据没有共同股票")
+        
+        weights_aligned = weights_aligned[common_stocks]
+        prices_aligned = prices_aligned[common_stocks]
+        
+        logger.info(
+            f"对齐后数据: {len(common_dates)} 天, {len(common_stocks)} 只股票"
         )
         
-        if use_simple_mode:
-            if self._initial_capital < self.SMALL_CAPITAL_THRESHOLD:
-                logger.warning(
-                    f"小资金模式（{self._initial_capital/10000:.0f}万 < {self.SMALL_CAPITAL_THRESHOLD/10000:.0f}万）："
-                    f"强制使用简单回测引擎，以精确计算最低5元佣金"
-                )
-            result = self._run_simple(price_data, signals)
-        elif VBT_AVAILABLE:
-            logger.info("使用 VectorBT 回测引擎（大资金模式）")
-            result = self._run_vectorbt(price_data, signals)
-        else:
-            result = self._run_simple(price_data, signals)
+        # 执行权重驱动回测
+        result = self._run_simple(prices_aligned, weights_aligned)
         
         logger.info(
             f"回测完成: 总收益={result.total_return:.2%}, "
             f"夏普比率={result.sharpe_ratio:.2f}, "
-            f"最大回撤={result.max_drawdown:.2%}"
+            f"最大回撤={result.max_drawdown:.2%}, "
+            f"总交易={result.total_trades}笔"
         )
         
         return result
     
-    def _run_vectorbt(
-        self,
-        price_data: pd.DataFrame,
-        signals: pd.Series
-    ) -> BacktestResult:
-        """
-        使用VectorBT执行回测
-        
-        Parameters
-        ----------
-        price_data : pd.DataFrame
-            价格数据
-        signals : pd.Series
-            交易信号
-        
-        Returns
-        -------
-        BacktestResult
-            回测结果
-        """
-        close = price_data["close"]
-        
-        # 创建入场和出场信号
-        entries = signals == 1
-        exits = signals == -1
-        
-        # 构建投资组合
-        portfolio = vbt.Portfolio.from_signals(
-            close=close,
-            entries=entries,
-            exits=exits,
-            init_cash=self._initial_capital,
-            fees=self._commission,
-            slippage=self._slippage,
-            freq="1D"
-        )
-        
-        # 提取回测指标
-        stats = portfolio.stats()
-        trades = portfolio.trades.records_readable
-        
-        return BacktestResult(
-            total_return=stats.get("Total Return [%]", 0) / 100,
-            annual_return=stats.get("Annualized Return [%]", 0) / 100,
-            sharpe_ratio=stats.get("Sharpe Ratio", 0),
-            max_drawdown=stats.get("Max Drawdown [%]", 0) / 100,
-            win_rate=stats.get("Win Rate [%]", 0) / 100,
-            profit_factor=stats.get("Profit Factor", 0),
-            total_trades=stats.get("Total Trades", 0),
-            portfolio_values=portfolio.value(),
-            trade_records=trades if len(trades) > 0 else pd.DataFrame()
-        )
-    
     def _run_simple(
         self,
         price_data: pd.DataFrame,
-        signals: pd.Series
+        target_weights: pd.DataFrame
     ) -> BacktestResult:
         """
-        简单回测实现（不依赖VectorBT）
+        权重驱动的多资产组合回测（Simple模式）
         
-        增强版功能：
-        1. 跌停板卖出限制（Limit Down Lock-up）
+        核心特性：
+        1. 涨跌停板限制（Limit Down/Up）
         2. 整手交易（Round-Lot，100股为1手）
         3. A股最低5元佣金规则
+        4. 先卖后买执行顺序
         
         Parameters
         ----------
         price_data : pd.DataFrame
-            价格数据，可选包含 'low', 'high' 列用于跌停判断
-        signals : pd.Series
-            交易信号：1=买入, -1=卖出, 0=持有
+            价格数据，Index=日期，Columns=股票代码
+        target_weights : pd.DataFrame
+            目标权重，Index=日期，Columns=股票代码，值为0-1
         
         Returns
         -------
         BacktestResult
             回测结果
         """
-        close = price_data["close"]
+        # ========================================
+        # Step A: 初始化状态
+        # ========================================
+        cash = float(self._initial_capital)
+        # 持仓：股票代码 -> 持有股数
+        shares: Dict[str, int] = {stock: 0 for stock in price_data.columns}
+        
+        # 记录
+        portfolio_values_list: List[float] = []
+        trade_records_list: List[Dict[str, Any]] = []
+        daily_returns_list: List[float] = []
+        
+        # 日期和数据
+        dates = price_data.index.tolist()
+        stocks = list(price_data.columns)
+        n_days = len(dates)
+        
+        # 转换为numpy加速
+        prices_arr = price_data.values  # shape: (n_days, n_stocks)
+        weights_arr = target_weights.values  # shape: (n_days, n_stocks)
+        
+        # 股票代码到索引映射
+        stock_to_idx = {stock: i for i, stock in enumerate(stocks)}
         
         # ========================================
-        # Step A: 跌停板检测（Limit Down Detection）
+        # Step B: 涨跌停检测
         # ========================================
-        # A股跌停规则：
-        # - 主板/创业板（注册制前）：-10%
-        # - ST股：-5%
-        # - 科创板/创业板（注册制后）：-20%
-        # 
-        # 简化判断条件：
-        # 1. low == close（一字跌停或收盘跌停）
-        # 2. pct_change <= -9.5%（考虑涨跌幅限制的通用阈值）
-        # 
-        # 跌停时无法卖出，必须持有到下一个可交易日
-        is_limit_down = pd.Series(False, index=close.index)
+        # 计算日收益率用于涨跌停判断
+        returns = price_data.pct_change().fillna(0).values
         
-        if 'low' in price_data.columns:
-            pct_change = close.pct_change()
-            
-            # 跌停判断：最低价 == 收盘价 且 跌幅 >= 9.5%
-            is_limit_down = (
-                (price_data['low'] == close) & 
-                (pct_change <= -0.095)
-            ).fillna(False)
-            
-            limit_down_days = is_limit_down.sum()
-            if limit_down_days > 0:
-                logger.info(f"检测到 {limit_down_days} 个跌停交易日，卖出信号将被延迟")
+        # 涨停：涨幅 >= 9.5%（主板10%，考虑精度误差）
+        is_limit_up = returns >= 0.095
+        # 跌停：跌幅 <= -9.5%
+        is_limit_down = returns <= -0.095
+        
+        # 统计
+        total_limit_up = is_limit_up.sum()
+        total_limit_down = is_limit_down.sum()
+        if total_limit_up > 0 or total_limit_down > 0:
+            logger.info(f"检测到涨停 {total_limit_up} 次, 跌停 {total_limit_down} 次")
         
         # ========================================
-        # Step B: 整手交易模拟（Round-Lot Simulation）
+        # Step C: 每日交易模拟
         # ========================================
-        # A股最小交易单位 = 100股（1手）
-        # 
-        # 使用迭代模拟以精确计算：
-        # - 实际持仓股数（整手）
-        # - 现金余额
-        # - 跌停锁仓
-        
-        # 初始化变量
-        cash = self._initial_capital
-        shares = 0  # 当前持有股数
-        portfolio_values_list = []
-        trade_records_list = []
-        daily_returns_list = []
-        
-        # 跟踪状态
-        pending_sell = False  # 是否有待执行的卖出（因跌停被阻止）
-        blocked_sells_count = 0
+        blocked_sells = 0
+        blocked_buys = 0
         prev_portfolio_value = self._initial_capital
         
-        dates = close.index.tolist()
-        prices = close.values
-        signals_arr = signals.values
-        is_limit_down_arr = is_limit_down.values
-        
-        for i, date in enumerate(dates):
-            price = prices[i]
-            signal = signals_arr[i]
-            is_limit = is_limit_down_arr[i]
+        for day_idx in range(n_days):
+            date = dates[day_idx]
+            today_prices = prices_arr[day_idx]
+            today_weights = weights_arr[day_idx]
+            today_limit_up = is_limit_up[day_idx]
+            today_limit_down = is_limit_down[day_idx]
             
-            # 当日开盘时的持仓价值
-            current_position_value = shares * price
+            # ----------------------------------------
+            # 1. 计算当前总资产价值（开盘时估算）
+            # ----------------------------------------
+            position_value = sum(
+                shares[stock] * today_prices[stock_to_idx[stock]]
+                for stock in stocks
+                if not np.isnan(today_prices[stock_to_idx[stock]])
+            )
+            total_equity = cash + position_value
             
-            # === 处理待执行的卖出（上一日因跌停被阻止）===
-            if pending_sell and shares > 0:
-                if not is_limit:
-                    # 非跌停日，执行延迟的卖出
-                    sell_value = shares * price
-                    # 计算卖出成本（佣金 + 印花税）
-                    commission = max(5.0, sell_value * self._commission)
+            # ----------------------------------------
+            # 2. 计算目标持仓（基于目标权重）
+            # ----------------------------------------
+            target_shares_dict: Dict[str, int] = {}
+            
+            for stock_idx, stock in enumerate(stocks):
+                price = today_prices[stock_idx]
+                weight = today_weights[stock_idx]
+                
+                # 跳过无效价格
+                if np.isnan(price) or price <= 0:
+                    target_shares_dict[stock] = 0
+                    continue
+                
+                # 计算目标市值
+                target_value = total_equity * weight
+                
+                # 计算目标股数（向下取整到整手）
+                target_shares = int(target_value / price / self.ROUND_LOT) * self.ROUND_LOT
+                target_shares_dict[stock] = max(0, target_shares)
+            
+            # ----------------------------------------
+            # 3. 执行交易（先卖后买）
+            # ----------------------------------------
+            # 3.1 卖出操作（释放现金）
+            for stock_idx, stock in enumerate(stocks):
+                current_shares = shares[stock]
+                target = target_shares_dict[stock]
+                price = today_prices[stock_idx]
+                
+                if np.isnan(price) or price <= 0:
+                    continue
+                
+                if current_shares > target:
+                    # 需要卖出
+                    sell_shares = current_shares - target
+                    
+                    # 检查跌停限制
+                    if today_limit_down[stock_idx]:
+                        blocked_sells += 1
+                        continue  # 跌停无法卖出
+                    
+                    # 执行卖出
+                    sell_value = sell_shares * price
+                    
+                    # 计算卖出成本
+                    commission = max(self.MIN_COMMISSION_CNY, sell_value * self._commission)
                     slippage_cost = sell_value * self._slippage
                     
-                    cash += sell_value - commission - slippage_cost
+                    # 更新现金和持仓
+                    net_proceeds = sell_value - commission - slippage_cost
+                    cash += net_proceeds
+                    shares[stock] = target
                     
+                    # 记录交易
                     trade_records_list.append({
                         'date': date,
-                        'action': 'SELL_DELAYED',
-                        'shares': shares,
+                        'symbol': stock,
+                        'action': 'SELL',
+                        'shares': sell_shares,
                         'price': price,
                         'value': sell_value,
                         'commission': commission,
-                        'reason': 'limit_down_delayed'
+                        'slippage': slippage_cost,
+                        'net_proceeds': net_proceeds
                     })
-                    
-                    shares = 0
-                    pending_sell = False
-                # 如果还是跌停，继续持有
             
-            # === 处理当日信号 ===
-            if signal == 1 and shares == 0:
-                # 买入信号：计算整手股数
-                # target_shares = (可用资金 / 价格) 向下取整到100的倍数
-                available_cash = cash * (1 - self._slippage)  # 预留滑点
-                target_shares = int((available_cash / price) // 100) * 100
+            # 3.2 买入操作（使用可用现金）
+            # 按权重排序，优先买入高权重股票
+            buy_orders: List[tuple] = []
+            for stock_idx, stock in enumerate(stocks):
+                current_shares = shares[stock]
+                target = target_shares_dict[stock]
                 
-                if target_shares >= 100:
-                    buy_value = target_shares * price
-                    # 计算买入成本
-                    commission = max(5.0, buy_value * self._commission)
+                if target > current_shares:
+                    weight = today_weights[stock_idx]
+                    buy_orders.append((stock, stock_idx, target - current_shares, weight))
+            
+            # 按权重降序排列
+            buy_orders.sort(key=lambda x: x[3], reverse=True)
+            
+            for stock, stock_idx, buy_shares, _ in buy_orders:
+                price = today_prices[stock_idx]
+                
+                if np.isnan(price) or price <= 0:
+                    continue
+                
+                # 检查涨停限制
+                if today_limit_up[stock_idx]:
+                    blocked_buys += 1
+                    continue  # 涨停无法买入
+                
+                # 计算买入成本
+                buy_value = buy_shares * price
+                commission = max(self.MIN_COMMISSION_CNY, buy_value * self._commission)
+                slippage_cost = buy_value * self._slippage
+                total_cost = buy_value + commission + slippage_cost
+                
+                # 检查现金是否充足
+                if total_cost > cash:
+                    # 调整买入数量到可负担的最大整手数
+                    affordable_value = cash / (1 + self._commission + self._slippage)
+                    buy_shares = int(affordable_value / price / self.ROUND_LOT) * self.ROUND_LOT
+                    
+                    if buy_shares < self.ROUND_LOT:
+                        continue  # 资金不足，跳过
+                    
+                    buy_value = buy_shares * price
+                    commission = max(self.MIN_COMMISSION_CNY, buy_value * self._commission)
                     slippage_cost = buy_value * self._slippage
                     total_cost = buy_value + commission + slippage_cost
-                    
-                    if total_cost <= cash:
-                        cash -= total_cost
-                        shares = target_shares
-                        
-                        trade_records_list.append({
-                            'date': date,
-                            'action': 'BUY',
-                            'shares': shares,
-                            'price': price,
-                            'value': buy_value,
-                            'commission': commission,
-                            'reason': 'signal'
-                        })
-                        pending_sell = False  # 买入后取消待执行的卖出
+                
+                # 执行买入
+                cash -= total_cost
+                shares[stock] += buy_shares
+                
+                # 记录交易
+                trade_records_list.append({
+                    'date': date,
+                    'symbol': stock,
+                    'action': 'BUY',
+                    'shares': buy_shares,
+                    'price': price,
+                    'value': buy_value,
+                    'commission': commission,
+                    'slippage': slippage_cost,
+                    'total_cost': total_cost
+                })
             
-            elif signal == -1 and shares > 0:
-                # 卖出信号：检查是否跌停
-                if is_limit:
-                    # 跌停无法卖出，标记待执行卖出
-                    pending_sell = True
-                    blocked_sells_count += 1
-                else:
-                    # 正常卖出
-                    sell_value = shares * price
-                    commission = max(5.0, sell_value * self._commission)
-                    slippage_cost = sell_value * self._slippage
-                    
-                    cash += sell_value - commission - slippage_cost
-                    
-                    trade_records_list.append({
-                        'date': date,
-                        'action': 'SELL',
-                        'shares': shares,
-                        'price': price,
-                        'value': sell_value,
-                        'commission': commission,
-                        'reason': 'signal'
-                    })
-                    
-                    shares = 0
-            
-            # 计算当日收盘时的组合价值
-            current_portfolio_value = cash + shares * price
+            # ----------------------------------------
+            # 4. 计算收盘时组合价值
+            # ----------------------------------------
+            position_value_eod = sum(
+                shares[stock] * today_prices[stock_to_idx[stock]]
+                for stock in stocks
+                if not np.isnan(today_prices[stock_to_idx[stock]])
+            )
+            current_portfolio_value = cash + position_value_eod
             portfolio_values_list.append(current_portfolio_value)
             
             # 计算日收益率
-            if prev_portfolio_value > 0:
-                daily_return = (current_portfolio_value / prev_portfolio_value) - 1
-            else:
-                daily_return = 0.0
+            daily_return = (current_portfolio_value / prev_portfolio_value) - 1 if prev_portfolio_value > 0 else 0
             daily_returns_list.append(daily_return)
-            
             prev_portfolio_value = current_portfolio_value
         
-        if blocked_sells_count > 0:
-            logger.info(f"因跌停限制，{blocked_sells_count} 次卖出信号被延迟")
+        # 统计受限交易
+        if blocked_sells > 0 or blocked_buys > 0:
+            logger.info(f"受涨跌停限制: {blocked_sells} 次卖出被阻止, {blocked_buys} 次买入被阻止")
         
         # ========================================
-        # 计算绩效指标
+        # Step D: 计算绩效指标
         # ========================================
-        portfolio_values = pd.Series(portfolio_values_list, index=close.index)
-        strategy_returns = pd.Series(daily_returns_list, index=close.index)
+        portfolio_values = pd.Series(portfolio_values_list, index=dates)
+        strategy_returns = pd.Series(daily_returns_list, index=dates)
         
         # 总收益率
         total_return = portfolio_values.iloc[-1] / self._initial_capital - 1
         
         # 年化收益率
         trading_days = len(portfolio_values)
-        years = trading_days / 252
-        annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+        years = trading_days / self.TRADING_DAYS_PER_YEAR
+        if years > 0 and (1 + total_return) > 0:
+            annual_return = (1 + total_return) ** (1 / years) - 1
+        else:
+            annual_return = 0.0
         
         # 夏普比率
-        excess_returns = strategy_returns - self._risk_free_rate / 252
-        sharpe_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std() \
-            if excess_returns.std() > 0 else 0
+        excess_returns = strategy_returns - self._risk_free_rate / self.TRADING_DAYS_PER_YEAR
+        if excess_returns.std() > 0:
+            sharpe_ratio = np.sqrt(self.TRADING_DAYS_PER_YEAR) * excess_returns.mean() / excess_returns.std()
+        else:
+            sharpe_ratio = 0.0
         
         # 最大回撤
         peak = portfolio_values.expanding().max()
         drawdown = (portfolio_values - peak) / peak
-        max_drawdown = drawdown.min()
+        max_drawdown = abs(drawdown.min())
         
         # 交易统计
         trade_records = pd.DataFrame(trade_records_list)
         total_trades = len(trade_records_list)
         
-        if total_trades > 0:
-            # 胜率：盈利交易数 / 总交易数
-            sells = trade_records[trade_records['action'].str.contains('SELL')]
-            buys = trade_records[trade_records['action'] == 'BUY']
+        # 胜率和盈亏比计算
+        win_rate = 0.0
+        profit_factor = 0.0
+        
+        if total_trades > 0 and not trade_records.empty:
+            # 按股票分组计算完整交易的盈亏
+            completed_trades = self._calculate_trade_pnl(trade_records)
             
-            if len(sells) > 0 and len(buys) > 0:
-                # 简化计算：比较卖出价值与买入价值
-                buy_values = buys['value'].values
-                sell_values = sells['value'].values[:len(buy_values)]
+            if len(completed_trades) > 0:
+                wins = completed_trades[completed_trades['pnl'] > 0]
+                losses = completed_trades[completed_trades['pnl'] <= 0]
                 
-                if len(sell_values) > 0:
-                    profits = sell_values - buy_values[:len(sell_values)]
-                    wins = (profits > 0).sum()
-                    win_rate = wins / len(profits) if len(profits) > 0 else 0
-                    
-                    gross_profit = profits[profits > 0].sum()
-                    gross_loss = abs(profits[profits < 0].sum())
-                    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-                else:
-                    win_rate = 0.0
-                    profit_factor = 0.0
-            else:
-                win_rate = 0.0
-                profit_factor = 0.0
-        else:
-            win_rate = 0.0
-            profit_factor = 0.0
+                win_rate = len(wins) / len(completed_trades) if len(completed_trades) > 0 else 0
+                
+                gross_profit = wins['pnl'].sum() if len(wins) > 0 else 0
+                gross_loss = abs(losses['pnl'].sum()) if len(losses) > 0 else 0
+                profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
         
         return BacktestResult(
             total_return=total_return,
             annual_return=annual_return,
             sharpe_ratio=sharpe_ratio,
-            max_drawdown=abs(max_drawdown),
+            max_drawdown=max_drawdown,
             win_rate=win_rate,
-            profit_factor=profit_factor,
+            profit_factor=profit_factor if not np.isinf(profit_factor) else 0.0,
             total_trades=total_trades,
             portfolio_values=portfolio_values,
             trade_records=trade_records
         )
     
+    def _calculate_trade_pnl(self, trade_records: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算每笔完整交易的盈亏
+        
+        将买入和卖出配对，计算实际盈亏。
+        
+        Parameters
+        ----------
+        trade_records : pd.DataFrame
+            交易记录
+        
+        Returns
+        -------
+        pd.DataFrame
+            完整交易的盈亏记录
+        """
+        if trade_records.empty:
+            return pd.DataFrame()
+        
+        completed = []
+        
+        # 按股票分组
+        for symbol in trade_records['symbol'].unique():
+            symbol_trades = trade_records[trade_records['symbol'] == symbol].sort_values('date')
+            
+            # 追踪持仓成本
+            position = 0
+            avg_cost = 0.0
+            
+            for _, trade in symbol_trades.iterrows():
+                if trade['action'] == 'BUY':
+                    # 更新平均成本
+                    new_shares = trade['shares']
+                    buy_cost = trade.get('total_cost', trade['value'] + trade['commission'])
+                    
+                    if position + new_shares > 0:
+                        avg_cost = (avg_cost * position + buy_cost) / (position + new_shares)
+                    position += new_shares
+                    
+                elif trade['action'] == 'SELL' and position > 0:
+                    # 计算卖出盈亏
+                    sell_shares = min(trade['shares'], position)
+                    sell_proceeds = trade.get('net_proceeds', trade['value'] - trade['commission'])
+                    cost_basis = avg_cost * sell_shares / position * position if position > 0 else 0
+                    
+                    # 按比例计算成本
+                    cost_basis = (sell_shares / position) * (avg_cost * position) if position > 0 else 0
+                    pnl = (sell_proceeds / sell_shares - avg_cost) * sell_shares if sell_shares > 0 else 0
+                    
+                    completed.append({
+                        'symbol': symbol,
+                        'entry_date': symbol_trades[symbol_trades['action'] == 'BUY']['date'].iloc[0] if len(symbol_trades[symbol_trades['action'] == 'BUY']) > 0 else trade['date'],
+                        'exit_date': trade['date'],
+                        'shares': sell_shares,
+                        'pnl': pnl
+                    })
+                    
+                    position -= sell_shares
+        
+        return pd.DataFrame(completed)
+    
     def run_optimization(
         self,
         strategy_class: type,
         price_data: pd.DataFrame,
-        param_grid: Dict[str, List[Any]]
+        param_grid: Dict[str, List[Any]],
+        factor_data: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """
         参数优化
@@ -496,6 +628,8 @@ class BacktestEngine:
             价格数据
         param_grid : Dict[str, List[Any]]
             参数网格，如 {"short_window": [5, 10], "long_window": [20, 30]}
+        factor_data : Optional[pd.DataFrame]
+            因子数据
         
         Returns
         -------
@@ -520,7 +654,7 @@ class BacktestEngine:
             
             try:
                 strategy = strategy_class(config=params)
-                result = self.run(strategy, price_data)
+                result = self.run(strategy, price_data, factor_data=factor_data)
                 
                 results.append({
                     **params,
@@ -543,7 +677,8 @@ class BacktestEngine:
     def compare_strategies(
         self,
         strategies: List[BaseStrategy],
-        price_data: pd.DataFrame
+        price_data: pd.DataFrame,
+        factor_data: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """
         策略对比
@@ -554,6 +689,8 @@ class BacktestEngine:
             策略列表
         price_data : pd.DataFrame
             价格数据
+        factor_data : Optional[pd.DataFrame]
+            因子数据
         
         Returns
         -------
@@ -565,7 +702,7 @@ class BacktestEngine:
         results = []
         for strategy in strategies:
             try:
-                result = self.run(strategy, price_data)
+                result = self.run(strategy, price_data, factor_data=factor_data)
                 results.append({
                     "strategy": strategy.name,
                     "total_return": result.total_return,
@@ -664,6 +801,38 @@ class PerformanceAnalyzer:
             "最大回撤结束": max_dd_end,
             "平均回撤": f"{abs(drawdown.mean()):.2%}",
             "回撤序列": drawdown,
+        }
+    
+    def trade_analysis(self) -> Dict[str, Any]:
+        """
+        交易分析
+        
+        Returns
+        -------
+        Dict[str, Any]
+            交易统计信息
+        """
+        trades = self.result.trade_records
+        
+        if trades.empty:
+            return {
+                "总交易次数": 0,
+                "买入次数": 0,
+                "卖出次数": 0,
+                "平均佣金": 0,
+                "总佣金": 0
+            }
+        
+        buys = trades[trades['action'] == 'BUY']
+        sells = trades[trades['action'] == 'SELL']
+        
+        return {
+            "总交易次数": len(trades),
+            "买入次数": len(buys),
+            "卖出次数": len(sells),
+            "平均佣金": trades['commission'].mean() if 'commission' in trades.columns else 0,
+            "总佣金": trades['commission'].sum() if 'commission' in trades.columns else 0,
+            "涉及股票数": trades['symbol'].nunique() if 'symbol' in trades.columns else 0,
         }
 
 
@@ -1381,4 +1550,3 @@ class VBTProBacktester:
         print(f"  交易费率:        {self.fees * 10000:.1f}‱ (双边)")
         print(f"  固定买入金额:    ¥{self.fixed_amount:,.0f}")
         print("=" * 60 + "\n")
-

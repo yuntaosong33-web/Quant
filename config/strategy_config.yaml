@@ -90,8 +90,8 @@ risk:
 
 # 交易配置
 trading:
-  # 交易费用（双边）
-  commission_rate: 0.001
+  # 交易费用（双边）- 标准A股费率
+  commission_rate: 0.0003
   
   # 印花税（卖出时）
   stamp_duty: 0.001
