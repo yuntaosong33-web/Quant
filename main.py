@@ -391,28 +391,43 @@ class DailyUpdateRunner:
     
     def update_financial_data(self) -> bool:
         """
-        更新财务数据
+        更新财务数据（实盘安全版）
         
         使用 DataLoader.fetch_financial_indicator 获取真实的 PE、PB、ROE 等数据。
+        采用 Fail Fast 机制，确保实盘安全：
+        - 不使用任何虚假/备用数据填充
+        - 失败股票标记为无效，从选股池中剔除
+        - 失败率超过阈值时终止程序并报警
         
         Returns
         -------
         bool
             更新是否成功
+        
+        Raises
+        ------
+        RuntimeError
+            当财务数据获取失败率超过 30% 时
         """
-        self.logger.info("开始更新财务数据...")
+        self.logger.info("开始更新财务数据（实盘安全模式）...")
+        
+        # 失败率阈值（超过此比例将触发 Critical Error）
+        FAILURE_THRESHOLD = 0.30  # 30%
         
         try:
             if self.ohlcv_data is None:
                 self.logger.warning("OHLCV 数据为空，无法生成财务数据")
                 return False
             
-            stocks = self.ohlcv_data['stock_code'].unique()
-            self.logger.info(f"需获取 {len(stocks)} 只股票的财务数据")
+            stocks = self.ohlcv_data['stock_code'].unique().tolist()
+            total_stocks = len(stocks)
+            self.logger.info(f"需获取 {total_stocks} 只股票的财务数据")
             
             # 使用真实数据接口获取财务指标
             financial_records = []
             failed_stocks = []
+            
+            import time
             
             for i, stock in enumerate(stocks):
                 try:
@@ -425,47 +440,109 @@ class DailyUpdateRunner:
                             latest = fin_df.iloc[-1] if len(fin_df) > 1 else fin_df.iloc[0]
                             
                             # 构建财务记录
+                            circ_mv = self._safe_get_value(latest, ['circ_mv', '流通市值'], default=np.nan)
+                            total_mv = self._safe_get_value(latest, ['total_mv', '总市值'], default=np.nan)
+                            
+                            # 检查关键字段是否有效（流通市值对小市值策略至关重要）
+                            has_valid_mv = pd.notna(circ_mv) or pd.notna(total_mv)
+                            
                             record = {
                                 'stock_code': stock,
                                 'pe_ttm': self._safe_get_value(latest, ['pe_ttm', 'pe', '市盈率'], default=np.nan),
                                 'pb': self._safe_get_value(latest, ['pb', '市净率'], default=np.nan),
-                                'dividend_yield': self._safe_get_value(latest, ['dividend_yield', 'dv_ratio', '股息率'], default=0.0),
+                                'dividend_yield': self._safe_get_value(latest, ['dividend_yield', 'dv_ratio', '股息率'], default=np.nan),
                                 'ps_ttm': self._safe_get_value(latest, ['ps_ttm', 'ps', '市销率'], default=np.nan),
                                 'roe': self._safe_get_value(latest, ['roe', 'roe_ttm'], default=np.nan),
-                                'total_mv': self._safe_get_value(latest, ['total_mv', '总市值'], default=np.nan),
-                                'circ_mv': self._safe_get_value(latest, ['circ_mv', '流通市值'], default=np.nan),
+                                'total_mv': total_mv,
+                                'circ_mv': circ_mv,
+                                # 标记数据是否有效（用于后续过滤）
+                                'data_valid': has_valid_mv,
                             }
                             
-                            # 估算上市天数（如果无法获取，使用默认值）
+                            # 估算上市天数
                             record['listing_days'] = self._estimate_listing_days(stock)
                             
                             financial_records.append(record)
-                            self.logger.debug(f"获取 {stock} 财务数据成功: PE={record['pe_ttm']:.2f}" if not np.isnan(record['pe_ttm']) else f"获取 {stock} 财务数据成功")
+                            
+                            if has_valid_mv:
+                                self.logger.debug(
+                                    f"✓ {stock} 财务数据有效: "
+                                    f"circ_mv={circ_mv/1e8:.2f}亿" if pd.notna(circ_mv) else f"✓ {stock} 财务数据获取成功"
+                                )
+                            else:
+                                # 数据获取成功但缺少关键字段，标记为失败
+                                self.logger.warning(
+                                    f"⚠ {stock} 缺少关键市值数据，将从选股池中剔除"
+                                )
+                                failed_stocks.append(stock)
                         else:
+                            self.logger.warning(f"⚠ {stock} 财务数据为空，将从选股池中剔除")
                             failed_stocks.append(stock)
                     else:
+                        self.logger.warning(f"⚠ {stock} 无法获取财务数据，将从选股池中剔除")
                         failed_stocks.append(stock)
                         
                 except Exception as e:
-                    self.logger.debug(f"获取 {stock} 财务数据失败: {e}")
+                    self.logger.warning(f"⚠ {stock} 财务数据获取异常: {e}，将从选股池中剔除")
                     failed_stocks.append(stock)
                 
                 # 进度日志
                 if (i + 1) % 10 == 0:
-                    self.logger.info(f"财务数据获取进度: {i + 1}/{len(stocks)}")
+                    current_failure_rate = len(failed_stocks) / (i + 1)
+                    self.logger.info(
+                        f"财务数据获取进度: {i + 1}/{total_stocks} | "
+                        f"失败: {len(failed_stocks)} ({current_failure_rate:.1%})"
+                    )
                 
                 # 添加延时避免请求过快
-                import time
                 time.sleep(0.1)
             
-            # 对于获取失败的股票，使用备用数据（市场平均值或模拟值）
+            # ========== Fail Fast 检查 ==========
+            failure_rate = len(failed_stocks) / total_stocks if total_stocks > 0 else 0
+            
+            if failure_rate > FAILURE_THRESHOLD:
+                error_msg = (
+                    f"🚨 CRITICAL ERROR: 财务数据获取失败率过高!\n"
+                    f"   失败数量: {len(failed_stocks)}/{total_stocks} ({failure_rate:.1%})\n"
+                    f"   阈值: {FAILURE_THRESHOLD:.0%}\n"
+                    f"   失败股票示例: {failed_stocks[:10]}...\n"
+                    f"   为确保实盘安全，程序终止。请检查数据源或网络连接。"
+                )
+                self.logger.critical(error_msg)
+                
+                # 尝试发送报警通知
+                try:
+                    token = os.environ.get("PUSHPLUS_TOKEN", "")
+                    if not token:
+                        token = self.config.get("notification", {}).get("pushplus_token", "")
+                    if token:
+                        send_pushplus_msg(
+                            token=token,
+                            title="🚨 量化系统 Critical Error",
+                            content=error_msg.replace("\n", "<br>"),
+                            template="html"
+                        )
+                except Exception:
+                    pass
+                
+                raise RuntimeError(error_msg)
+            
+            # ========== 处理失败股票（不使用 Fallback，仅记录） ==========
             if failed_stocks:
-                self.logger.warning(f"{len(failed_stocks)} 只股票财务数据获取失败，使用备用数据")
-                fallback_records = self._generate_fallback_financial_data(failed_stocks)
-                financial_records.extend(fallback_records)
+                self.logger.warning(
+                    f"📊 财务数据获取结果:\n"
+                    f"   成功: {total_stocks - len(failed_stocks)}/{total_stocks}\n"
+                    f"   失败: {len(failed_stocks)}/{total_stocks} ({failure_rate:.1%})\n"
+                    f"   ⚠ 失败股票将被排除在选股池之外（不使用虚假数据填充）"
+                )
+                
+                # 保存失败股票列表供后续过滤使用
+                self._excluded_stocks = set(failed_stocks)
+            else:
+                self._excluded_stocks = set()
             
             if not financial_records:
-                self.logger.error("未获取到任何财务数据")
+                self.logger.error("未获取到任何有效财务数据")
                 return False
             
             self.financial_data = pd.DataFrame(financial_records)
@@ -476,10 +553,14 @@ class DailyUpdateRunner:
             # 获取行业数据
             self.industry_data = self._fetch_industry_data(stocks)
             
+            # 统计有效数据
+            valid_count = self.financial_data['data_valid'].sum() if 'data_valid' in self.financial_data.columns else len(self.financial_data)
+            
             self.logger.info(
-                f"财务数据更新完成，共 {len(self.financial_data)} 条记录，"
-                f"成功 {len(self.financial_data) - len(failed_stocks)} 只，"
-                f"备用 {len(failed_stocks)} 只"
+                f"✅ 财务数据更新完成:\n"
+                f"   总记录: {len(self.financial_data)}\n"
+                f"   有效数据: {valid_count}\n"
+                f"   已剔除: {len(failed_stocks)} 只股票"
             )
             
             # 保存数据
@@ -489,6 +570,9 @@ class DailyUpdateRunner:
             
             return True
             
+        except RuntimeError:
+            # Critical Error，直接向上抛出
+            raise
         except Exception as e:
             self.logger.error(f"更新财务数据失败: {e}")
             import traceback
@@ -563,9 +647,10 @@ class DailyUpdateRunner:
     
     def _generate_fallback_financial_data(self, stocks: List[str]) -> List[Dict[str, Any]]:
         """
-        为获取失败的股票生成备用财务数据
+        [已废弃] 为获取失败的股票生成备用财务数据
         
-        使用已获取数据的中位数或合理默认值。
+        此方法已被废弃，实盘环境下禁止使用虚假数据填充。
+        调用此方法将抛出 RuntimeError。
         
         Parameters
         ----------
@@ -575,34 +660,29 @@ class DailyUpdateRunner:
         Returns
         -------
         List[Dict[str, Any]]
-            备用财务数据记录列表
+            不会返回，直接抛出异常
+        
+        Raises
+        ------
+        RuntimeError
+            始终抛出，禁止使用备用数据
+        
+        Notes
+        -----
+        实盘安全策略：
+        - 失败股票应直接从选股池中剔除，而非用虚假数据填充
+        - 使用中位数/默认值填充可能导致选股失真，造成实盘亏损
+        - 正确做法：在 calculate_factors 时过滤掉 data_valid=False 的股票
         """
-        # 计算已获取数据的中位数作为备用值
-        if hasattr(self, 'financial_data') and self.financial_data is not None and len(self.financial_data) > 0:
-            median_pe = self.financial_data['pe_ttm'].median()
-            median_pb = self.financial_data['pb'].median() if 'pb' in self.financial_data.columns else 2.0
-            median_roe = self.financial_data['roe'].median() if 'roe' in self.financial_data.columns else 0.10
-        else:
-            # 使用市场平均值作为默认
-            median_pe = 15.0
-            median_pb = 2.0
-            median_roe = 0.10
-        
-        fallback_records = []
-        for stock in stocks:
-            fallback_records.append({
-                'stock_code': stock,
-                'pe_ttm': median_pe,
-                'pb': median_pb,
-                'dividend_yield': 0.02,  # 默认2%股息率
-                'ps_ttm': 3.0,
-                'roe': median_roe,
-                'total_mv': np.nan,
-                'circ_mv': np.nan,
-                'listing_days': 500,  # 默认上市500天
-            })
-        
-        return fallback_records
+        error_msg = (
+            f"🚨 安全警告: 禁止使用备用财务数据!\n"
+            f"   请求填充 {len(stocks)} 只股票的虚假数据。\n"
+            f"   实盘环境下，这可能导致严重的选股失真。\n"
+            f"   正确做法：将这些股票从选股池中剔除。\n"
+            f"   股票列表: {stocks[:5]}..."
+        )
+        self.logger.critical(error_msg)
+        raise RuntimeError(error_msg)
     
     def _clean_financial_data(self) -> None:
         """
@@ -751,56 +831,130 @@ class DailyUpdateRunner:
         """
         检查大盘风控是否触发
         
-        风控条件：沪深300收盘价 < 20日均线
+        从配置文件读取风控参数：
+        - ma_period: 均线周期（默认60，即MA60牛熊线）
+        - drop_threshold: 跌幅阈值（默认0.05，即5%）
+        - drop_lookback: 跌幅回溯天数（默认20）
+        
+        风控触发条件（需同时满足）：
+        1. 收盘价 < MA{ma_period}（跌破均线）
+        2. （可选）近{drop_lookback}日跌幅 > {drop_threshold}
         
         Returns
         -------
         bool
             True 表示风控触发（应空仓），False 表示正常
+        
+        Notes
+        -----
+        风控参数从 config['risk']['market_risk'] 中读取，支持动态配置。
         """
+        # 读取风控配置
+        risk_config = self.config.get("risk", {})
+        market_risk_config = risk_config.get("market_risk", {})
+        
+        # 检查是否启用风控
+        if not market_risk_config.get("enabled", True):
+            self.logger.debug("大盘风控已禁用")
+            return False
+        
+        # 读取风控参数（从配置文件，支持动态调整）
+        ma_period = market_risk_config.get("ma_period", 60)  # 默认使用 MA60
+        drop_threshold = market_risk_config.get("drop_threshold", 0.05)  # 默认 5%
+        drop_lookback = market_risk_config.get("drop_lookback", 20)  # 默认 20 天
+        
         if self.benchmark_data is None or self.benchmark_data.empty:
             self.logger.debug("无基准数据，风控检查跳过")
             return False
         
         try:
-            # 获取最新数据
-            latest_data = self.benchmark_data.tail(20)
+            # 获取足够的历史数据用于计算均线
+            required_days = max(ma_period, drop_lookback) + 1
+            latest_data = self.benchmark_data.tail(required_days)
             
-            if len(latest_data) < 20:
-                self.logger.debug("基准数据不足20天，风控检查跳过")
+            if len(latest_data) < ma_period:
+                self.logger.debug(
+                    f"基准数据不足 {ma_period} 天（当前 {len(latest_data)} 天），"
+                    f"风控检查跳过"
+                )
                 return False
             
-            # 计算20日均线
-            ma20 = latest_data['close'].mean()
+            # 计算移动平均线（使用配置的周期）
+            ma_value = latest_data['close'].tail(ma_period).mean()
             latest_close = latest_data['close'].iloc[-1]
             
-            is_triggered = latest_close < ma20
+            # 条件1：跌破均线
+            is_below_ma = latest_close < ma_value
+            
+            # 条件2：计算近期跌幅（可选条件）
+            is_drop_exceeded = False
+            recent_drop = 0.0
+            
+            if drop_threshold > 0 and len(latest_data) >= drop_lookback:
+                lookback_data = latest_data.tail(drop_lookback)
+                if len(lookback_data) >= 2:
+                    start_price = lookback_data['close'].iloc[0]
+                    end_price = lookback_data['close'].iloc[-1]
+                    recent_drop = (end_price - start_price) / start_price
+                    is_drop_exceeded = recent_drop < -drop_threshold
+            
+            # 综合判断：跌破均线 且 跌幅超过阈值（如果配置了阈值）
+            # 如果 drop_threshold <= 0，则只判断均线条件
+            if drop_threshold > 0:
+                is_triggered = is_below_ma and is_drop_exceeded
+            else:
+                is_triggered = is_below_ma
+            
+            # 优化的日志输出
+            ma_label = f"MA{ma_period}"
+            deviation_pct = (latest_close - ma_value) / ma_value * 100
             
             if is_triggered:
                 self.logger.warning(
-                    f"大盘风控触发: 沪深300收盘价 {latest_close:.2f} < MA20 {ma20:.2f}"
+                    f"🚨 大盘风控触发!\n"
+                    f"   当前点位: {latest_close:.2f} | {ma_label}: {ma_value:.2f} | "
+                    f"偏离: {deviation_pct:+.2f}%\n"
+                    f"   近{drop_lookback}日跌幅: {recent_drop*100:+.2f}% | "
+                    f"阈值: -{drop_threshold*100:.1f}%"
                 )
             else:
+                status = "✅" if latest_close >= ma_value else "⚠️"
                 self.logger.info(
-                    f"大盘风控正常: 沪深300收盘价 {latest_close:.2f} >= MA20 {ma20:.2f}"
+                    f"{status} 大盘风控检查: "
+                    f"点位 {latest_close:.2f} vs {ma_label} {ma_value:.2f} "
+                    f"(偏离 {deviation_pct:+.2f}%) | "
+                    f"近{drop_lookback}日变化: {recent_drop*100:+.2f}%"
                 )
+                
+                # 如果接近触发条件，额外警告
+                if is_below_ma and not is_drop_exceeded:
+                    self.logger.warning(
+                        f"   ⚠️ 已跌破 {ma_label}，但跌幅 ({recent_drop*100:+.2f}%) "
+                        f"未达阈值 (-{drop_threshold*100:.1f}%)，继续观察"
+                    )
             
             return is_triggered
             
         except Exception as e:
             self.logger.warning(f"风控检查失败: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return False
     
     def calculate_factors(self) -> bool:
         """
-        计算因子数据
+        计算因子数据（实盘安全版）
+        
+        包含以下安全机制：
+        - 过滤掉财务数据获取失败的股票
+        - 将无效数据的股票因子得分设为 -inf，确保不会被选中
         
         Returns
         -------
         bool
             计算是否成功
         """
-        self.logger.info("开始计算因子...")
+        self.logger.info("开始计算因子（实盘安全模式）...")
         
         try:
             # 即使财务数据更新失败，如果OHLCV数据存在，仍继续执行因子计算
@@ -820,10 +974,30 @@ class DailyUpdateRunner:
             if 'date' not in ohlcv.columns and 'trade_date' in ohlcv.columns:
                 ohlcv['date'] = pd.to_datetime(ohlcv['trade_date'])
             
+            # ========== 实盘安全：过滤掉被排除的股票 ==========
+            excluded_stocks = getattr(self, '_excluded_stocks', set())
+            if excluded_stocks:
+                original_count = len(ohlcv['stock_code'].unique())
+                ohlcv = ohlcv[~ohlcv['stock_code'].isin(excluded_stocks)]
+                filtered_count = len(ohlcv['stock_code'].unique())
+                self.logger.info(
+                    f"🛡️ 安全过滤: 已剔除 {original_count - filtered_count} 只"
+                    f"财务数据无效的股票（剩余 {filtered_count} 只）"
+                )
+            
             # 合并财务数据 (仅在财务数据存在时合并，避免硬依赖)
             if self.financial_data is not None and not self.financial_data.empty:
+                # 只合并有效数据
+                valid_financial = self.financial_data.copy()
+                if 'data_valid' in valid_financial.columns:
+                    invalid_count = (~valid_financial['data_valid']).sum()
+                    if invalid_count > 0:
+                        self.logger.warning(
+                            f"🛡️ 财务数据中有 {invalid_count} 条无效记录，将被标记"
+                        )
+                
                 factor_data = ohlcv.merge(
-                    self.financial_data,
+                    valid_financial,
                     on='stock_code',
                     how='left'
                 )
@@ -984,39 +1158,63 @@ class DailyUpdateRunner:
     
     def generate_target_positions(self) -> bool:
         """
-        生成目标持仓
+        生成目标持仓（实盘安全版）
         
-        包含大盘风控逻辑：当沪深300跌破20日均线时，强制空仓。
+        包含以下安全机制：
+        1. 大盘风控：当大盘跌破MA{n}且跌幅超阈值时，强制空仓
+        2. 数据验证：确保所选股票都有有效的财务数据
+        3. 结果校验：保存的 JSON 文件明确标记风控状态
         
         Returns
         -------
         bool
             生成是否成功
         """
-        self.logger.info("开始生成目标持仓...")
+        self.logger.info("开始生成目标持仓（实盘安全模式）...")
         
         try:
             # === 大盘风控检查 ===
             if self.is_market_risk_triggered():
-                self.logger.warning("大盘风控触发，系统强制空仓！")
+                self.logger.warning("🚨 大盘风控触发，系统强制空仓！")
                 self.target_positions = {}
+                
+                # 读取风控配置用于记录
+                risk_config = self.config.get("risk", {})
+                market_risk_config = risk_config.get("market_risk", {})
+                ma_period = market_risk_config.get("ma_period", 60)
+                drop_threshold = market_risk_config.get("drop_threshold", 0.05)
                 
                 # 保存空仓状态
                 portfolio_config = self.config.get("portfolio", {})
                 total_capital = portfolio_config.get("total_capital", 1000000)
                 
                 positions_path = DATA_PROCESSED_PATH / f"target_positions_{self.today.strftime('%Y%m%d')}.json"
-                with open(positions_path, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'date': self.today.strftime('%Y-%m-%d'),
-                        'positions': {},
-                        'weights': {},
-                        'total_capital': total_capital,
-                        'market_risk_triggered': True,
-                        'reason': '沪深300跌破20日均线，触发大盘风控'
-                    }, f, ensure_ascii=False, indent=2)
                 
-                self.logger.info("已保存空仓目标持仓（风控触发）")
+                # 构建空仓 JSON（实盘保护：确保 positions 为空字典）
+                empty_position_data = {
+                    'date': self.today.strftime('%Y-%m-%d'),
+                    'positions': {},  # 关键：确保为空字典
+                    'weights': {},    # 关键：确保为空字典
+                    'total_capital': total_capital,
+                    'market_risk_triggered': True,  # 关键：标记风控触发
+                    'reason': f'大盘跌破MA{ma_period}且跌幅超{drop_threshold*100:.0f}%，触发风控',
+                    'risk_params': {
+                        'ma_period': ma_period,
+                        'drop_threshold': drop_threshold,
+                    },
+                    'action': 'CLEAR_ALL_POSITIONS',  # 明确指令
+                    'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+                
+                with open(positions_path, 'w', encoding='utf-8') as f:
+                    json.dump(empty_position_data, f, ensure_ascii=False, indent=2)
+                
+                self.logger.info(
+                    f"✅ 已保存空仓目标持仓（风控触发）\n"
+                    f"   文件: {positions_path}\n"
+                    f"   positions: {{}}\n"
+                    f"   market_risk_triggered: True"
+                )
                 return True
             # =====================
             
@@ -1043,6 +1241,21 @@ class DailyUpdateRunner:
             
             # 选取 Top N 股票
             selected_stocks = self.strategy.select_top_stocks(filtered_data)
+            
+            # ========== 实盘安全：验证所选股票数据有效性 ==========
+            excluded_stocks = getattr(self, '_excluded_stocks', set())
+            invalid_selected = [s for s in selected_stocks if s in excluded_stocks]
+            
+            if invalid_selected:
+                self.logger.error(
+                    f"🚨 安全警告: 选中的股票中包含无效数据股票: {invalid_selected}\n"
+                    f"   这些股票将被移除。"
+                )
+                selected_stocks = [s for s in selected_stocks if s not in excluded_stocks]
+            
+            if not selected_stocks:
+                self.logger.error("过滤无效数据后无可选股票，取消本次调仓")
+                return False
             
             self.logger.info(f"选中 {len(selected_stocks)} 只股票: {selected_stocks[:5]}...")
             
@@ -1887,18 +2100,185 @@ def run_daily_update(
         return False
 
 
+def _load_backtest_financial_data(
+    stock_list: List[str],
+    start_date: str,
+    end_date: str,
+    data_loader: "DataLoader"
+) -> pd.DataFrame:
+    """
+    加载回测用历史财务数据（特别是流通市值 circ_mv）
+    
+    优先从本地 parquet 文件加载，如果不存在则尝试在线获取。
+    
+    Parameters
+    ----------
+    stock_list : List[str]
+        股票代码列表
+    start_date : str
+        开始日期 (YYYY-MM-DD)
+    end_date : str
+        结束日期 (YYYY-MM-DD)
+    data_loader : DataLoader
+        数据加载器实例
+    
+    Returns
+    -------
+    pd.DataFrame
+        财务数据，包含 date, stock_code, circ_mv, total_mv 等字段
+    
+    Raises
+    ------
+    FileNotFoundError
+        当本地无财务数据且无法在线获取时
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"加载回测财务数据: {len(stock_list)} 只股票, {start_date} ~ {end_date}")
+    
+    financial_records = []
+    failed_stocks = []
+    
+    # 尝试从本地加载已保存的财务数据
+    local_financial_path = DATA_RAW_PATH / "financial_data.parquet"
+    if local_financial_path.exists():
+        try:
+            local_df = pd.read_parquet(local_financial_path)
+            logger.info(f"从本地加载财务数据: {len(local_df)} 条记录")
+            
+            # 过滤日期范围和股票列表
+            if 'date' in local_df.columns:
+                local_df['date'] = pd.to_datetime(local_df['date'])
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                local_df = local_df[
+                    (local_df['date'] >= start_dt) & 
+                    (local_df['date'] <= end_dt) &
+                    (local_df['stock_code'].isin(stock_list))
+                ]
+                
+                if not local_df.empty and 'circ_mv' in local_df.columns:
+                    logger.info(f"本地财务数据过滤后: {len(local_df)} 条记录")
+                    return local_df
+        except Exception as e:
+            logger.warning(f"加载本地财务数据失败: {e}")
+    
+    # 尝试查找按日期保存的财务数据文件
+    financial_files = list(DATA_RAW_PATH.glob("financial_*.parquet"))
+    if financial_files:
+        logger.info(f"找到 {len(financial_files)} 个财务数据文件，尝试加载...")
+        all_financial_data = []
+        
+        for fpath in financial_files:
+            try:
+                df = pd.read_parquet(fpath)
+                if 'stock_code' in df.columns:
+                    # 从文件名提取日期
+                    date_str = fpath.stem.replace("financial_", "")
+                    if len(date_str) == 8:
+                        df['data_date'] = pd.to_datetime(date_str, format='%Y%m%d')
+                    all_financial_data.append(df)
+            except Exception as e:
+                logger.debug(f"加载 {fpath} 失败: {e}")
+        
+        if all_financial_data:
+            combined_df = pd.concat(all_financial_data, ignore_index=True)
+            if 'circ_mv' in combined_df.columns or 'total_mv' in combined_df.columns:
+                logger.info(f"合并财务数据: {len(combined_df)} 条记录")
+                return combined_df
+    
+    # 在线获取财务指标（仅获取当前快照，用于近期回测）
+    logger.warning("本地无历史财务数据，尝试在线获取当前财务指标...")
+    logger.warning("注意：在线获取的财务数据为当前快照，可能导致回测存在前视偏差")
+    
+    import time
+    for i, stock in enumerate(stock_list):
+        try:
+            fin_df = data_loader.fetch_financial_indicator(stock)
+            
+            if fin_df is not None and not fin_df.empty:
+                # 提取市值数据
+                if isinstance(fin_df, pd.DataFrame) and len(fin_df) > 0:
+                    latest = fin_df.iloc[-1] if len(fin_df) > 1 else fin_df.iloc[0]
+                    
+                    # 获取流通市值
+                    circ_mv = None
+                    total_mv = None
+                    
+                    for col in ['circ_mv', '流通市值']:
+                        if col in latest.index:
+                            circ_mv = latest[col]
+                            break
+                    
+                    for col in ['total_mv', '总市值']:
+                        if col in latest.index:
+                            total_mv = latest[col]
+                            break
+                    
+                    if circ_mv is not None or total_mv is not None:
+                        financial_records.append({
+                            'stock_code': stock,
+                            'circ_mv': circ_mv if circ_mv is not None else total_mv,
+                            'total_mv': total_mv if total_mv is not None else circ_mv,
+                            'pe_ttm': latest.get('pe_ttm', np.nan),
+                            'pb': latest.get('pb', np.nan),
+                        })
+                    else:
+                        failed_stocks.append(stock)
+                else:
+                    failed_stocks.append(stock)
+            else:
+                failed_stocks.append(stock)
+                
+        except Exception as e:
+            logger.debug(f"获取 {stock} 财务数据失败: {e}")
+            failed_stocks.append(stock)
+        
+        # 进度日志
+        if (i + 1) % 20 == 0:
+            logger.info(f"财务数据获取进度: {i + 1}/{len(stock_list)}")
+        
+        # 延时避免请求过快
+        if (i + 1) % 5 == 0:
+            time.sleep(0.5)
+    
+    if not financial_records:
+        error_msg = (
+            "无法获取财务数据（流通市值 circ_mv）。\n"
+            "小市值策略回测需要历史市值数据。请先运行以下命令下载数据：\n"
+            "  python tools/download_financial_data.py --start {start} --end {end}\n"
+            "或在 data/raw/ 目录下放置包含 circ_mv 字段的 financial_data.parquet 文件。"
+        ).format(start=start_date, end=end_date)
+        
+        logger.error(error_msg)
+        raise FileNotFoundError(error_msg)
+    
+    financial_df = pd.DataFrame(financial_records)
+    
+    if failed_stocks:
+        logger.warning(
+            f"部分股票财务数据获取失败: {len(failed_stocks)}/{len(stock_list)}, "
+            f"成功: {len(financial_records)}"
+        )
+    
+    logger.info(f"财务数据加载完成: {len(financial_df)} 只股票")
+    return financial_df
+
+
 def _generate_backtest_factor_data(
     price_data_dict: Dict[str, pd.DataFrame],
     close_df: pd.DataFrame,
-    strategy_config: Dict[str, Any]
+    strategy_config: Dict[str, Any],
+    financial_data: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
     """
-    生成回测用因子数据（简化版）
+    生成回测用因子数据（增强版）
     
-    为避免前视偏差，仅使用量价因子：
+    计算以下因子：
     - momentum_zscore: 基于 RSI_20 的动量因子
-    - value_zscore: 置为 0（无财务数据时）
-    - quality_zscore: 置为 0（无财务数据时）
+    - small_cap: 小市值因子 = -log(circ_mv)，市值越小分数越高
+    - small_cap_zscore: 小市值因子的 Z-Score 标准化
+    - turnover_5d: 5日平均换手率
+    - value_zscore, quality_zscore: 财务因子（需要财务数据）
     
     Parameters
     ----------
@@ -1908,16 +2288,48 @@ def _generate_backtest_factor_data(
         收盘价矩阵 (Index=日期, Columns=股票代码)
     strategy_config : Dict[str, Any]
         策略配置
+    financial_data : Optional[pd.DataFrame]
+        财务数据，包含 stock_code, circ_mv 等字段
     
     Returns
     -------
     pd.DataFrame
-        因子数据，格式为 MultiIndex (date, stock_code) 或含 date/stock_code 列
+        因子数据，包含 date, stock_code 及各类因子列
+    
+    Notes
+    -----
+    如果提供了 financial_data 且包含 circ_mv，将正确计算 small_cap 因子。
+    否则 small_cap 相关因子将被设置为 NaN，并记录警告。
     """
     logger = logging.getLogger(__name__)
-    logger.info("生成回测因子数据（简化版，仅量价因子）...")
+    
+    has_financial = (
+        financial_data is not None and 
+        not financial_data.empty and 
+        'circ_mv' in financial_data.columns
+    )
+    
+    if has_financial:
+        logger.info("生成回测因子数据（含财务因子：small_cap, value）...")
+    else:
+        logger.warning(
+            "生成回测因子数据（无财务数据，small_cap 因子将不可用）..."
+        )
     
     factor_records = []
+    
+    # 构建财务数据映射 {stock_code: {circ_mv, pe_ttm, ...}}
+    financial_map: Dict[str, Dict[str, Any]] = {}
+    if has_financial:
+        for _, row in financial_data.iterrows():
+            stock_code = row.get('stock_code', '')
+            if stock_code:
+                financial_map[stock_code] = {
+                    'circ_mv': row.get('circ_mv', np.nan),
+                    'total_mv': row.get('total_mv', np.nan),
+                    'pe_ttm': row.get('pe_ttm', np.nan),
+                    'pb': row.get('pb', np.nan),
+                }
     
     # 计算 RSI_20 for 每只股票
     def calculate_rsi(series: pd.Series, period: int = 20) -> pd.Series:
@@ -1946,8 +2358,32 @@ def _generate_backtest_factor_data(
         # 计算 RSI_20
         rsi_20 = calculate_rsi(df['close'], period=20)
         
+        # 计算 5 日平均换手率
+        turnover_5d = pd.Series(np.nan, index=df.index)
+        if 'turnover' in df.columns:
+            turnover_5d = df['turnover'].rolling(5, min_periods=1).mean()
+        
+        # 获取财务数据
+        fin_data = financial_map.get(stock_code, {})
+        circ_mv = fin_data.get('circ_mv', np.nan)
+        pe_ttm = fin_data.get('pe_ttm', np.nan)
+        
+        # 计算 small_cap 因子：-log(circ_mv)
+        # 市值越小，-log(市值) 越大，得分越高
+        if pd.notna(circ_mv) and circ_mv > 0:
+            small_cap = -np.log(circ_mv)
+        else:
+            small_cap = np.nan
+        
+        # 计算 EP_TTM (价值因子)
+        if pd.notna(pe_ttm) and pe_ttm > 0:
+            ep_ttm = 1.0 / pe_ttm
+        else:
+            ep_ttm = np.nan
+        
         for date in df.index:
             rsi_val = rsi_20.get(date, np.nan) if date in rsi_20.index else np.nan
+            turnover_val = turnover_5d.get(date, np.nan) if date in turnover_5d.index else np.nan
             close_price = df.loc[date, 'close'] if date in df.index else np.nan
             
             factor_records.append({
@@ -1955,9 +2391,13 @@ def _generate_backtest_factor_data(
                 'stock_code': stock_code,
                 'close': close_price,
                 'rsi_20': rsi_val,
-                # 模拟的财务因子（无实际财务数据时置为 0）
-                'ep_ttm': 0.0,
-                'roe_stability': 0.0,
+                'turnover_5d': turnover_val,
+                # 小市值因子（核心）
+                'small_cap': small_cap,
+                'circ_mv': circ_mv,
+                # 价值因子
+                'ep_ttm': ep_ttm,
+                'roe_stability': np.nan,  # 需要更多财务数据
                 # 估算上市天数（默认足够长以通过过滤）
                 'listing_days': 1000,
                 # 涨跌停标志（简化：默认无涨跌停）
@@ -1973,8 +2413,12 @@ def _generate_backtest_factor_data(
     # Z-Score 标准化（按日期分组）
     def zscore_by_date(group: pd.DataFrame, col: str) -> pd.Series:
         """按日期分组计算 Z-Score"""
-        mean_val = group[col].mean()
-        std_val = group[col].std()
+        valid_vals = group[col].dropna()
+        if len(valid_vals) < 2:
+            return pd.Series(np.nan, index=group.index)
+        
+        mean_val = valid_vals.mean()
+        std_val = valid_vals.std()
         if std_val > 0:
             return (group[col] - mean_val) / std_val
         else:
@@ -1985,18 +2429,53 @@ def _generate_backtest_factor_data(
         lambda g: zscore_by_date(g, 'rsi_20')
     ).reset_index(level=0, drop=True)
     
-    # 价值和质量因子置为 0（无财务数据）
-    factor_df['value_zscore'] = 0.0
-    factor_df['quality_zscore'] = 0.0
+    # 计算 Small Cap Z-Score（小市值因子）
+    if has_financial:
+        factor_df['small_cap_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'small_cap')
+        ).reset_index(level=0, drop=True)
+        
+        # 计算换手率 Z-Score
+        factor_df['turnover_5d_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'turnover_5d')
+        ).reset_index(level=0, drop=True)
+        
+        # 计算价值因子 Z-Score
+        factor_df['value_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'ep_ttm')
+        ).reset_index(level=0, drop=True)
+    else:
+        # 无财务数据时设置为 NaN（而不是 0，以便策略能识别）
+        factor_df['small_cap_zscore'] = np.nan
+        factor_df['turnover_5d_zscore'] = np.nan
+        factor_df['value_zscore'] = np.nan
+        
+        logger.warning(
+            "警告：无财务数据，small_cap_zscore 设置为 NaN。"
+            "回测结果将仅基于动量因子（RSI），无法体现小市值策略效果。"
+        )
     
-    # 填充 NaN
+    # 质量因子（需要更多财务数据，暂时设为 NaN）
+    factor_df['quality_zscore'] = np.nan
+    
+    # 填充动量因子的 NaN
     factor_df['momentum_zscore'] = factor_df['momentum_zscore'].fillna(0.0)
     
+    # 统计有效的小市值因子数量
+    valid_small_cap = factor_df['small_cap_zscore'].notna().sum()
+    total_records = len(factor_df)
+    
     logger.info(
-        f"因子数据生成完成: {len(factor_df)} 条记录, "
+        f"因子数据生成完成: {total_records} 条记录, "
         f"{factor_df['stock_code'].nunique()} 只股票, "
         f"{factor_df['date'].nunique()} 个交易日"
     )
+    
+    if has_financial:
+        logger.info(
+            f"小市值因子 (small_cap_zscore) 有效率: "
+            f"{valid_small_cap}/{total_records} ({valid_small_cap/total_records:.1%})"
+        )
     
     return factor_df
 
@@ -2033,10 +2512,17 @@ def run_backtest(
     -----
     回测流程：
     1. 加载历史 OHLCV 数据
-    2. 获取基准指数数据（用于大盘风控）
-    3. 生成因子数据（RSI_20 动量因子，财务因子置为 0）
-    4. 使用 BacktestEngine 执行权重驱动回测
-    5. 生成回测报告
+    2. 准备价格矩阵
+    3. 加载历史财务数据（特别是流通市值 circ_mv，用于小市值因子）
+    4. 获取基准指数数据（用于大盘风控）
+    5. 生成因子数据（含 small_cap = -log(circ_mv)，momentum 等）
+    6. 使用 BacktestEngine 执行权重驱动回测
+    7. 生成回测报告
+    
+    小市值策略要求：
+    - 需要本地存储的财务数据文件（data/raw/financial_*.parquet）
+    - 财务数据需包含 circ_mv（流通市值）字段
+    - 如果无财务数据，策略会自动退化为纯动量策略
     """
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
@@ -2075,7 +2561,7 @@ def run_backtest(
         # ========================================
         # Step 1: 加载历史数据
         # ========================================
-        logger.info("Step 1/6: 加载历史 OHLCV 数据")
+        logger.info("Step 1/7: 加载历史 OHLCV 数据")
         
         data_loader = DataLoader(output_dir=str(DATA_RAW_PATH))
         
@@ -2143,7 +2629,7 @@ def run_backtest(
         # ========================================
         # Step 2: 准备价格矩阵
         # ========================================
-        logger.info("Step 2/6: 准备价格矩阵")
+        logger.info("Step 2/7: 准备价格矩阵")
         
         # 构建收盘价 DataFrame (行=日期, 列=股票)
         close_prices = {}
@@ -2161,9 +2647,43 @@ def run_backtest(
         logger.info(f"价格矩阵: {close_df.shape[0]} 天 x {close_df.shape[1]} 只股票")
         
         # ========================================
-        # Step 3: 获取基准指数数据（用于大盘风控）
+        # Step 3: 加载历史财务数据（关键：小市值因子需要 circ_mv）
         # ========================================
-        logger.info(f"Step 3/6: 获取基准指数数据 ({benchmark_code})")
+        logger.info("Step 3/7: 加载历史财务数据（流通市值 circ_mv）")
+        
+        financial_data: Optional[pd.DataFrame] = None
+        has_financial_data = False
+        
+        try:
+            financial_data = _load_backtest_financial_data(
+                stock_list=list(price_data_dict.keys()),
+                start_date=start_date,
+                end_date=end_date,
+                data_loader=data_loader
+            )
+            
+            if financial_data is not None and not financial_data.empty:
+                has_financial_data = 'circ_mv' in financial_data.columns
+                logger.info(
+                    f"财务数据加载成功: {len(financial_data)} 条记录, "
+                    f"circ_mv 可用: {has_financial_data}"
+                )
+            else:
+                logger.warning("财务数据为空")
+                
+        except FileNotFoundError as e:
+            logger.error(f"财务数据加载失败: {e}")
+            logger.error("小市值策略回测需要财务数据。如果您只想运行动量策略，请继续；否则请先准备财务数据。")
+            # 不抛出异常，允许继续（退化为纯动量策略）
+            financial_data = None
+        except Exception as e:
+            logger.warning(f"加载财务数据时发生错误: {e}，将使用纯动量策略")
+            financial_data = None
+        
+        # ========================================
+        # Step 4: 获取基准指数数据（用于大盘风控）
+        # ========================================
+        logger.info(f"Step 4/7: 获取基准指数数据 ({benchmark_code})")
         
         benchmark_data: Optional[pd.DataFrame] = None
         
@@ -2189,14 +2709,18 @@ def run_backtest(
             benchmark_data = None
         
         # ========================================
-        # Step 4: 生成因子数据
+        # Step 5: 生成因子数据（含小市值因子）
         # ========================================
-        logger.info("Step 4/6: 生成因子数据（简化版，仅量价因子）")
+        if has_financial_data:
+            logger.info("Step 5/7: 生成因子数据（含小市值因子 small_cap）")
+        else:
+            logger.warning("Step 5/7: 生成因子数据（无财务数据，仅动量因子）")
         
         factor_data = _generate_backtest_factor_data(
             price_data_dict=price_data_dict,
             close_df=close_df,
-            strategy_config=strategy_config
+            strategy_config=strategy_config,
+            financial_data=financial_data
         )
         
         if factor_data.empty:
@@ -2204,49 +2728,76 @@ def run_backtest(
             return False
         
         # ========================================
-        # Step 5: 初始化策略和引擎，执行回测
+        # Step 6: 初始化策略和引擎，执行回测
         # ========================================
-        logger.info("Step 5/6: 初始化策略和引擎，执行回测")
+        logger.info("Step 6/7: 初始化策略和引擎，执行回测")
         
         if strategy_type == "multi_factor":
             # 多因子策略
-            # 从配置读取因子权重（如果财务因子不可用，动量权重会自动主导）
+            # 从配置读取因子权重
             value_weight = strategy_config.get("value_weight", 0.0)
             quality_weight = strategy_config.get("quality_weight", 0.0)
             momentum_weight = strategy_config.get("momentum_weight", 1.0)
+            size_weight = strategy_config.get("size_weight", 0.0)
             
-            # 如果财务因子权重非零但数据不可用，调整为纯动量策略
-            if value_weight > 0 or quality_weight > 0:
+            # 根据财务数据可用性调整策略配置
+            if has_financial_data:
+                # 财务数据可用，可以使用小市值策略
+                logger.info("财务数据可用，启用小市值因子 (small_cap)")
+                
+                # 如果配置了 size_weight 或策略需要小市值因子
+                if size_weight > 0 or strategy_config.get("use_small_cap", True):
+                    # 使用小市值因子
+                    value_col = strategy_config.get("value_col", "small_cap_zscore")
+                    size_col = strategy_config.get("size_col", "small_cap_zscore")
+                else:
+                    value_col = strategy_config.get("value_col", "value_zscore")
+                    size_col = strategy_config.get("size_col", "small_cap_zscore")
+            else:
+                # 无财务数据，退化为纯动量策略
                 logger.warning(
-                    f"配置了财务因子权重 (value={value_weight}, quality={quality_weight})，"
-                    f"但回测模式下无财务数据，自动调整为纯动量策略 (momentum=1.0)"
+                    f"无财务数据，小市值因子不可用。"
+                    f"自动调整为纯动量策略 (momentum=1.0)"
                 )
+                # 强制调整权重
+                if value_weight > 0 or size_weight > 0:
+                    logger.warning(
+                        f"原配置权重 (value={value_weight}, size={size_weight}) "
+                        f"因缺少财务数据被置为 0"
+                    )
                 value_weight = 0.0
+                size_weight = 0.0
                 quality_weight = 0.0
                 momentum_weight = 1.0
+                value_col = "value_zscore"
+                size_col = "small_cap_zscore"
             
             strategy = MultiFactorStrategy(
-                name="Multi-Factor Backtest",
+                name="Multi-Factor Backtest" + (" (小市值增强)" if has_financial_data else " (纯动量)"),
                 config={
                     "value_weight": value_weight,
                     "quality_weight": quality_weight,
                     "momentum_weight": momentum_weight,
+                    "size_weight": size_weight,
                     "top_n": strategy_config.get("top_n", 5),
                     "min_listing_days": strategy_config.get("min_listing_days", 126),
                     "rebalance_frequency": strategy_config.get("rebalance_frequency", "monthly"),
                     "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.05),
                     # 因子列名配置
-                    "value_col": "value_zscore",
-                    "quality_col": "quality_zscore",
-                    "momentum_col": "momentum_zscore",
+                    "value_col": value_col,
+                    "quality_col": strategy_config.get("quality_col", "quality_zscore"),
+                    "momentum_col": strategy_config.get("momentum_col", "momentum_zscore"),
+                    "size_col": size_col,
                     "date_col": "date",
                     "stock_col": "stock_code",
                 }
             )
             logger.info(
                 f"使用多因子策略: value={value_weight}, quality={quality_weight}, "
-                f"momentum={momentum_weight}, top_n={strategy.top_n}"
+                f"momentum={momentum_weight}, size={size_weight}, top_n={strategy.top_n}"
             )
+            if has_financial_data:
+                logger.info(f"因子列: value_col={value_col}, size_col={size_col}")
         else:
             # 均线交叉策略（不支持权重驱动回测，使用简化逻辑）
             strategy = MACrossStrategy(
@@ -2319,9 +2870,9 @@ def run_backtest(
             win_rate = (strategy_returns > 0).sum() / len(strategy_returns) if len(strategy_returns) > 0 else 0
         
         # ========================================
-        # Step 6: 生成回测报告
+        # Step 7: 生成回测报告
         # ========================================
-        logger.info("Step 6/6: 生成回测报告")
+        logger.info("Step 7/7: 生成回测报告")
         
         report_content = _generate_backtest_report(
             start_date=start_date,
@@ -2352,6 +2903,7 @@ def run_backtest(
         logger.info(f"策略名称:    {strategy.name}")
         logger.info(f"回测区间:    {start_date} ~ {end_date}")
         logger.info(f"股票池:      {stock_pool} ({len(close_df.columns)} 只股票)")
+        logger.info(f"财务数据:    {'✓ 已加载 (small_cap 因子可用)' if has_financial_data else '✗ 未加载 (纯动量策略)'}")
         logger.info(f"基准指数:    {benchmark_code} {'✓ 已启用风控' if benchmark_data is not None else '✗ 风控未启用'}")
         logger.info("-" * 60)
         logger.info(f"初始资金:    ¥{initial_capital:,.0f}")
