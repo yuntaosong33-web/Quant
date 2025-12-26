@@ -325,6 +325,7 @@ class BacktestEngine:
         # ========================================
         blocked_sells = 0
         blocked_buys = 0
+        insufficient_capital_total = 0  # 小资金不足买入1手的累计次数
         prev_portfolio_value = self._initial_capital
         
         for day_idx in range(n_days):
@@ -348,6 +349,7 @@ class BacktestEngine:
             # 2. 计算目标持仓（基于目标权重）
             # ----------------------------------------
             target_shares_dict: Dict[str, int] = {}
+            insufficient_capital_count = 0  # 记录资金不足无法买1手的情况
             
             for stock_idx, stock in enumerate(stocks):
                 price = today_prices[stock_idx]
@@ -363,7 +365,20 @@ class BacktestEngine:
                 
                 # 计算目标股数（向下取整到整手）
                 target_shares = int(target_value / price / self.ROUND_LOT) * self.ROUND_LOT
+                
+                # ===== 小资金警告：目标金额不足买入1手 =====
+                if target_value > 0 and target_shares == 0:
+                    insufficient_capital_count += 1
+                    min_required = price * self.ROUND_LOT  # 买1手需要的最小资金
+                    logger.warning(
+                        f"{stock} 目标金额 {target_value:.0f} 不足买入1手 "
+                        f"(股价 {price:.2f}, 需要 {min_required:.0f})，已放弃买入"
+                    )
+                
                 target_shares_dict[stock] = max(0, target_shares)
+            
+            # 累计小资金不足的次数
+            insufficient_capital_total += insufficient_capital_count
             
             # ----------------------------------------
             # 3. 执行交易（先卖后买）
@@ -457,7 +472,13 @@ class BacktestEngine:
                     buy_shares = int(affordable_value / price / self.ROUND_LOT) * self.ROUND_LOT
                     
                     if buy_shares < self.ROUND_LOT:
-                        continue  # 资金不足，跳过
+                        # ===== 小资金警告：现金不足买入1手 =====
+                        min_required = price * self.ROUND_LOT * (1 + self._commission + self._slippage)
+                        logger.warning(
+                            f"{stock} 剩余现金 {cash:.0f} 不足买入1手 "
+                            f"(股价 {price:.2f}, 需要 {min_required:.0f})，已放弃买入"
+                        )
+                        continue  # 资金不足，跳过（现金保留，流转到下一只股票）
                     
                     buy_value = buy_shares * price
                     commission = max(self.MIN_COMMISSION_CNY, buy_value * self._commission)
@@ -501,6 +522,13 @@ class BacktestEngine:
         # 统计受限交易
         if blocked_sells > 0 or blocked_buys > 0:
             logger.info(f"受涨跌停限制: {blocked_sells} 次卖出被阻止, {blocked_buys} 次买入被阻止")
+        
+        # 统计小资金不足情况
+        if insufficient_capital_total > 0:
+            logger.warning(
+                f"⚠️ 小资金警告: 共 {insufficient_capital_total} 次因资金不足无法买入1手，"
+                f"建议增加本金或减少持仓数量 (top_n)"
+            )
         
         # ========================================
         # Step D: 计算绩效指标

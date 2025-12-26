@@ -35,13 +35,13 @@ strategy:
   # - 换手率因子确保资金活跃度
   # - LLM 情绪因子作为 Alpha 加成
   value_weight: 0.0      # 放弃估值因子
-  quality_weight: 0.3    # 换手率因子（资金活跃度，对应 turnover_5d_zscore）
-  momentum_weight: 0.4   # 核心动量因子（对应 roc_20_zscore）
-  size_weight: 0.0       # 放弃小市值因子（股池已锁定中盘股）
-  sentiment_weight: 0.3  # 新增：情绪因子权重（LLM 分析结果作为 Alpha 加成）
+  quality_weight: 0.2    # 换手率因子（资金活跃度，对应 turnover_5d_zscore）
+  momentum_weight: 0.3   # 核心动量因子（对应 roc_20_zscore）
+  size_weight: 0.3       # 小市值因子（明确小市值因子的主导地位）
+  sentiment_weight: 0.2  # 新增：情绪因子权重（LLM 分析结果作为 Alpha 加成）
   
   # 选股参数（集中持仓，追求高弹性）
-  top_n: 3              # 仅选取3只股票，单只约33%仓位
+  top_n: 6              # 选取6只股票，降低单只股票风险
   min_listing_days: 126  # 最小上市天数（约6个月）
   
   # 因子列名配置（与 features.py 产出列名一致）
@@ -58,7 +58,7 @@ strategy:
   
   # 再平衡缓冲区：权重变化小于此阈值时不调整
   # 动量策略降低缓冲区（2%），更敏感响应信号变化
-  rebalance_buffer: 0.02
+  rebalance_buffer: 0.03
 
 # 投资组合配置 - 激进型（集中持仓）
 portfolio:
@@ -90,11 +90,11 @@ portfolio:
 
 # 风险控制配置 - 激进型参数
 risk:
-  # 止损比例（收紧：做错即砍，快速止损）
-  stop_loss: 0.05
+  # 止损比例（放宽：避免频繁被洗）
+  stop_loss: 0.08
   
   # 止盈比例
-  take_profit: 0.20
+  take_profit: 0.30
   
   # 单日最大亏损比例
   max_daily_loss: 0.05
@@ -106,7 +106,7 @@ risk:
   # 仅当大盘跌破60日均线且20日跌幅超过5%时才触发熔断
   market_risk:
     enabled: true
-    ma_period: 60           # 使用60日均线（牛熊线）替代原20日均线
+    ma_period: 20           # 使用20日均线（反应更灵敏）
     drop_threshold: 0.05    # 20日跌幅阈值（5%）
     drop_lookback: 20       # 跌幅回溯天数
 

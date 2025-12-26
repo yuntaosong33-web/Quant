@@ -1165,6 +1165,9 @@ class FactorCalculator:
     # 默认财务数据滞后天数（约3个月）
     DEFAULT_LAG_DAYS = 60
     
+    # 市值类列名（随股价变动的行情数据，不应滞后）
+    MARKET_VALUE_COLS = ['circ_mv', 'total_mv', '流通市值', '总市值']
+    
     def __init__(
         self,
         ohlcv_data: pd.DataFrame,
@@ -1188,14 +1191,20 @@ class FactorCalculator:
             是否对财务数据进行滞后处理，默认 True
         lag_days : int
             财务数据滞后天数，默认 60（约3个月）
+        
+        Notes
+        -----
+        市值数据（circ_mv, total_mv）是随股价变动的行情数据，不进行滞后处理，
+        而是使用 T-1 日数据。其他财报指标（PE, ROE 等）需要滞后以避免前视偏差。
         """
         self.ohlcv_data = ohlcv_data.copy()
         self.industry_data = industry_data.copy() if industry_data is not None else None
         
         # 对财务数据进行滞后处理（避免前视偏差）
+        # 注意：市值数据单独处理，不进行滞后
         if lag_financial_data and not financial_data.empty:
             self.financial_data = self._lag_financial_data(financial_data.copy(), lag_days)
-            logger.info(f"财务数据已滞后 {lag_days} 天（避免前视偏差）")
+            logger.info(f"财务数据已滞后 {lag_days} 天（避免前视偏差），市值数据使用T-1日值")
         else:
             self.financial_data = financial_data.copy()
         
@@ -1212,26 +1221,66 @@ class FactorCalculator:
         
         将财务数据的日期索引向后移动指定天数，模拟财报发布滞后。
         
+        **重要**：市值数据（circ_mv, total_mv）是随股价变动的行情数据，
+        不应滞后60天，否则会导致小市值因子计算严重失真。
+        
+        处理逻辑：
+        1. 分离市值列（circ_mv, total_mv）和财报指标列（PE, ROE 等）
+        2. 仅对财报指标进行滞后处理
+        3. 市值数据使用 T-1 日数据（滞后1天，符合实际交易逻辑）
+        4. 合并后返回
+        
         Parameters
         ----------
         financial_data : pd.DataFrame
             原始财务数据
         lag_days : int
-            滞后天数
+            滞后天数（仅应用于财报指标）
         
         Returns
         -------
         pd.DataFrame
-            滞后后的财务数据
+            处理后的财务数据（财报指标滞后，市值数据使用 T-1）
         
         Notes
         -----
         - 如果数据有 'report_date' 或 'pub_date' 列，优先使用发布日期
         - 否则对 DatetimeIndex 进行偏移
         - 使用 pd.Timedelta 进行日期偏移，确保精确性
+        - 市值数据仅滞后 1 天（T-1），模拟真实可获得的行情数据
         """
         df = financial_data.copy()
         
+        # ========== Step 1: 识别并分离市值列 ==========
+        mv_cols_in_data = [col for col in self.MARKET_VALUE_COLS if col in df.columns]
+        
+        # 识别用于合并的键列
+        key_cols = []
+        if 'stock_code' in df.columns:
+            key_cols.append('stock_code')
+        if 'date' in df.columns:
+            key_cols.append('date')
+        elif 'trade_date' in df.columns:
+            key_cols.append('trade_date')
+        
+        # 保存市值数据（将单独处理）
+        market_value_df = None
+        if mv_cols_in_data:
+            # 提取市值列和键列
+            mv_keep_cols = key_cols + mv_cols_in_data
+            market_value_df = df[mv_keep_cols].copy()
+            
+            # 市值数据使用 T-1（滞后1天，模拟真实行情数据可获得性）
+            MV_LAG_DAYS = 1
+            date_col = 'date' if 'date' in market_value_df.columns else 'trade_date'
+            if date_col in market_value_df.columns:
+                market_value_df[date_col] = pd.to_datetime(market_value_df[date_col]) + pd.Timedelta(days=MV_LAG_DAYS)
+            
+            # 从主数据中移除市值列（后续单独合并）
+            df = df.drop(columns=mv_cols_in_data)
+            logger.info(f"市值数据列 {mv_cols_in_data} 已分离，使用 T-1 日数据")
+        
+        # ========== Step 2: 对财报指标进行滞后处理 ==========
         # 检查是否有发布日期列（更精确的方式）
         pub_date_cols = ['pub_date', 'publish_date', 'announcement_date']
         pub_date_col = next((c for c in pub_date_cols if c in df.columns), None)
@@ -1249,21 +1298,43 @@ class FactorCalculator:
                     if isinstance(df.index, pd.DatetimeIndex):
                         df = df.reset_index(drop=True)
                     df = df.set_index(pub_date_col)
-            return df
-        
-        # 方式2：对日期索引进行固定天数偏移
-        if isinstance(df.index, pd.DatetimeIndex):
-            # 将索引向后移动 lag_days 天
-            df.index = df.index + pd.Timedelta(days=lag_days)
-            logger.debug(f"DatetimeIndex 已向后偏移 {lag_days} 天")
-        elif 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date']) + pd.Timedelta(days=lag_days)
-            logger.debug(f"date 列已向后偏移 {lag_days} 天")
-        elif 'trade_date' in df.columns:
-            df['trade_date'] = pd.to_datetime(df['trade_date']) + pd.Timedelta(days=lag_days)
-            logger.debug(f"trade_date 列已向后偏移 {lag_days} 天")
         else:
-            logger.warning("财务数据无日期列，无法进行滞后处理")
+            # 方式2：对日期索引进行固定天数偏移
+            if isinstance(df.index, pd.DatetimeIndex):
+                # 将索引向后移动 lag_days 天
+                df.index = df.index + pd.Timedelta(days=lag_days)
+                logger.debug(f"财报指标 DatetimeIndex 已向后偏移 {lag_days} 天")
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date']) + pd.Timedelta(days=lag_days)
+                logger.debug(f"财报指标 date 列已向后偏移 {lag_days} 天")
+            elif 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date']) + pd.Timedelta(days=lag_days)
+                logger.debug(f"财报指标 trade_date 列已向后偏移 {lag_days} 天")
+            else:
+                logger.warning("财务数据无日期列，无法进行滞后处理")
+        
+        # ========== Step 3: 合并市值数据回主数据 ==========
+        if market_value_df is not None and len(key_cols) >= 2:
+            # 确保日期列类型一致
+            date_col = 'date' if 'date' in df.columns else 'trade_date'
+            if date_col in df.columns and date_col in market_value_df.columns:
+                df[date_col] = pd.to_datetime(df[date_col])
+                market_value_df[date_col] = pd.to_datetime(market_value_df[date_col])
+            
+            # 使用左连接合并（财报数据为主，市值数据可能有缺失）
+            df = df.merge(
+                market_value_df,
+                on=key_cols,
+                how='left',
+                suffixes=('', '_mv')
+            )
+            logger.info(f"市值数据已合并回主数据（使用 T-1 日值）")
+        elif market_value_df is not None:
+            # 如果无法合并（缺少键列），直接将市值列加回
+            for col in mv_cols_in_data:
+                if col in market_value_df.columns:
+                    df[col] = market_value_df[col].values
+            logger.warning("无法按键合并市值数据，已直接添加回列")
         
         return df
     
@@ -1977,7 +2048,8 @@ def lag_fundamental_data(
     data: pd.DataFrame,
     lag_days: int = 60,
     date_col: Optional[str] = None,
-    stock_col: str = "stock_code"
+    stock_col: str = "stock_code",
+    exclude_market_value: bool = True
 ) -> pd.DataFrame:
     """
     对财务/基本面数据进行滞后处理，避免前视偏差（Look-Ahead Bias）
@@ -1990,6 +2062,10 @@ def lag_fundamental_data(
     
     默认滞后 60 个自然日（约 3 个月 / ~45 个交易日），
     这是一个保守估计，确保只使用历史上实际可获得的数据。
+    
+    **重要更新**：市值数据（circ_mv, total_mv）是随股价变动的行情数据，
+    不应滞后60天，否则会导致小市值因子计算严重失真。
+    默认情况下，市值列仅滞后1天（T-1），其他财报指标滞后 lag_days 天。
     
     Parameters
     ----------
@@ -2005,17 +2081,22 @@ def lag_fundamental_data(
         - 其次查找 'date', 'trade_date', 'report_date' 列
     stock_col : str
         股票代码列名，默认 'stock_code'
+    exclude_market_value : bool
+        是否将市值列（circ_mv, total_mv）单独处理，默认 True。
+        若为 True，市值列仅滞后1天（T-1），而非 lag_days 天。
     
     Returns
     -------
     pd.DataFrame
         滞后后的财务数据，日期已向后移动 lag_days 天
+        （市值数据仅滞后1天，如果 exclude_market_value=True）
     
     Notes
     -----
     - 此函数仅移动日期，不改变数据本身
     - 移动后的日期表示"该数据最早可被使用的日期"
     - 对于有发布日期（pub_date）的数据，建议使用 FactorCalculator 的内置方法
+    - 市值数据（circ_mv, total_mv）是行情数据，使用 T-1 日数据更合理
     
     Examples
     --------
@@ -2040,10 +2121,35 @@ def lag_fundamental_data(
     df = data.copy()
     lag_delta = pd.Timedelta(days=lag_days)
     
+    # 市值类列名（随股价变动的行情数据，不应滞后60天）
+    MARKET_VALUE_COLS = ['circ_mv', 'total_mv', '流通市值', '总市值']
+    MV_LAG_DAYS = 1  # 市值数据滞后天数（T-1）
+    
     # 自动识别日期列
     if date_col is None:
         if isinstance(df.index, pd.DatetimeIndex):
-            # 直接修改索引
+            # 对于 DatetimeIndex，需要特殊处理市值列
+            if exclude_market_value:
+                mv_cols_in_data = [col for col in MARKET_VALUE_COLS if col in df.columns]
+                if mv_cols_in_data:
+                    # 保存市值数据
+                    mv_data = df[mv_cols_in_data].copy()
+                    # 移除市值列
+                    df = df.drop(columns=mv_cols_in_data)
+                    # 对其他数据滞后
+                    df.index = df.index + lag_delta
+                    # 市值数据仅滞后1天
+                    mv_data.index = mv_data.index + pd.Timedelta(days=MV_LAG_DAYS)
+                    # 合并回去
+                    df = df.join(mv_data, how='left')
+                    df.index.name = 'date'
+                    logger.info(
+                        f"财务数据 DatetimeIndex 已向后偏移 {lag_days} 天，"
+                        f"市值数据 {mv_cols_in_data} 仅偏移 {MV_LAG_DAYS} 天"
+                    )
+                    return df
+            
+            # 无市值列或不排除市值，直接偏移全部
             df.index = df.index + lag_delta
             df.index.name = 'date'
             logger.info(f"财务数据 DatetimeIndex 已向后偏移 {lag_days} 天")
@@ -2062,8 +2168,30 @@ def lag_fundamental_data(
     if date_col not in df.columns:
         raise ValueError(f"指定的日期列 '{date_col}' 不存在于数据中")
     
-    df[date_col] = pd.to_datetime(df[date_col]) + lag_delta
+    # 处理市值列单独滞后
+    if exclude_market_value:
+        mv_cols_in_data = [col for col in MARKET_VALUE_COLS if col in df.columns]
+        if mv_cols_in_data and stock_col in df.columns:
+            # 分离市值数据
+            key_cols = [stock_col, date_col]
+            mv_df = df[key_cols + mv_cols_in_data].copy()
+            mv_df[date_col] = pd.to_datetime(mv_df[date_col]) + pd.Timedelta(days=MV_LAG_DAYS)
+            
+            # 从主数据中移除市值列，对其他数据滞后
+            df = df.drop(columns=mv_cols_in_data)
+            df[date_col] = pd.to_datetime(df[date_col]) + lag_delta
+            
+            # 合并市值数据
+            df = df.merge(mv_df, on=key_cols, how='left')
+            
+            logger.info(
+                f"财务数据 '{date_col}' 列已向后偏移 {lag_days} 天，"
+                f"市值数据 {mv_cols_in_data} 仅偏移 {MV_LAG_DAYS} 天"
+            )
+            return df
     
+    # 默认：全部偏移
+    df[date_col] = pd.to_datetime(df[date_col]) + lag_delta
     logger.info(f"财务数据 '{date_col}' 列已向后偏移 {lag_days} 天")
     return df
 

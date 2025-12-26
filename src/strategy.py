@@ -808,7 +808,11 @@ class MultiFactorStrategy(BaseStrategy):
                     + momentum_weight * Momentum_Z + size_weight * Size_Z
         
         情绪进攻型策略额外加分：
-        Final_Score = Base_Score + sentiment_weight * Sentiment_Score
+        Final_Score = Base_Score + sentiment_weight * Sentiment_Score * 3.0
+        
+        特殊处理：
+        - 换手率因子引入"过热惩罚"：Z-Score > 2.0 时反向扣分
+        - 情绪因子量纲对齐：乘以 3.0 放大系数使其与技术因子匹配
         
         Parameters
         ----------
@@ -816,7 +820,7 @@ class MultiFactorStrategy(BaseStrategy):
             包含因子 Z-Score 的数据框
         sentiment_scores : Optional[pd.Series]
             情绪分数序列（范围 -1 到 1），索引应为股票代码。
-            如果传入，将乘以 sentiment_weight 加到总分中。
+            如果传入，将乘以 sentiment_weight 和放大系数 3.0 加到总分中。
         
         Returns
         -------
@@ -830,6 +834,7 @@ class MultiFactorStrategy(BaseStrategy):
         - 激进型策略中，value_col 可映射到 small_cap_zscore
         - quality_col 可映射到 turnover_5d_zscore
         - sentiment_scores 权重归一化由用户配置保证
+        - 换手率过热惩罚阈值为 Z-Score = 2.0
         """
         total_score = pd.Series(0.0, index=data.index)
         
@@ -839,9 +844,23 @@ class MultiFactorStrategy(BaseStrategy):
         elif self.value_weight > 0:
             logger.warning(f"未找到价值因子列: {self.value_col}")
         
-        # 质量因子（激进策略中可用于放置换手率因子）
+        # 质量因子（换手率因子）- 引入"过热惩罚"机制
+        # Z-Score > 2.0 表示极度活跃，过热反而扣分
+        # score = z_score if z_score <= 2.0 else 2.0 - (z_score - 2.0) * 2
         if self.quality_col in data.columns and self.quality_weight > 0:
-            total_score += self.quality_weight * data[self.quality_col].fillna(0)
+            raw_quality = data[self.quality_col].fillna(0)
+            # 向量化计算：过热惩罚
+            # 对于 z > 2.0: score = 2.0 - (z - 2.0) * 2 = 4.0 - 2*z
+            quality_score = np.where(
+                raw_quality > 2.0,
+                2.0 - (raw_quality - 2.0) * 2,  # 过热惩罚
+                raw_quality  # 正常情况保持原值
+            )
+            total_score += self.quality_weight * quality_score
+            # 记录过热股票数量
+            overheat_count = (raw_quality > 2.0).sum()
+            if overheat_count > 0:
+                logger.debug(f"换手率过热惩罚: {overheat_count} 只股票 Z-Score > 2.0")
         elif self.quality_weight > 0:
             logger.warning(f"未找到质量因子列: {self.quality_col}")
         
@@ -851,13 +870,17 @@ class MultiFactorStrategy(BaseStrategy):
         elif self.momentum_weight > 0:
             logger.warning(f"未找到动量因子列: {self.momentum_col}")
         
-        # 新增：市值因子（独立权重，激进型小市值策略核心因子）
+        # 市值因子（独立权重，激进型小市值策略核心因子）
         if self.size_col in data.columns and self.size_weight > 0:
             total_score += self.size_weight * data[self.size_col].fillna(0)
         elif self.size_weight > 0:
             logger.warning(f"未找到市值因子列: {self.size_col}")
         
         # ===== 情绪进攻型策略：加入情绪分数 =====
+        # 情绪因子量纲对齐：情绪分数范围 [-1, 1]，Z-Score 通常在 [-3, 3]
+        # 乘以放大系数 3.0 使其影响力与技术因子匹配
+        SENTIMENT_SCALE_FACTOR = 3.0
+        
         if sentiment_scores is not None and self.sentiment_weight > 0:
             # 确定股票代码列用于对齐
             stock_col = self.stock_col if self.stock_col in data.columns else 'symbol'
@@ -865,9 +888,12 @@ class MultiFactorStrategy(BaseStrategy):
             if stock_col in data.columns:
                 # 使用股票代码对齐情绪分数
                 aligned_sentiment = data[stock_col].map(sentiment_scores).fillna(0)
-                total_score += self.sentiment_weight * aligned_sentiment
+                # 应用放大系数进行量纲对齐
+                scaled_sentiment = aligned_sentiment * SENTIMENT_SCALE_FACTOR
+                total_score += self.sentiment_weight * scaled_sentiment
                 logger.debug(
                     f"情绪分数已加入综合得分: 权重={self.sentiment_weight}, "
+                    f"放大系数={SENTIMENT_SCALE_FACTOR}, "
                     f"有效股票数={aligned_sentiment.notna().sum()}"
                 )
             else:
@@ -878,9 +904,12 @@ class MultiFactorStrategy(BaseStrategy):
                     stock_codes = data.index
                 aligned_sentiment = stock_codes.to_series().map(sentiment_scores).fillna(0)
                 aligned_sentiment.index = data.index
-                total_score += self.sentiment_weight * aligned_sentiment
+                # 应用放大系数进行量纲对齐
+                scaled_sentiment = aligned_sentiment * SENTIMENT_SCALE_FACTOR
+                total_score += self.sentiment_weight * scaled_sentiment
                 logger.debug(
-                    f"情绪分数已加入综合得分 (索引对齐): 权重={self.sentiment_weight}"
+                    f"情绪分数已加入综合得分 (索引对齐): 权重={self.sentiment_weight}, "
+                    f"放大系数={SENTIMENT_SCALE_FACTOR}"
                 )
         
         return total_score
@@ -1247,21 +1276,25 @@ class MultiFactorStrategy(BaseStrategy):
                 return []
             
             # 过滤逻辑
+            # 一票否决阈值：情绪分数 < -0.5 的股票直接剔除
+            VETO_THRESHOLD = -0.5
+            
             filtered_candidates: List[str] = []
             low_confidence_count = 0
             negative_sentiment_count = 0
+            vetoed_stocks: List[str] = []
             
             for _, row in sentiment_df.iterrows():
                 stock_code = row["stock_code"]
                 score = row["score"]
                 confidence = row["confidence"]
                 
-                # 规则1: 检查情绪分数
-                if score < self._sentiment_threshold:
+                # 规则1: 一票否决 - 情绪分数 < -0.5 直接剔除
+                if score < VETO_THRESHOLD:
                     negative_sentiment_count += 1
-                    logger.debug(
-                        f"情绪过滤 (负面): {stock_code} score={score:.2f} "
-                        f"< threshold={self._sentiment_threshold}"
+                    vetoed_stocks.append(stock_code)
+                    logger.warning(
+                        f"风控剔除: {stock_code} 情绪分 {score:.2f} < {VETO_THRESHOLD}"
                     )
                     continue
                 
@@ -1277,11 +1310,18 @@ class MultiFactorStrategy(BaseStrategy):
                 # 通过所有检查
                 filtered_candidates.append(stock_code)
             
+            # 汇总日志
+            if vetoed_stocks:
+                logger.warning(
+                    f"🚨 情绪风控一票否决: {len(vetoed_stocks)} 只股票被剔除 "
+                    f"(情绪分 < {VETO_THRESHOLD}): {vetoed_stocks}"
+                )
+            
             logger.info(
                 f"情绪过滤完成 ({date_str}): "
                 f"输入 {len(candidates)} 只, "
                 f"通过 {len(filtered_candidates)} 只, "
-                f"负面情绪剔除 {negative_sentiment_count} 只, "
+                f"一票否决剔除 {negative_sentiment_count} 只, "
                 f"低置信度剔除 {low_confidence_count} 只"
             )
             
@@ -1430,6 +1470,10 @@ class MultiFactorStrategy(BaseStrategy):
         
         date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
         
+        # 一票否决阈值：情绪分数 < -0.5 的股票直接剔除
+        VETO_THRESHOLD = -0.5
+        vetoed_stocks: List[str] = []
+        
         try:
             # 调用情绪分析引擎
             sentiment_df = self._sentiment_engine.calculate_sentiment(pre_candidates, date_str)
@@ -1440,16 +1484,46 @@ class MultiFactorStrategy(BaseStrategy):
                     f"降级为纯技术面选股"
                 )
             else:
-                # 构建情绪分数 Series（索引为股票代码）
-                sentiment_scores = pd.Series(
+                # ========== 一票否决逻辑 ==========
+                # 情绪分数 < -0.5 的股票直接从候选列表中剔除
+                for _, row in sentiment_df.iterrows():
+                    stock_code = row["stock_code"]
+                    score = row["score"]
+                    
+                    if score < VETO_THRESHOLD:
+                        vetoed_stocks.append(stock_code)
+                        logger.warning(
+                            f"风控剔除: {stock_code} 情绪分 {score:.2f} < {VETO_THRESHOLD}"
+                        )
+                
+                # 汇总一票否决日志
+                if vetoed_stocks:
+                    logger.warning(
+                        f"🚨 情绪风控一票否决: {len(vetoed_stocks)} 只股票被剔除 "
+                        f"(情绪分 < {VETO_THRESHOLD}): {vetoed_stocks}"
+                    )
+                    # 从候选列表中移除被否决的股票
+                    pre_candidates = [s for s in pre_candidates if s not in vetoed_stocks]
+                
+                # ========== 构建情绪分数 Series ==========
+                # 仅对 score > 0 的股票进行加分，score <= 0 时不加分（设为 0）
+                raw_scores = pd.Series(
                     sentiment_df['score'].values,
                     index=sentiment_df['stock_code'].values
                 )
+                
+                # 只保留正分用于加分，负分和零分不加分（设为0）
+                sentiment_scores = raw_scores.clip(lower=0)
+                
+                positive_count = (raw_scores > 0).sum()
+                neutral_count = ((raw_scores <= 0) & (raw_scores >= VETO_THRESHOLD)).sum()
+                
                 logger.info(
                     f"情绪分析完成 ({date_str}): "
-                    f"{len(sentiment_scores)} 只股票获得情绪分数, "
-                    f"均值={sentiment_scores.mean():.3f}, "
-                    f"范围=[{sentiment_scores.min():.3f}, {sentiment_scores.max():.3f}]"
+                    f"原始 {len(raw_scores)} 只, "
+                    f"正面加分 {positive_count} 只, "
+                    f"中性不加分 {neutral_count} 只, "
+                    f"一票否决 {len(vetoed_stocks)} 只"
                 )
         
         except LLMCircuitBreakerError:
@@ -1467,8 +1541,9 @@ class MultiFactorStrategy(BaseStrategy):
         # ==========================================
         # 第三阶段：最终排名
         # Final_Score = Base_Score + Sentiment_Weight * Sentiment_Score
+        # 注意：sentiment_scores 已处理，仅正分会被加入
         # ==========================================
-        # 筛选出候选股的数据子集
+        # 筛选出候选股的数据子集（排除被一票否决的股票）
         if stock_col in valid_data.columns:
             candidate_mask = valid_data[stock_col].isin(pre_candidates)
         else:
@@ -1479,7 +1554,7 @@ class MultiFactorStrategy(BaseStrategy):
         
         candidate_data = valid_data[candidate_mask].copy()
         
-        # 计算最终得分（包含情绪分数）
+        # 计算最终得分（包含情绪分数，仅正分加分）
         candidate_data['final_score'] = self.calculate_total_score(
             candidate_data,
             sentiment_scores=sentiment_scores
@@ -1496,7 +1571,8 @@ class MultiFactorStrategy(BaseStrategy):
         
         logger.debug(
             f"第三阶段最终排名: {len(pre_candidates)} 只候选股 -> "
-            f"选出 {len(top_stocks)} 只目标股票"
+            f"选出 {len(top_stocks)} 只目标股票 "
+            f"(一票否决剔除 {len(vetoed_stocks)} 只)"
         )
         
         return top_stocks

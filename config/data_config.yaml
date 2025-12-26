@@ -4,7 +4,7 @@
 # Tushare 配置（主数据源）
 # 获取 token: https://tushare.pro/register
 tushare:
-  token: ""  # 留空占位，需用户填写 Tushare Pro token
+  token: "7de46c74cf5f993d70c5ff931bd1a0c420a950ca4d35671010d244ba"  # Tushare Pro token
 
 # 数据湖存储配置
 lake:
