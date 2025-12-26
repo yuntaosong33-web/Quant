@@ -52,6 +52,15 @@ from src import (
     send_pushplus_msg,
 )
 
+# 导入 LLM 熔断器异常（用于风控处理）
+try:
+    from src.llm_client import LLMCircuitBreakerError
+except ImportError:
+    # 定义回退类以避免导入错误
+    class LLMCircuitBreakerError(RuntimeError):
+        """LLM 熔断器触发异常（回退定义）"""
+        pass
+
 # 配置常量
 CONFIG_PATH = Path("config/strategy_config.yaml")
 DATA_RAW_PATH = Path("data/raw")
@@ -1310,6 +1319,49 @@ class DailyUpdateRunner:
                 }, f, ensure_ascii=False, indent=2)
             
             return True
+        
+        except LLMCircuitBreakerError as e:
+            # ===== LLM 熔断器触发: 风控停止交易 =====
+            self.logger.critical(
+                f"⛔ LLM Circuit Breaker Triggered! Risk control failed. "
+                f"HALTING ALL TRADING SIGNALS."
+            )
+            self.logger.critical(f"Error details: {e}")
+            
+            # 保存风控停止状态文件
+            self.target_positions = {}
+            
+            portfolio_config = self.config.get("portfolio", {})
+            total_capital = portfolio_config.get("total_capital", 1000000)
+            
+            positions_path = DATA_PROCESSED_PATH / f"target_positions_{self.today.strftime('%Y%m%d')}.json"
+            
+            # 构建风控停止 JSON（明确标记 LLM 熔断状态）
+            halt_position_data = {
+                'date': self.today.strftime('%Y-%m-%d'),
+                'positions': {},  # 关键：确保为空字典，不产生任何买入信号
+                'weights': {},    # 关键：确保为空字典
+                'total_capital': total_capital,
+                'market_risk_triggered': False,
+                'llm_circuit_breaker_triggered': True,  # 关键：标记 LLM 熔断触发
+                'reason': f'LLM Circuit Breaker Triggered: {str(e)[:200]}',
+                'action': 'HALT_ALL_TRADING',  # 明确指令：停止所有交易
+                'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            
+            with open(positions_path, 'w', encoding='utf-8') as f:
+                json.dump(halt_position_data, f, ensure_ascii=False, indent=2)
+            
+            self.logger.critical(
+                f"✅ 已保存风控停止状态文件\n"
+                f"   文件: {positions_path}\n"
+                f"   positions: {{}}\n"
+                f"   llm_circuit_breaker_triggered: True\n"
+                f"   action: HALT_ALL_TRADING"
+            )
+            
+            # 返回 False 表示生成失败，调用方应停止后续流程
+            return False
             
         except Exception as e:
             self.logger.error(f"生成目标持仓失败: {e}")

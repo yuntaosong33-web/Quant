@@ -18,6 +18,18 @@ try:
 except ImportError:
     ak = None
 
+# 导入 LLM 熔断器异常（用于风控）
+try:
+    from src.llm_client import LLMCircuitBreakerError
+except ImportError:
+    try:
+        from llm_client import LLMCircuitBreakerError
+    except ImportError:
+        # 定义回退类以避免导入错误
+        class LLMCircuitBreakerError(RuntimeError):
+            """LLM 熔断器触发异常（回退定义）"""
+            pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -1140,6 +1152,12 @@ class MultiFactorStrategy(BaseStrategy):
         仅对 Top N * buffer 的候选股票进行情绪分析，而非全市场股票。
         这显著减少了 LLM API 调用次数，降低成本并提高效率。
         
+        **安全策略 (Fail-Closed)**:
+        当 LLM 服务不可用或发生错误时，系统采用安全优先策略：
+        - 熔断器触发: 抛出 LLMCircuitBreakerError，完全停止交易
+        - 其他 LLM 错误: 返回空列表，阻止生成买入信号
+        这避免了在 LLM 风控不可用时仍产生买入信号的危险情况。
+        
         Parameters
         ----------
         candidates : List[str]
@@ -1163,9 +1181,9 @@ class MultiFactorStrategy(BaseStrategy):
         1. score < sentiment_threshold: 剔除（负面情绪）
         2. confidence < min_confidence: 剔除并记录警告（不确定分析结果）
         
-        异常处理：
-        - LLMCircuitBreakerError: 直接抛出，停止交易
-        - 其他异常: 记录警告，返回原候选列表（fail-safe）
+        异常处理（Fail-Closed 策略）：
+        - LLMCircuitBreakerError: 记录 CRITICAL 日志并抛出异常，停止交易
+        - 其他异常: 记录 CRITICAL 日志并返回空列表，阻止产生买入信号
         """
         if not candidates:
             return []
@@ -1176,18 +1194,17 @@ class MultiFactorStrategy(BaseStrategy):
         date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
         
         try:
-            # 导入熔断器异常类
-            try:
-                from src.llm_client import LLMCircuitBreakerError
-            except ImportError:
-                from llm_client import LLMCircuitBreakerError
-            
             # 调用情绪分析引擎（返回 DataFrame）
             sentiment_df = self._sentiment_engine.calculate_sentiment(candidates, date_str)
             
             if sentiment_df.empty:
-                logger.warning(f"情绪分析返回空结果，保留所有候选股票")
-                return candidates
+                # 情绪分析返回空结果也视为异常情况
+                # Fail-Closed: 返回空列表而非原候选列表
+                logger.critical(
+                    f"⛔ 情绪分析返回空结果 ({date_str}), "
+                    f"Fail-Closed: 阻止所有 {len(candidates)} 只候选股票的买入信号"
+                )
+                return []
             
             # 过滤逻辑
             filtered_candidates: List[str] = []
@@ -1230,20 +1247,24 @@ class MultiFactorStrategy(BaseStrategy):
             
             return filtered_candidates
         
-        except Exception as e:
-            # 检查是否是熔断器异常
-            error_type = type(e).__name__
-            if "CircuitBreaker" in error_type:
-                # 熔断器触发，直接抛出，停止交易
-                logger.critical(f"LLM 熔断器触发，停止交易: {e}")
-                raise
-            
-            # 其他异常：fail-safe，返回原候选列表
-            logger.warning(
-                f"情绪分析失败 ({date_str}): {e}. "
-                f"Fail-safe: 保留所有 {len(candidates)} 只候选股票"
+        except LLMCircuitBreakerError as e:
+            # ===== 熔断器触发: 停止交易 =====
+            logger.critical(
+                f"⛔ LLM Circuit Breaker Triggered! Risk control failed. "
+                f"HALTING TRADING SIGNALS. Error: {e}"
             )
-            return candidates
+            # 直接抛出异常，完全停止交易流程
+            raise
+        
+        except Exception as e:
+            # ===== 其他异常: Fail-Closed 策略 =====
+            # 返回空列表而非原候选列表，避免在 LLM 风控不可用时产生买入信号
+            logger.critical(
+                f"⛔ LLM Sentiment Analysis Failed ({date_str}): {e}. "
+                f"Fail-Closed: 阻止所有 {len(candidates)} 只候选股票的买入信号. "
+                f"原因: LLM 风控不可用时不应产生交易信号."
+            )
+            return []
     
     def select_top_stocks(
         self,
@@ -1471,18 +1492,16 @@ class MultiFactorStrategy(BaseStrategy):
                     pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)
                     
                     # Step 2: 应用情绪过滤（Just-in-Time 分析）
+                    # 注意: _apply_sentiment_filter 内部已实现 Fail-Closed 策略
                     if self._enable_sentiment_filter and self._sentiment_engine is not None:
                         try:
                             final_candidates = self._apply_sentiment_filter(pre_candidates, date)
-                        except Exception as e:
-                            # 检查是否是熔断器异常
-                            error_type = type(e).__name__
-                            if "CircuitBreaker" in error_type:
-                                # 熔断器触发，抛出异常停止交易
-                                raise
-                            # 其他异常：记录警告，使用原候选列表
-                            logger.warning(f"情绪过滤失败: {e}，使用原候选列表")
-                            final_candidates = pre_candidates
+                        except LLMCircuitBreakerError:
+                            # ===== 熔断器触发: 停止交易 =====
+                            # 直接抛出，由调用方处理
+                            raise
+                        # 注意: 其他异常已在 _apply_sentiment_filter 中处理，
+                        # 会返回空列表（Fail-Closed），不会抛出
                     else:
                         final_candidates = pre_candidates
                     
@@ -2043,18 +2062,16 @@ class MultiFactorStrategy(BaseStrategy):
                     pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)
                     
                     # Step 2.2: 应用情绪过滤（Just-in-Time 分析）
+                    # 注意: _apply_sentiment_filter 内部已实现 Fail-Closed 策略
                     if self._enable_sentiment_filter and self._sentiment_engine is not None:
                         try:
                             final_candidates = self._apply_sentiment_filter(pre_candidates, date)
-                        except Exception as e:
-                            # 检查是否是熔断器异常
-                            error_type = type(e).__name__
-                            if "CircuitBreaker" in error_type:
-                                # 熔断器触发，抛出异常停止交易
-                                raise
-                            # 其他异常：记录警告，使用原候选列表
-                            logger.warning(f"情绪过滤失败: {e}，使用原候选列表")
-                            final_candidates = pre_candidates
+                        except LLMCircuitBreakerError:
+                            # ===== 熔断器触发: 停止交易 =====
+                            # 直接抛出，由调用方处理
+                            raise
+                        # 注意: 其他异常已在 _apply_sentiment_filter 中处理，
+                        # 会返回空列表（Fail-Closed），不会抛出
                     else:
                         final_candidates = pre_candidates
                     
