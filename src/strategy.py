@@ -1264,23 +1264,25 @@ class MultiFactorStrategy(BaseStrategy):
                 # 使用 ffill 填充非交易日的空缺 (如果有的话)
                 aligned_index = index_df.reindex(all_dates, method='ffill')
                 
-                # ===== 激进版风控条件 =====
-                # 旧规则（保守）: (Close < MA20) AND (MA20_Slope < 0)
-                # 新规则（激进）: (Close < MA60) AND (20日跌幅 > 5%)
+                # ===== 趋势风控条件（OR 逻辑）=====
+                # 原规则（AND）: (Close < MA60) AND (20日跌幅 > 5%)
+                #   问题：缓慢阴跌的熊市中不会触发，非常危险
+                # 新规则（OR）: (Close < MA60) OR (20日跌幅 > 5%)
                 # 
                 # 逻辑说明：
-                # 1. MA60（60日均线）是传统的牛熊分界线，跌破才考虑风控
-                # 2. 同时要求20日跌幅超过5%，确认是暴跌趋势而非阴跌
-                # 3. 只要大盘在MA60之上，或仅仅是阴跌，都保持满仓进攻
+                # 1. 只要跌破 MA60（牛熊线），就触发风控
+                # 2. 或者发生暴跌（20日跌幅超5%），也触发风控
+                # 3. 两者满足其一即空仓，更加安全
                 drop_threshold = -0.05  # 20日跌幅阈值（-5%）
                 
                 condition_below_ma60 = aligned_index['close'] < aligned_index['ma60']
                 condition_crash = aligned_index['drop_20d'] < drop_threshold
                 
-                market_risk_series = (condition_below_ma60 & condition_crash).fillna(False)
+                # 使用 OR 逻辑：只要满足其一即触发风控
+                market_risk_series = (condition_below_ma60 | condition_crash).fillna(False)
                 
                 logger.info(
-                    f"已使用激进版大盘风控: (Close < MA60) AND (20日跌幅 < {drop_threshold:.0%})"
+                    f"已使用趋势风控 (OR 逻辑): (Close < MA60) OR (20日跌幅 < {drop_threshold:.0%})"
                 )
                 
             except Exception as e:

@@ -836,7 +836,7 @@ class DailyUpdateRunner:
         - drop_threshold: 跌幅阈值（默认0.05，即5%）
         - drop_lookback: 跌幅回溯天数（默认20）
         
-        风控触发条件（需同时满足）：
+        风控触发条件（满足任一即触发，OR 逻辑）：
         1. 收盘价 < MA{ma_period}（跌破均线）
         2. （可选）近{drop_lookback}日跌幅 > {drop_threshold}
         
@@ -848,6 +848,7 @@ class DailyUpdateRunner:
         Notes
         -----
         风控参数从 config['risk']['market_risk'] 中读取，支持动态配置。
+        使用 OR 逻辑可避免缓慢阴跌的熊市中无法触发风控的问题。
         """
         # 读取风控配置
         risk_config = self.config.get("risk", {})
@@ -898,10 +899,11 @@ class DailyUpdateRunner:
                     recent_drop = (end_price - start_price) / start_price
                     is_drop_exceeded = recent_drop < -drop_threshold
             
-            # 综合判断：跌破均线 且 跌幅超过阈值（如果配置了阈值）
-            # 如果 drop_threshold <= 0，则只判断均线条件
+            # 综合判断：跌破均线 或 跌幅超过阈值（任一满足即触发风控）
+            # 原逻辑使用 AND，会导致缓慢阴跌时无法触发，非常危险
+            # 新逻辑使用 OR：只要跌破均线，或者发生暴跌，都视为风险
             if drop_threshold > 0:
-                is_triggered = is_below_ma and is_drop_exceeded
+                is_triggered = is_below_ma or is_drop_exceeded
             else:
                 is_triggered = is_below_ma
             
@@ -1197,7 +1199,7 @@ class DailyUpdateRunner:
                     'weights': {},    # 关键：确保为空字典
                     'total_capital': total_capital,
                     'market_risk_triggered': True,  # 关键：标记风控触发
-                    'reason': f'大盘跌破MA{ma_period}且跌幅超{drop_threshold*100:.0f}%，触发风控',
+                    'reason': f'大盘跌破MA{ma_period}或跌幅超{drop_threshold*100:.0f}%，触发风控',
                     'risk_params': {
                         'ma_period': ma_period,
                         'drop_threshold': drop_threshold,
@@ -2312,8 +2314,12 @@ def _generate_backtest_factor_data(
     if has_financial:
         logger.info("生成回测因子数据（含财务因子：small_cap, value）...")
     else:
+        logger.info(
+            "生成回测因子数据：将使用「换手率倒推市值」方法估算流通市值，"
+            "公式: estimated_circ_mv = amount / (turnover / 100)"
+        )
         logger.warning(
-            "生成回测因子数据（无财务数据，small_cap 因子将不可用）..."
+            "注意：估算市值仅供回测参考，实际市值以财务数据为准"
         )
     
     factor_records = []
@@ -2363,17 +2369,27 @@ def _generate_backtest_factor_data(
         if 'turnover' in df.columns:
             turnover_5d = df['turnover'].rolling(5, min_periods=1).mean()
         
-        # 获取财务数据
+        # 获取财务数据（作为优先使用的静态市值）
         fin_data = financial_map.get(stock_code, {})
-        circ_mv = fin_data.get('circ_mv', np.nan)
+        static_circ_mv = fin_data.get('circ_mv', np.nan)
         pe_ttm = fin_data.get('pe_ttm', np.nan)
         
-        # 计算 small_cap 因子：-log(circ_mv)
-        # 市值越小，-log(市值) 越大，得分越高
-        if pd.notna(circ_mv) and circ_mv > 0:
-            small_cap = -np.log(circ_mv)
-        else:
-            small_cap = np.nan
+        # 计算估算流通市值序列（基于换手率倒推）
+        # 公式: estimated_circ_mv = amount / (turnover / 100)
+        # 含义: 换手率 = 成交量 / 流通股本，成交额 ≈ 成交量 * 当日均价
+        #       所以: 流通市值 ≈ 成交额 / 换手率
+        has_turnover = 'turnover' in df.columns
+        has_amount = 'amount' in df.columns
+        
+        estimated_circ_mv_series = pd.Series(np.nan, index=df.index)
+        if has_turnover and has_amount:
+            # 换手率转为小数 (turnover 单位是百分比，如 3.5 表示 3.5%)
+            turnover_pct = df['turnover'] / 100.0
+            # 避免除以零或极小值
+            safe_turnover = turnover_pct.replace(0, np.nan)
+            safe_turnover = safe_turnover.where(safe_turnover >= 0.0001, np.nan)
+            # 计算估算流通市值 (单位与 amount 一致，通常是元)
+            estimated_circ_mv_series = df['amount'] / safe_turnover
         
         # 计算 EP_TTM (价值因子)
         if pd.notna(pe_ttm) and pe_ttm > 0:
@@ -2385,6 +2401,24 @@ def _generate_backtest_factor_data(
             rsi_val = rsi_20.get(date, np.nan) if date in rsi_20.index else np.nan
             turnover_val = turnover_5d.get(date, np.nan) if date in turnover_5d.index else np.nan
             close_price = df.loc[date, 'close'] if date in df.index else np.nan
+            
+            # 获取当天的估算市值
+            estimated_circ_mv = estimated_circ_mv_series.get(date, np.nan)
+            
+            # 优先级：1. 财务数据中的 circ_mv  2. 换手率估算的市值  3. NaN
+            if pd.notna(static_circ_mv) and static_circ_mv > 0:
+                circ_mv = static_circ_mv
+            elif pd.notna(estimated_circ_mv) and estimated_circ_mv > 0:
+                circ_mv = estimated_circ_mv
+            else:
+                circ_mv = np.nan
+            
+            # 计算 small_cap 因子：-log(circ_mv)
+            # 市值越小，-log(市值) 越大，得分越高
+            if pd.notna(circ_mv) and circ_mv > 0:
+                small_cap = -np.log(circ_mv)
+            else:
+                small_cap = np.nan
             
             factor_records.append({
                 'date': date,
@@ -2429,8 +2463,11 @@ def _generate_backtest_factor_data(
         lambda g: zscore_by_date(g, 'rsi_20')
     ).reset_index(level=0, drop=True)
     
+    # 检查是否有有效的 small_cap 数据（来自财务数据或换手率估算）
+    has_valid_small_cap = factor_df['small_cap'].notna().any()
+    
     # 计算 Small Cap Z-Score（小市值因子）
-    if has_financial:
+    if has_valid_small_cap:
         factor_df['small_cap_zscore'] = factor_df.groupby('date', group_keys=False).apply(
             lambda g: zscore_by_date(g, 'small_cap')
         ).reset_index(level=0, drop=True)
@@ -2440,18 +2477,27 @@ def _generate_backtest_factor_data(
             lambda g: zscore_by_date(g, 'turnover_5d')
         ).reset_index(level=0, drop=True)
         
-        # 计算价值因子 Z-Score
-        factor_df['value_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-            lambda g: zscore_by_date(g, 'ep_ttm')
-        ).reset_index(level=0, drop=True)
+        # 计算价值因子 Z-Score（需要财务数据）
+        if has_financial:
+            factor_df['value_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+                lambda g: zscore_by_date(g, 'ep_ttm')
+            ).reset_index(level=0, drop=True)
+        else:
+            factor_df['value_zscore'] = np.nan
+            
+        if not has_financial:
+            logger.info(
+                "已通过换手率倒推市值计算 small_cap_zscore，"
+                f"有效记录数: {factor_df['small_cap_zscore'].notna().sum()}"
+            )
     else:
-        # 无财务数据时设置为 NaN（而不是 0，以便策略能识别）
+        # 既无财务数据也无换手率估算时设置为 NaN
         factor_df['small_cap_zscore'] = np.nan
         factor_df['turnover_5d_zscore'] = np.nan
         factor_df['value_zscore'] = np.nan
         
         logger.warning(
-            "警告：无财务数据，small_cap_zscore 设置为 NaN。"
+            "警告：无财务数据且无法通过换手率估算市值，small_cap_zscore 设置为 NaN。"
             "回测结果将仅基于动量因子（RSI），无法体现小市值策略效果。"
         )
     
