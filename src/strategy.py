@@ -711,6 +711,7 @@ class MultiFactorStrategy(BaseStrategy):
         self.quality_weight: float = self.config.get("quality_weight", 0.3)
         self.momentum_weight: float = self.config.get("momentum_weight", 0.4)
         self.size_weight: float = self.config.get("size_weight", 0.3)  # 新增：市值因子权重
+        self.sentiment_weight: float = self.config.get("sentiment_weight", 0.3)  # 情绪进攻型权重
         
         # 选股参数配置
         self.top_n: int = self.config.get("top_n", 30)
@@ -751,9 +752,11 @@ class MultiFactorStrategy(BaseStrategy):
             self.rebalance_frequency = "monthly"
         
         # 验证权重之和（包含新增的 size_weight）
+        # 注意：sentiment_weight 是额外的 Alpha 因子权重，不计入基础权重归一化
+        # 由用户配置保证合理性
         weight_sum = self.value_weight + self.quality_weight + self.momentum_weight + self.size_weight
         if abs(weight_sum - 1.0) > 1e-6:
-            logger.warning(f"因子权重之和为 {weight_sum}，建议权重之和为 1.0")
+            logger.warning(f"基础因子权重之和为 {weight_sum}，建议权重之和为 1.0")
         
         # ===== LLM 情绪分析配置 =====
         # 从配置中获取 LLM 设置
@@ -786,13 +789,17 @@ class MultiFactorStrategy(BaseStrategy):
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
             f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
-            f"市值权重={self.size_weight}, "
+            f"市值权重={self.size_weight}, 情绪权重={self.sentiment_weight}, "
             f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
             f"再平衡缓冲区={self.rebalance_buffer:.1%}, "
             f"情绪过滤={'启用' if self._enable_sentiment_filter else '禁用'}"
         )
     
-    def calculate_total_score(self, data: pd.DataFrame) -> pd.Series:
+    def calculate_total_score(
+        self,
+        data: pd.DataFrame,
+        sentiment_scores: Optional[pd.Series] = None
+    ) -> pd.Series:
         """
         计算综合因子得分
         
@@ -800,10 +807,16 @@ class MultiFactorStrategy(BaseStrategy):
         Total_Score = value_weight * Value_Z + quality_weight * Quality_Z 
                     + momentum_weight * Momentum_Z + size_weight * Size_Z
         
+        情绪进攻型策略额外加分：
+        Final_Score = Base_Score + sentiment_weight * Sentiment_Score
+        
         Parameters
         ----------
         data : pd.DataFrame
             包含因子 Z-Score 的数据框
+        sentiment_scores : Optional[pd.Series]
+            情绪分数序列（范围 -1 到 1），索引应为股票代码。
+            如果传入，将乘以 sentiment_weight 加到总分中。
         
         Returns
         -------
@@ -816,6 +829,7 @@ class MultiFactorStrategy(BaseStrategy):
         - 使用向量化操作计算得分
         - 激进型策略中，value_col 可映射到 small_cap_zscore
         - quality_col 可映射到 turnover_5d_zscore
+        - sentiment_scores 权重归一化由用户配置保证
         """
         total_score = pd.Series(0.0, index=data.index)
         
@@ -842,6 +856,32 @@ class MultiFactorStrategy(BaseStrategy):
             total_score += self.size_weight * data[self.size_col].fillna(0)
         elif self.size_weight > 0:
             logger.warning(f"未找到市值因子列: {self.size_col}")
+        
+        # ===== 情绪进攻型策略：加入情绪分数 =====
+        if sentiment_scores is not None and self.sentiment_weight > 0:
+            # 确定股票代码列用于对齐
+            stock_col = self.stock_col if self.stock_col in data.columns else 'symbol'
+            
+            if stock_col in data.columns:
+                # 使用股票代码对齐情绪分数
+                aligned_sentiment = data[stock_col].map(sentiment_scores).fillna(0)
+                total_score += self.sentiment_weight * aligned_sentiment
+                logger.debug(
+                    f"情绪分数已加入综合得分: 权重={self.sentiment_weight}, "
+                    f"有效股票数={aligned_sentiment.notna().sum()}"
+                )
+            else:
+                # 尝试使用索引对齐
+                if isinstance(data.index, pd.MultiIndex):
+                    stock_codes = data.index.get_level_values(-1)
+                else:
+                    stock_codes = data.index
+                aligned_sentiment = stock_codes.to_series().map(sentiment_scores).fillna(0)
+                aligned_sentiment.index = data.index
+                total_score += self.sentiment_weight * aligned_sentiment
+                logger.debug(
+                    f"情绪分数已加入综合得分 (索引对齐): 权重={self.sentiment_weight}"
+                )
         
         return total_score
     
@@ -1269,10 +1309,25 @@ class MultiFactorStrategy(BaseStrategy):
     def select_top_stocks(
         self,
         data: pd.DataFrame,
-        n: Optional[int] = None
+        n: Optional[int] = None,
+        date: Optional[pd.Timestamp] = None,
+        use_sentiment_scoring: bool = True
     ) -> List[str]:
         """
-        选取得分最高的 Top N 只股票
+        两阶段选股：技术面初筛 + 情绪面加成
+        
+        实现"情绪进攻型"策略的核心选股逻辑：
+        
+        **第一阶段（技术面初筛）**：
+        仅根据技术因子（Momentum + Turnover + Size 等）计算基础得分，
+        选出前 N * buffer_multiplier 只候选股票。
+        
+        **第二阶段（情绪面加成）**：
+        对候选股调用 LLM 情绪分析引擎，获取情绪分数（-1 到 1）。
+        
+        **第三阶段（最终排名）**：
+        Final_Score = Base_Score + Sentiment_Weight * Sentiment_Score
+        根据最终得分选出 Top N。
         
         Parameters
         ----------
@@ -1280,38 +1335,169 @@ class MultiFactorStrategy(BaseStrategy):
             包含因子数据的 DataFrame
         n : Optional[int]
             选取数量，默认使用 self.top_n
+        date : Optional[pd.Timestamp]
+            分析日期，用于情绪分析。如果启用情绪分析但未传入日期，
+            则使用当前日期或从数据中推断。
+        use_sentiment_scoring : bool
+            是否启用情绪进攻型加分。默认 True。
+            设置为 False 可强制使用纯技术面选股。
         
         Returns
         -------
         List[str]
             选中的股票代码列表
+        
+        Notes
+        -----
+        - 如果 LLM 调用失败，自动降级为仅使用技术面得分排序
+        - 情绪分数范围为 -1 到 1，会乘以 sentiment_weight 加到基础分上
         """
         n = n or self.top_n
         
         if data.empty:
             return []
         
-        # 计算综合得分
+        # 确定股票代码列
+        stock_col = self.stock_col if self.stock_col in data.columns else 'symbol'
+        
+        # ==========================================
+        # 第一阶段：技术面初筛（基础得分）
+        # ==========================================
         data = data.copy()
-        data['total_score'] = self.calculate_total_score(data)
+        data['base_score'] = self.calculate_total_score(data, sentiment_scores=None)
         
         # 剔除得分为 NaN 的股票
-        valid_data = data.dropna(subset=['total_score'])
+        valid_data = data.dropna(subset=['base_score'])
         
         if valid_data.empty:
             return []
         
-        # 选取 Top N
-        stock_col = self.stock_col if self.stock_col in valid_data.columns else 'symbol'
+        # 判断是否需要进行情绪面加成
+        should_use_sentiment = (
+            use_sentiment_scoring
+            and self._enable_sentiment_filter
+            and self._sentiment_engine is not None
+            and self.sentiment_weight > 0
+        )
+        
+        if not should_use_sentiment:
+            # 纯技术面选股：直接返回 Top N
+            if stock_col not in valid_data.columns:
+                if isinstance(valid_data.index, pd.MultiIndex):
+                    top_stocks = valid_data.nlargest(n, 'base_score').index.get_level_values(-1).tolist()
+                else:
+                    top_stocks = valid_data.nlargest(n, 'base_score').index.tolist()
+            else:
+                top_stocks = valid_data.nlargest(n, 'base_score')[stock_col].tolist()
+            return top_stocks
+        
+        # ==========================================
+        # 第一阶段：选出扩展候选列表（Top N * buffer）
+        # ==========================================
+        buffer_n = n * self._sentiment_buffer_multiplier
         
         if stock_col not in valid_data.columns:
-            # 尝试从索引获取股票代码
             if isinstance(valid_data.index, pd.MultiIndex):
-                top_stocks = valid_data.nlargest(n, 'total_score').index.get_level_values(-1).tolist()
+                pre_selected = valid_data.nlargest(buffer_n, 'base_score')
+                pre_candidates = pre_selected.index.get_level_values(-1).tolist()
             else:
-                top_stocks = valid_data.nlargest(n, 'total_score').index.tolist()
+                pre_selected = valid_data.nlargest(buffer_n, 'base_score')
+                pre_candidates = pre_selected.index.tolist()
         else:
-            top_stocks = valid_data.nlargest(n, 'total_score')[stock_col].tolist()
+            pre_selected = valid_data.nlargest(buffer_n, 'base_score')
+            pre_candidates = pre_selected[stock_col].tolist()
+        
+        logger.debug(
+            f"第一阶段技术面初筛: 共 {len(valid_data)} 只股票 -> "
+            f"选出 {len(pre_candidates)} 只候选股 (buffer={self._sentiment_buffer_multiplier}x)"
+        )
+        
+        # ==========================================
+        # 第二阶段：情绪面加成（LLM 分析）
+        # ==========================================
+        sentiment_scores: Optional[pd.Series] = None
+        
+        # 确定分析日期
+        if date is None:
+            if self.date_col in data.columns:
+                date = pd.to_datetime(data[self.date_col]).max()
+            elif isinstance(data.index, pd.DatetimeIndex):
+                date = data.index.max()
+            elif isinstance(data.index, pd.MultiIndex):
+                date = data.index.get_level_values(0).max()
+            else:
+                date = pd.Timestamp.now()
+        
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        
+        try:
+            # 调用情绪分析引擎
+            sentiment_df = self._sentiment_engine.calculate_sentiment(pre_candidates, date_str)
+            
+            if sentiment_df.empty:
+                logger.warning(
+                    f"情绪分析返回空结果 ({date_str}), "
+                    f"降级为纯技术面选股"
+                )
+            else:
+                # 构建情绪分数 Series（索引为股票代码）
+                sentiment_scores = pd.Series(
+                    sentiment_df['score'].values,
+                    index=sentiment_df['stock_code'].values
+                )
+                logger.info(
+                    f"情绪分析完成 ({date_str}): "
+                    f"{len(sentiment_scores)} 只股票获得情绪分数, "
+                    f"均值={sentiment_scores.mean():.3f}, "
+                    f"范围=[{sentiment_scores.min():.3f}, {sentiment_scores.max():.3f}]"
+                )
+        
+        except LLMCircuitBreakerError:
+            # 熔断器触发：直接抛出，由上层处理
+            raise
+        
+        except Exception as e:
+            # ===== LLM 异常处理：降级为纯技术面 =====
+            logger.warning(
+                f"⚠️ 情绪分析失败 ({date_str}): {e}. "
+                f"降级为纯技术面选股，不阻断交易流程。"
+            )
+            sentiment_scores = None
+        
+        # ==========================================
+        # 第三阶段：最终排名
+        # Final_Score = Base_Score + Sentiment_Weight * Sentiment_Score
+        # ==========================================
+        # 筛选出候选股的数据子集
+        if stock_col in valid_data.columns:
+            candidate_mask = valid_data[stock_col].isin(pre_candidates)
+        else:
+            if isinstance(valid_data.index, pd.MultiIndex):
+                candidate_mask = valid_data.index.get_level_values(-1).isin(pre_candidates)
+            else:
+                candidate_mask = valid_data.index.isin(pre_candidates)
+        
+        candidate_data = valid_data[candidate_mask].copy()
+        
+        # 计算最终得分（包含情绪分数）
+        candidate_data['final_score'] = self.calculate_total_score(
+            candidate_data,
+            sentiment_scores=sentiment_scores
+        )
+        
+        # 选取最终 Top N
+        if stock_col not in candidate_data.columns:
+            if isinstance(candidate_data.index, pd.MultiIndex):
+                top_stocks = candidate_data.nlargest(n, 'final_score').index.get_level_values(-1).tolist()
+            else:
+                top_stocks = candidate_data.nlargest(n, 'final_score').index.tolist()
+        else:
+            top_stocks = candidate_data.nlargest(n, 'final_score')[stock_col].tolist()
+        
+        logger.debug(
+            f"第三阶段最终排名: {len(pre_candidates)} 只候选股 -> "
+            f"选出 {len(top_stocks)} 只目标股票"
+        )
         
         return top_stocks
     
@@ -1481,39 +1667,34 @@ class MultiFactorStrategy(BaseStrategy):
             # 1. 每日风控检查
             is_risk_triggered = market_risk_series.loc[date]
             
-            # 2. 调仓逻辑（采用 Filter-Then-Analyze 模式）
+            # 2. 调仓逻辑（采用两阶段选股模式：技术面初筛 + 情绪面加成）
             if date in rebalance_dates:
                 # 调仓日: 重新选股 (无论是否有风控，都更新选股列表以备后用)
                 filtered_data = self.filter_stocks(data, date)
                 
                 if not filtered_data.empty:
-                    # Step 1: 获取扩展候选列表（Top N * buffer）
-                    buffer_n = self.top_n * self._sentiment_buffer_multiplier
-                    pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)
+                    try:
+                        # 使用新的两阶段选股方法
+                        # select_top_stocks 内部已实现：
+                        # 1. 技术面初筛 -> Top N * buffer 候选股
+                        # 2. 情绪分析获取情绪分数
+                        # 3. 最终排名 = 基础分 + 情绪权重 * 情绪分
+                        current_holdings = self.select_top_stocks(
+                            filtered_data,
+                            n=self.top_n,
+                            date=date,
+                            use_sentiment_scoring=True
+                        )
+                        
+                        logger.debug(
+                            f"调仓日 {date.strftime('%Y-%m-%d')}: "
+                            f"两阶段选股完成, 选中 {len(current_holdings)} 只股票"
+                        )
                     
-                    # Step 2: 应用情绪过滤（Just-in-Time 分析）
-                    # 注意: _apply_sentiment_filter 内部已实现 Fail-Closed 策略
-                    if self._enable_sentiment_filter and self._sentiment_engine is not None:
-                        try:
-                            final_candidates = self._apply_sentiment_filter(pre_candidates, date)
-                        except LLMCircuitBreakerError:
-                            # ===== 熔断器触发: 停止交易 =====
-                            # 直接抛出，由调用方处理
-                            raise
-                        # 注意: 其他异常已在 _apply_sentiment_filter 中处理，
-                        # 会返回空列表（Fail-Closed），不会抛出
-                    else:
-                        final_candidates = pre_candidates
-                    
-                    # Step 3: 最终选取 Top N
-                    current_holdings = final_candidates[:self.top_n]
-                    
-                    logger.debug(
-                        f"调仓日 {date.strftime('%Y-%m-%d')}: "
-                        f"预选 {len(pre_candidates)} 只 -> "
-                        f"情绪过滤后 {len(final_candidates)} 只 -> "
-                        f"最终选中 {len(current_holdings)} 只股票"
-                    )
+                    except LLMCircuitBreakerError:
+                        # ===== 熔断器触发: 停止交易 =====
+                        # 直接抛出，由调用方处理
+                        raise
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
                     current_holdings = []

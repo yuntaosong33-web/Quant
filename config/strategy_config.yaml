@@ -1,12 +1,12 @@
 # A股量化交易系统 - 策略配置文件
 # ===============================
-# 激进型高收益小市值策略 (Aggressive Small Cap Strategy)
+# 中证1000 强动量 + 情绪进攻策略 (Aggressive Momentum & Sentiment Strategy)
 
 # 数据配置
 data:
-  # 股票池: hs300(沪深300), zz500(中证500), all(全市场)
-  # 激进策略使用全市场选股，捕捉小市值机会
-  stock_pool: "hs300"
+  # 股票池: hs300(沪深300), zz500(中证500), zz1000(中证1000), all(全市场)
+  # 中证1000提供更高弹性，适合动量+情绪策略
+  stock_pool: "zz1000"
   
   # 历史数据开始日期
   start_date: "2020-01-01"
@@ -18,39 +18,46 @@ data:
   raw_data_path: "data/raw"
   processed_data_path: "data/processed"
 
-# 策略配置 - 激进型小市值策略
+# 策略配置 - 中证1000强动量+情绪进攻策略
 strategy:
   # 策略名称
-  name: "Aggressive Small Cap Strategy"
+  name: "Aggressive Momentum & Sentiment"
   
-  # 因子权重配置 (激进型)
-  # Total_Score = value_weight * SmallCap_Z + quality_weight * Turnover_Z 
-  #             + momentum_weight * RSI_Z + size_weight * SmallCap_Z
-  # 注意：放弃传统价值因子，改用小市值+高换手+动量的激进组合
-  value_weight: 0.0      # 放弃估值因子（借用此位置放小市值因子）
-  quality_weight: 0.3    # 借用此位置放换手率因子（资金活跃度）
-  momentum_weight: 0.4   # 动量因子权重 (RSI)
-  size_weight: 0.3       # 新增：小市值因子权重（市值越小分数越高）
+  # 因子权重配置 (强动量 + 情绪进攻型)
+  # Base_Score = value_weight * Value_Z + quality_weight * Turnover_Z 
+  #            + momentum_weight * ROC20_Z + size_weight * SmallCap_Z
+  # Final_Score = Base_Score + sentiment_weight * Sentiment_Score
+  # 
+  # 策略逻辑：
+  # - 放弃估值因子（中盘股已无估值优势）
+  # - 放弃小市值因子（已通过 zz1000 股池锁定）
+  # - 核心依赖动量因子（ROC_20）捕捉趋势
+  # - 换手率因子确保资金活跃度
+  # - LLM 情绪因子作为 Alpha 加成
+  value_weight: 0.0      # 放弃估值因子
+  quality_weight: 0.3    # 换手率因子（资金活跃度，对应 turnover_5d_zscore）
+  momentum_weight: 0.4   # 核心动量因子（对应 roc_20_zscore）
+  size_weight: 0.0       # 放弃小市值因子（股池已锁定中盘股）
+  sentiment_weight: 0.3  # 新增：情绪因子权重（LLM 分析结果作为 Alpha 加成）
   
-  # 选股参数（极度集中，追求高弹性）
+  # 选股参数（集中持仓，追求高弹性）
   top_n: 3              # 仅选取3只股票，单只约33%仓位
   min_listing_days: 126  # 最小上市天数（约6个月）
   
   # 因子列名配置（与 features.py 产出列名一致）
-  # small_cap_zscore: 小市值因子 = -log(流通市值) 的标准化
   # turnover_5d_zscore: 5日平均换手率的标准化
-  # rsi_20_zscore: 20日RSI的标准化
-  value_col: "small_cap_zscore"       # 借用 value 位置放市值因子
-  quality_col: "turnover_5d_zscore"   # 借用 quality 位置放换手率因子
-  momentum_col: "rsi_20_zscore"       # 保持动量因子
-  size_col: "small_cap_zscore"        # 新增：独立市值因子列名
+  # roc_20_zscore: 20日变动率(ROC)的标准化 - 使用新添加的 ROC_20 因子
+  value_col: "value_zscore"           # 未使用（权重为0）
+  quality_col: "turnover_5d_zscore"   # 换手率因子
+  momentum_col: "roc_20_zscore"       # 核心动量因子：20日变动率
+  size_col: "small_cap_zscore"        # 未使用（权重为0）
   
   # 调仓频率: monthly(月度), weekly(周度)
-  # 周度调仓更适合激进策略，快速响应市场变化
+  # 周度调仓更适合动量策略，快速捕捉趋势变化
   rebalance_frequency: "weekly"
   
   # 再平衡缓冲区：权重变化小于此阈值时不调整
-  # 激进策略降低缓冲区（2%），更敏感响应信号变化
+  # 动量策略降低缓冲区（2%），更敏感响应信号变化
   rebalance_buffer: 0.02
 
 # 投资组合配置 - 激进型（集中持仓）
@@ -104,8 +111,11 @@ risk:
     drop_lookback: 20       # 跌幅回溯天数
 
 # LLM 情绪分析配置
-# 用于过滤有重大负面新闻的股票（黑天鹅事件风控）
-# 采用 "Filter-Then-Analyze" 模式：仅对 Top N * buffer 的候选股票进行情绪分析
+# 情绪进攻型策略：情绪分数作为 Alpha 因子加成，而非仅用于过滤
+# 采用两阶段选股模式：
+#   1. 技术面初筛 → Top N * buffer 候选股
+#   2. LLM 情绪分析 → 获取情绪分数
+#   3. Final_Score = Base_Score + Sentiment_Weight * Sentiment_Score → 最终排名
 llm:
   # 提供商: deepseek, openai, 或其他 OpenAI 兼容接口
   provider: "deepseek"
@@ -116,13 +126,14 @@ llm:
   # API 端点（可选，也可通过环境变量 OPENAI_BASE_URL 配置）
   base_url: "https://api.deepseek.com/v1"
   
-  # 是否启用情绪过滤
-  # 启用后，情绪分数低于阈值的股票将被过滤
+  # 是否启用情绪分析
+  # 启用后，情绪分数将作为 Alpha 因子加成到综合得分中
+  # 注意：在新的情绪进攻型策略中，情绪分数是加分项而非仅过滤项
   enable_sentiment_filter: true
   
-  # 情绪分数阈值
+  # 情绪分数阈值（保留用于极端负面情况的安全过滤）
   # 分数范围: -1.0 (极度负面) 到 1.0 (极度正面)
-  # 低于此阈值的股票将被禁止交易
+  # 低于此阈值的股票仍会被禁止交易（黑天鹅风控）
   sentiment_threshold: -0.5
   
   # 情绪缓存文件路径
@@ -135,7 +146,7 @@ llm:
   # API 最大重试次数
   max_retries: 3
   
-  # ===== 新增：熔断器与置信度配置 =====
+  # ===== 熔断器与置信度配置 =====
   
   # 熔断器阈值：连续 API 调用失败次数
   # 超过此阈值时，系统将抛出 LLMCircuitBreakerError 异常停止交易
@@ -150,9 +161,9 @@ llm:
   
   # 情绪分析缓冲区乘数
   # 选取 top_n * buffer_multiplier 只股票进行情绪分析
-  # 例如: top_n=3, buffer_multiplier=3 → 分析 9 只候选股票
-  # 这确保即使部分股票被情绪过滤剔除，仍有足够的备选
-  sentiment_buffer_multiplier: 3
+  # 例如: top_n=3, buffer_multiplier=5 → 分析 15 只候选股票
+  # 扩大初筛范围，确保从更多候选股中优中选优
+  sentiment_buffer_multiplier: 5
 
 # 交易配置
 trading:
@@ -220,5 +231,5 @@ backtest:
   initial_capital: 300000
   
   # 基准指数
-  # ZZ500 (000905) 更适合中小盘策略的股票池匹配度
-  benchmark: "000905"  # 中证500
+  # ZZ1000 (000852) 与中证1000股池匹配，适合动量策略
+  benchmark: "000852"  # 中证1000

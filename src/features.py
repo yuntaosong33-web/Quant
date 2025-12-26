@@ -666,6 +666,7 @@ class TechnicalFeatures(FeatureEngine):
             "volatility_20": lambda df: self.volatility(df["close"], 20),
             "momentum_10": lambda df: self.momentum(df["close"], 10),
             "roc_10": lambda df: self.roc(df["close"], 10),
+            "roc_20": lambda df: self.roc(df["close"], 20),
             "williams_r": lambda df: self.williams_r(df["high"], df["low"], df["close"]),
             "kdj_k": lambda df: self.kdj(df["high"], df["low"], df["close"])[0],
             "kdj_d": lambda df: self.kdj(df["high"], df["low"], df["close"])[1],
