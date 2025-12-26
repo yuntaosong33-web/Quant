@@ -103,6 +103,37 @@ risk:
     drop_threshold: 0.05    # 20日跌幅阈值（5%）
     drop_lookback: 20       # 跌幅回溯天数
 
+# LLM 情绪分析配置
+# 用于过滤有重大负面新闻的股票（黑天鹅事件风控）
+llm:
+  # 提供商: deepseek, openai, 或其他 OpenAI 兼容接口
+  provider: "deepseek"
+  
+  # 模型名称
+  model: "deepseek-chat"
+  
+  # API 端点（可选，也可通过环境变量 OPENAI_BASE_URL 配置）
+  base_url: "https://api.deepseek.com/v1"
+  
+  # 是否启用情绪过滤
+  # 启用后，情绪分数低于阈值的股票将被过滤
+  enable_sentiment_filter: true
+  
+  # 情绪分数阈值
+  # 分数范围: -1.0 (极度负面) 到 1.0 (极度正面)
+  # 低于此阈值的股票将被禁止交易
+  sentiment_threshold: -0.5
+  
+  # 情绪缓存文件路径
+  # 用于避免回测时重复调用 API
+  cache_path: "data/processed/sentiment_cache.json"
+  
+  # API 请求超时时间（秒）
+  request_timeout: 30
+  
+  # API 最大重试次数
+  max_retries: 3
+
 # 交易配置
 trading:
   # 交易费用（双边）- 标准A股费率

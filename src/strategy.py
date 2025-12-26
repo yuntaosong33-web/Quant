@@ -743,12 +743,38 @@ class MultiFactorStrategy(BaseStrategy):
         if abs(weight_sum - 1.0) > 1e-6:
             logger.warning(f"因子权重之和为 {weight_sum}，建议权重之和为 1.0")
         
+        # ===== LLM 情绪分析配置 =====
+        # 从配置中获取 LLM 设置
+        self._llm_config = self.config.get("llm", {})
+        self._enable_sentiment_filter: bool = self._llm_config.get("enable_sentiment_filter", False)
+        self._sentiment_threshold: float = self._llm_config.get("sentiment_threshold", -0.5)
+        self._sentiment_engine = None
+        
+        # 初始化情绪分析引擎（如果启用）
+        if self._enable_sentiment_filter:
+            try:
+                from src.features import SentimentEngine
+                self._sentiment_engine = SentimentEngine(self._llm_config)
+                logger.info(
+                    f"情绪分析过滤已启用: threshold={self._sentiment_threshold}"
+                )
+            except ImportError:
+                logger.warning(
+                    "无法导入 SentimentEngine，情绪分析过滤未启用。"
+                    "请确保 src.features 模块可用。"
+                )
+                self._enable_sentiment_filter = False
+            except Exception as e:
+                logger.warning(f"初始化 SentimentEngine 失败: {e}")
+                self._enable_sentiment_filter = False
+        
         logger.info(
             f"多因子策略初始化: 价值权重={self.value_weight}, "
             f"质量权重={self.quality_weight}, 动量权重={self.momentum_weight}, "
             f"市值权重={self.size_weight}, "
             f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
-            f"再平衡缓冲区={self.rebalance_buffer:.1%}"
+            f"再平衡缓冲区={self.rebalance_buffer:.1%}, "
+            f"情绪过滤={'启用' if self._enable_sentiment_filter else '禁用'}"
         )
     
     def calculate_total_score(self, data: pd.DataFrame) -> pd.Series:
@@ -1078,6 +1104,75 @@ class MultiFactorStrategy(BaseStrategy):
             listing_days = (date - ipo_dates).dt.days
             day_data = day_data[listing_days >= self.min_listing_days]
         filter_stats['次新股'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 7: 情绪分析过滤（黑天鹅事件风控）
+        # 剔除情绪分数低于阈值的股票
+        # ==========================================
+        if self._enable_sentiment_filter and self._sentiment_engine is not None:
+            if not day_data.empty:
+                before = len(day_data)
+                
+                # 获取股票代码列表
+                stock_col = self.stock_col if self.stock_col in day_data.columns else None
+                if stock_col is None:
+                    # 尝试从索引获取
+                    if isinstance(day_data.index, pd.MultiIndex):
+                        stock_codes = day_data.index.get_level_values(-1).tolist()
+                    else:
+                        stock_codes = day_data.index.tolist()
+                else:
+                    stock_codes = day_data[stock_col].tolist()
+                
+                # 获取情绪分数
+                try:
+                    date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+                    sentiment_scores = self._sentiment_engine.calculate_sentiment(
+                        stock_codes, date_str
+                    )
+                    
+                    # 构建过滤掩码
+                    # 情绪分数低于阈值的股票将被过滤
+                    # 缺失数据视为中性 (0.0)，允许交易
+                    if stock_col:
+                        scores_aligned = day_data[stock_col].map(
+                            lambda x: sentiment_scores.get(x, 0.0)
+                        )
+                    else:
+                        if isinstance(day_data.index, pd.MultiIndex):
+                            idx_values = day_data.index.get_level_values(-1)
+                        else:
+                            idx_values = day_data.index
+                        scores_aligned = pd.Series(
+                            [sentiment_scores.get(x, 0.0) for x in idx_values],
+                            index=day_data.index
+                        )
+                    
+                    # 过滤低于阈值的股票
+                    negative_sentiment_mask = scores_aligned < self._sentiment_threshold
+                    
+                    # 记录被过滤的股票（用于调试）
+                    filtered_stocks = []
+                    if negative_sentiment_mask.any():
+                        if stock_col:
+                            filtered_stocks = day_data.loc[negative_sentiment_mask, stock_col].tolist()
+                        else:
+                            if isinstance(day_data.index, pd.MultiIndex):
+                                filtered_stocks = day_data.loc[negative_sentiment_mask].index.get_level_values(-1).tolist()
+                            else:
+                                filtered_stocks = day_data.loc[negative_sentiment_mask].index.tolist()
+                        
+                        for stock in filtered_stocks:
+                            score = sentiment_scores.get(stock, 0.0)
+                            logger.debug(
+                                f"情绪过滤: {stock} score={score:.2f} < threshold={self._sentiment_threshold}"
+                            )
+                    
+                    day_data = day_data[~negative_sentiment_mask]
+                    filter_stats['负面情绪'] = before - len(day_data)
+                    
+                except Exception as e:
+                    logger.warning(f"情绪分析失败: {e}，跳过情绪过滤")
         
         # 汇总日志
         total_filtered = initial_count - len(day_data)
