@@ -53,7 +53,7 @@ def _configure_ssl_context() -> None:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
+        ssl_context.set_ciphers('DEFAULT@SECLEVEL=0')
         
         # 设置更兼容的TLS选项，解决EOF问题
         ssl_context.options |= ssl.OP_NO_SSLv2
@@ -74,47 +74,43 @@ def _configure_requests_session() -> None:
     """
     配置 requests 库的全局会话以处理SSL问题
     
-    通过 HTTPAdapter 配置自动重试机制，专门针对：
-    - SSL EOF 错误
-    - 连接重置错误
-    - 超时错误
+    通过 Monkey Patch 方式劫持 requests.Session.request 方法：
+    - 强制添加 Connection: close 头，禁用 Keep-Alive，解决 EOF 错误
+    - 设置默认超时 (10, 30)，防止请求卡死
+    
+    Notes
+    -----
+    使用 Monkey Patch 而非 HTTPAdapter 的原因：
+    - HTTPAdapter 无法强制禁用 Keep-Alive
+    - 需要在所有请求中统一添加 Connection: close 头
     """
     try:
         import requests
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
         
-        # 配置重试策略
-        retry_strategy = Retry(
-            total=5,
-            backoff_factor=1.0,  # 指数退避: 1, 2, 4, 8, 16 秒
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-            raise_on_status=False,
-        )
+        # 保存原始方法引用（确保可追溯）
+        _original_request = requests.Session.request
         
-        # 创建带重试的适配器
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=10,
-        )
+        def _patched_request(self, method, url, **kwargs):
+            """
+            劫持后的 request 方法
+            
+            强制禁用 Keep-Alive 并设置默认超时
+            """
+            # 强制添加 Connection: close 头，禁用长连接
+            headers = kwargs.get('headers', {}) or {}
+            headers['Connection'] = 'close'
+            kwargs['headers'] = headers
+            
+            # 设置默认超时 (连接超时 10s, 读取超时 30s)
+            if 'timeout' not in kwargs or kwargs['timeout'] is None:
+                kwargs['timeout'] = (10, 30)
+            
+            return _original_request(self, method, url, **kwargs)
         
-        # 尝试修改 akshare 使用的 session
-        # akshare 内部使用 requests，我们配置默认session
-        session = requests.Session()
-        session.verify = False  # 禁用SSL验证
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+        # Monkey Patch: 替换全局 Session.request 方法
+        requests.Session.request = _patched_request
         
-        # 设置默认超时
-        session.request = lambda method, url, **kwargs: requests.Session.request(
-            session, method, url, 
-            timeout=kwargs.pop('timeout', 30),
-            **kwargs
-        )
-        
-        logger.debug("requests会话已配置重试策略")
+        logger.debug("requests.Session.request 已通过 Monkey Patch 配置 (Connection: close, timeout=(10,30))")
         
     except Exception as e:
         logger.warning(f"requests会话配置失败: {e}")
@@ -1204,6 +1200,7 @@ class DataLoader:
     - 财务指标数据（PE、PB、股息率）
     - 并发批量下载
     - Parquet格式存储
+    - LocalFirst模式（优先读取本地数据湖）
     
     Attributes
     ----------
@@ -1215,6 +1212,10 @@ class DataLoader:
         重试次数
     timeout : int
         超时时间（秒）
+    mode : str
+        数据获取模式：'network'（网络优先）或 'local_first'（本地优先）
+    lake_path : Path
+        数据湖路径（仅 local_first 模式使用）
     
     Examples
     --------
@@ -1225,6 +1226,10 @@ class DataLoader:
     >>> 
     >>> # 批量下载沪深300成分股
     >>> results = loader.batch_download_hs300("2023-01-01", "2024-12-31")
+    >>> 
+    >>> # LocalFirst模式：优先读取本地数据
+    >>> loader_local = DataLoader(mode="local_first")
+    >>> df = loader_local.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
     """
     
     # AkShare 接口常量
@@ -1232,13 +1237,19 @@ class DataLoader:
     ADJUST_HFQ = "hfq"      # 后复权
     ADJUST_NONE = ""        # 不复权
     
+    # 支持的模式
+    MODE_NETWORK = "network"
+    MODE_LOCAL_FIRST = "local_first"
+    
     def __init__(
         self,
         output_dir: str = "data/raw",
-        max_workers: int = 5,
+        max_workers: int = 2,
         retry_times: int = 3,
-        retry_delay: float = 2.0,
-        timeout: int = 30
+        retry_delay: float = 3.0,
+        timeout: int = 30,
+        mode: str = "network",
+        lake_path: str = "data/lake/daily"
     ) -> None:
         """
         初始化数据加载器
@@ -1248,19 +1259,33 @@ class DataLoader:
         output_dir : str, optional
             数据保存目录，默认 'data/raw'
         max_workers : int, optional
-            最大并发线程数，默认5（避免请求过快被限制）
+            最大并发线程数，默认2（降低并发以提升网络稳定性）
         retry_times : int, optional
             网络请求重试次数，默认3
         retry_delay : float, optional
-            重试间隔秒数，默认2.0
+            重试间隔秒数，默认3.0（增加间隔以避免触发限流）
         timeout : int, optional
             请求超时时间（秒），默认30
+        mode : str, optional
+            数据获取模式，可选：
+            - 'network': 网络优先模式（默认），直接从 Akshare 获取数据
+            - 'local_first': 本地优先模式，优先读取数据湖，缺失时降级到网络
+        lake_path : str, optional
+            数据湖路径，默认 'data/lake/daily'（仅 local_first 模式使用）
         """
         self.output_dir = Path(output_dir)
         self.max_workers = max_workers
         self.retry_times = retry_times
         self.retry_delay = retry_delay
         self.timeout = timeout
+        
+        # 模式配置
+        if mode not in (self.MODE_NETWORK, self.MODE_LOCAL_FIRST):
+            raise ValueError(
+                f"不支持的模式: {mode}，可选 'network' 或 'local_first'"
+            )
+        self.mode = mode
+        self.lake_path = Path(lake_path)
         
         # 确保输出目录存在
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1279,7 +1304,7 @@ class DataLoader:
         
         logger.info(
             f"DataLoader初始化: output_dir={output_dir}, "
-            f"max_workers={max_workers}, retry_times={retry_times}"
+            f"max_workers={max_workers}, mode={mode}"
         )
     
     def fetch_daily_price(
@@ -1295,6 +1320,8 @@ class DataLoader:
         使用 ak.stock_zh_a_hist 接口获取数据。
         默认获取前复权数据用于计算收益率，同时可保留不复权数据用于计算成交额。
         
+        在 local_first 模式下，优先读取本地数据湖，缺失或过期时降级到网络获取。
+        
         Parameters
         ----------
         symbol : str
@@ -1304,7 +1331,7 @@ class DataLoader:
         end_date : str
             结束日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
         include_unadjusted : bool, optional
-            是否同时获取不复权数据，默认True
+            是否同时获取不复权数据，默认True（仅网络模式有效）
         
         Returns
         -------
@@ -1330,6 +1357,180 @@ class DataLoader:
         >>> loader = DataLoader()
         >>> df = loader.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
         >>> print(df[['close', 'amount', 'pct_change']].head())
+        >>> 
+        >>> # LocalFirst模式
+        >>> loader_local = DataLoader(mode="local_first")
+        >>> df = loader_local.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
+        """
+        # LocalFirst 模式
+        if self.mode == self.MODE_LOCAL_FIRST:
+            return self._fetch_daily_price_local_first(
+                symbol, start_date, end_date, include_unadjusted
+            )
+        
+        # Network 模式（原有逻辑）
+        return self._fetch_from_network(
+            symbol, start_date, end_date, include_unadjusted
+        )
+    
+    def _fetch_daily_price_local_first(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        include_unadjusted: bool = True
+    ) -> pd.DataFrame:
+        """
+        LocalFirst 模式获取日线数据
+        
+        优先读取本地数据湖，缺失或过期时降级到网络获取。
+        
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        include_unadjusted : bool
+            是否包含不复权数据
+        
+        Returns
+        -------
+        pd.DataFrame
+            日线数据
+        """
+        # 标准化日期格式
+        start_dt = pd.to_datetime(start_date.replace("-", ""), format="%Y%m%d")
+        end_dt = pd.to_datetime(end_date.replace("-", ""), format="%Y%m%d")
+        
+        # Step 1: 尝试读取本地数据
+        local_df = self._read_from_lake(symbol)
+        
+        if local_df is not None and not local_df.empty:
+            local_max_date = local_df.index.max()
+            local_min_date = local_df.index.min()
+            
+            # 检查本地数据是否覆盖请求范围
+            if local_min_date <= start_dt and local_max_date >= end_dt:
+                # 本地数据完整，直接返回
+                logger.debug(f"{symbol}: 本地数据完整，直接返回")
+                return local_df.loc[start_dt:end_dt].copy()
+            
+            # Step 2: 本地数据不完整，需要补录
+            logger.warning(
+                f"本地数据缺失或过期 ({symbol})，正在触发临时网络请求... "
+                f"(本地: {local_min_date.date()} ~ {local_max_date.date()}, "
+                f"请求: {start_dt.date()} ~ {end_dt.date()})"
+            )
+            
+            # 计算需要补录的日期范围
+            missing_ranges = []
+            
+            # 前面缺失
+            if start_dt < local_min_date:
+                missing_ranges.append((
+                    start_dt.strftime("%Y%m%d"),
+                    (local_min_date - pd.Timedelta(days=1)).strftime("%Y%m%d")
+                ))
+            
+            # 后面缺失
+            if end_dt > local_max_date:
+                missing_ranges.append((
+                    (local_max_date + pd.Timedelta(days=1)).strftime("%Y%m%d"),
+                    end_dt.strftime("%Y%m%d")
+                ))
+            
+            # 获取缺失数据
+            all_dfs = [local_df]
+            for miss_start, miss_end in missing_ranges:
+                missing_df = self._fetch_from_network(
+                    symbol, miss_start, miss_end, include_unadjusted
+                )
+                if missing_df is not None and not missing_df.empty:
+                    all_dfs.append(missing_df)
+            
+            # 合并数据
+            if len(all_dfs) > 1:
+                merged_df = pd.concat(all_dfs)
+                merged_df = merged_df[~merged_df.index.duplicated(keep='last')]
+                merged_df = merged_df.sort_index()
+                return merged_df.loc[start_dt:end_dt].copy()
+            
+            return local_df.loc[start_dt:end_dt].copy()
+        
+        else:
+            # Step 3: 本地无数据，完全从网络获取
+            logger.warning(
+                f"本地数据缺失或过期 ({symbol})，正在触发临时网络请求..."
+            )
+            return self._fetch_from_network(
+                symbol, start_date, end_date, include_unadjusted
+            )
+    
+    def _read_from_lake(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        从数据湖读取本地数据
+        
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            本地数据，文件不存在返回 None
+        """
+        filepath = self.lake_path / f"{symbol}.parquet"
+        
+        if not filepath.exists():
+            logger.debug(f"本地文件不存在: {filepath}")
+            return None
+        
+        try:
+            df = pd.read_parquet(filepath)
+            
+            # 确保索引是 DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if 'date' in df.columns:
+                    df = df.set_index('date')
+                df.index = pd.to_datetime(df.index)
+            
+            df = df.sort_index()
+            logger.debug(f"从数据湖加载 {symbol}: {len(df)} 行")
+            return df
+            
+        except Exception as e:
+            logger.warning(f"读取本地文件失败 {filepath}: {e}")
+            return None
+    
+    def _fetch_from_network(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        include_unadjusted: bool = True
+    ) -> pd.DataFrame:
+        """
+        从网络获取日线数据（Akshare）
+        
+        Parameters
+        ----------
+        symbol : str
+            股票代码
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        include_unadjusted : bool
+            是否包含不复权数据
+        
+        Returns
+        -------
+        pd.DataFrame
+            日线数据
         """
         # 标准化日期格式
         start_date = start_date.replace("-", "")

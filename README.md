@@ -8,6 +8,7 @@
 ## ✨ 特性
 
 - 📊 **数据获取**: 基于 AkShare 的 A 股数据获取，支持日线、基本面等多种数据
+- 🗄️ **本地数据湖**: 支持 Tushare/Akshare 双数据源，Parquet 格式本地存储，增量更新
 - 🔢 **因子计算**: 丰富的技术指标库，支持自定义因子扩展
 - 📈 **策略框架**: 灵活的策略抽象接口，支持均线、RSI、组合策略等
 - ⚡ **高性能回测**: 基于 VectorBT 的向量化回测引擎
@@ -19,19 +20,23 @@
 ashare_quant_system/
 ├── config/                    # 配置文件
 │   ├── strategy_config.yaml   # 策略配置
-│   └── data_config.yaml       # 数据配置
+│   └── data_config.yaml       # 数据配置（含Tushare/数据湖配置）
 ├── data/                      # 数据存储
 │   ├── raw/                   # 原始数据 (Parquet格式)
-│   └── processed/             # 清洗后的特征数据
+│   ├── processed/             # 清洗后的特征数据
+│   └── lake/daily/            # 本地数据湖（日线Parquet）
 ├── src/                       # 源代码
 │   ├── __init__.py           
-│   ├── data_loader.py         # 数据获取与ETL类
+│   ├── data_loader.py         # 数据获取与ETL类（支持LocalFirst模式）
 │   ├── features.py            # 因子计算引擎
 │   ├── strategy.py            # 策略逻辑实现
 │   ├── backtest.py            # VectorBT回测流程
-│   └── utils.py               # 通用工具函数
+│   └── utils.py               # 通用工具函数（含DataStandardizer）
+├── tools/                     # 工具脚本
+│   ├── sync_data.py           # 数据同步脚本（Tushare/Akshare双源）
+│   ├── pre_trade_check.py     # 盘前检查
+│   └── update_holdings.py     # 持仓更新
 ├── notebooks/                 # Jupyter Notebooks
-│   └── exploratory_analysis.ipynb
 ├── tests/                     # 单元测试
 ├── pyproject.toml             # 依赖管理
 └── README.md
@@ -118,6 +123,46 @@ hs300_stocks = loader.get_stock_list(index_code="000300")
 # 获取基本面数据
 fundamental = loader.fetch_fundamental_data("000001")
 ```
+
+### DataLoader (增强版数据加载器)
+
+支持两种模式：网络模式和本地优先模式（LocalFirst）。
+
+```python
+from src import DataLoader
+
+# 网络模式（默认）- 直接从 Akshare 获取
+loader = DataLoader(mode="network")
+df = loader.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
+
+# LocalFirst 模式 - 优先读取本地数据湖，缺失时降级到网络
+loader_local = DataLoader(mode="local_first", lake_path="data/lake/daily")
+df = loader_local.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
+```
+
+### 数据同步脚本 (sync_data.py)
+
+独立的盘后数据同步脚本，支持 Tushare（主）和 Akshare（备）双数据源：
+
+```bash
+# 同步股票池中的所有股票（增量更新）
+python tools/sync_data.py
+
+# 同步指定股票
+python tools/sync_data.py --symbols 000001 000002 600519
+
+# 全量重建（忽略本地已有数据）
+python tools/sync_data.py --full-rebuild
+
+# 查看同步状态
+python tools/sync_data.py --status
+```
+
+**特性**：
+- 增量更新：自动检测本地数据的最后日期，只下载缺失部分
+- 双源降级：优先使用 Tushare，失败自动切换到 Akshare
+- 并发控制：使用 ThreadPoolExecutor (max_workers=3)
+- 进度显示：tqdm 进度条 + 详细日志
 
 ### FeatureEngine (因子计算)
 
@@ -212,16 +257,32 @@ backtest:
 ### data_config.yaml
 
 ```yaml
+# Tushare 配置（主数据源）
+tushare:
+  token: ""  # 填写 Tushare Pro token
+
+# 数据湖配置
+lake:
+  storage_path: "data/lake/daily"
+  compression: "snappy"
+
+# 数据源配置
 data_source:
   provider: "akshare"
-  retry_times: 3
+  primary: "tushare"    # 主数据源
+  fallback: "akshare"   # 备用数据源
+  retry_times: 5
 
+# 股票池配置
 universe:
   index_codes:
-    - "000300"
+    - "000300"  # 沪深300
+    - "000905"  # 中证500
 
-storage:
-  file_format: "parquet"
+# 同步配置
+sync:
+  start_date: "2020-01-01"
+  max_workers: 3
 ```
 
 ## 🧪 测试

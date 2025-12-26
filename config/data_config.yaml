@@ -1,13 +1,26 @@
 # 数据配置文件
 # A股量化交易系统 - Data Configuration
 
+# Tushare 配置（主数据源）
+# 获取 token: https://tushare.pro/register
+tushare:
+  token: ""  # 留空占位，需用户填写 Tushare Pro token
+
+# 数据湖存储配置
+lake:
+  storage_path: "data/lake/daily"  # 日线数据存储路径
+  compression: "snappy"            # Parquet 压缩算法
+
 # 数据源配置
 data_source:
-  provider: "akshare"  # 数据提供商
+  provider: "akshare"  # 数据提供商（兼容旧配置）
+  primary: "tushare"   # 主数据源
+  fallback: "akshare"  # 备用数据源
   retry_times: 5       # 重试次数（网络不稳定时建议增加）
   retry_delay: 3       # 基础重试间隔（秒），实际使用指数退避
   timeout: 60          # 超时时间（秒）
   request_delay: 0.5   # 请求间隔（秒），避免被限流
+  max_workers: 2       # 最大并发线程数（降低以提升网络稳定性）
 
 # 股票池配置
 universe:
@@ -63,3 +76,8 @@ update:
   update_time: "18:00"    # 更新时间
   incremental: true       # 增量更新
 
+# 数据同步脚本配置
+sync:
+  start_date: "2020-01-01"  # 历史数据起始日期
+  max_workers: 3            # 同步并发线程数
+  batch_size: 50            # 每批处理股票数量
