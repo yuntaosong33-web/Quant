@@ -17,7 +17,6 @@ Usage
     # 生成回测报告
     python main.py --backtest --start 2023-01-01 --end 2024-01-01
 """
-
 import argparse
 import logging
 import os
@@ -192,15 +191,21 @@ class DailyUpdateRunner:
         self.strategy = MultiFactorStrategy(
             name=strategy_config.get("name", "Multi-Factor Strategy"),
             config={
-                # 为避免使用含有未来函数的财务数据，暂时仅启用量价因子
+                # 因子权重配置（从配置文件读取）
                 "value_weight": strategy_config.get("value_weight", 0.0),
-                "quality_weight": strategy_config.get("quality_weight", 0.0),
-                "momentum_weight": strategy_config.get("momentum_weight", 1.0),
-                "top_n": strategy_config.get("top_n", 30),
+                "quality_weight": strategy_config.get("quality_weight", 0.3),
+                "momentum_weight": strategy_config.get("momentum_weight", 0.4),
+                "size_weight": strategy_config.get("size_weight", 0.3),
+                "top_n": strategy_config.get("top_n", 3),
                 "min_listing_days": strategy_config.get("min_listing_days", 126),
-                "value_col": "ep_ttm_zscore",
-                "quality_col": "roe_stability_zscore",
-                "momentum_col": "rsi_20_zscore",
+                # 因子列名配置（从配置文件读取，支持激进型小市值策略）
+                "value_col": strategy_config.get("value_col", "small_cap_zscore"),
+                "quality_col": strategy_config.get("quality_col", "turnover_5d_zscore"),
+                "momentum_col": strategy_config.get("momentum_col", "rsi_20_zscore"),
+                "size_col": strategy_config.get("size_col", "small_cap_zscore"),
+                # 调仓配置
+                "rebalance_frequency": strategy_config.get("rebalance_frequency", "weekly"),
+                "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.02),
             }
         )
     
@@ -833,52 +838,73 @@ class DailyUpdateRunner:
                     how='left'
                 )
             
-            # 计算价值因子 EP_TTM (如果缺少列，填充 0 或 NaN)
+            # ==================== 因子计算 ====================
+            # 根据策略配置动态计算所需因子
+            
+            # 1. 动量因子 RSI_20（所有策略通用）
+            factor_data['rsi_20'] = factor_data.groupby('stock_code')['close'].transform(
+                lambda x: self._calculate_rsi(x, 20)
+            )
+            
+            # 2. 小市值因子 small_cap（激进型策略使用）
+            # small_cap = -log(流通市值)，市值越小分数越高
+            if 'circ_mv' in factor_data.columns:
+                factor_data['small_cap'] = -np.log(factor_data['circ_mv'].replace(0, np.nan))
+                factor_data['small_cap'] = factor_data['small_cap'].replace([np.inf, -np.inf], np.nan)
+            elif 'total_mv' in factor_data.columns:
+                factor_data['small_cap'] = -np.log(factor_data['total_mv'].replace(0, np.nan))
+                factor_data['small_cap'] = factor_data['small_cap'].replace([np.inf, -np.inf], np.nan)
+            else:
+                factor_data['small_cap'] = np.nan
+            
+            # 3. 换手率因子 turnover_5d（激进型策略使用）
+            if 'turn' in factor_data.columns:
+                factor_data['turnover_5d'] = factor_data.groupby('stock_code')['turn'].transform(
+                    lambda x: x.rolling(5, min_periods=1).mean()
+                )
+            else:
+                factor_data['turnover_5d'] = np.nan
+            
+            # 4. 传统价值因子 EP_TTM（保守型策略使用）
             if 'pe_ttm' in factor_data.columns:
                 factor_data['ep_ttm'] = 1.0 / factor_data['pe_ttm'].replace(0, np.nan)
                 factor_data['ep_ttm'] = factor_data['ep_ttm'].replace([np.inf, -np.inf], np.nan)
             else:
                 factor_data['ep_ttm'] = np.nan
             
-            # 计算质量因子 ROE_Stability (如果缺少列，填充 NaN)
+            # 5. 传统质量因子 ROE_Stability（保守型策略使用）
             if 'roe' in factor_data.columns:
                 factor_data['roe_stability'] = factor_data['roe']
             else:
                 factor_data['roe_stability'] = np.nan
             
-            # 计算动量因子 RSI_20
-            factor_data['rsi_20'] = factor_data.groupby('stock_code')['close'].transform(
-                lambda x: self._calculate_rsi(x, 20)
-            )
-            
-            # 计算特质波动率 IVOL
+            # 6. 特质波动率 IVOL（风险因子）
             factor_data['ivol'] = factor_data.groupby('stock_code')['close'].transform(
                 lambda x: x.pct_change().rolling(20).std() * np.sqrt(252)
             )
             
-            # Z-Score 标准化（行业中性化）
+            # ==================== Z-Score 标准化 ====================
             date_col = 'date' if 'date' in factor_data.columns else 'trade_date'
             
-            # 即使某些因子全为 NaN，z_score_normalize 也应能处理（返回 NaN）
+            # 对所有计算的因子进行 Z-Score 标准化（行业中性化）
+            factor_cols_to_normalize = [
+                'rsi_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability'
+            ]
+            # 只标准化存在且有效的因子列
+            valid_factor_cols = [
+                col for col in factor_cols_to_normalize 
+                if col in factor_data.columns and factor_data[col].notna().any()
+            ]
+            
             factor_data = z_score_normalize(
                 factor_data,
-                factor_cols=['ep_ttm', 'roe_stability', 'rsi_20'],
+                factor_cols=valid_factor_cols,
                 date_col=date_col,
                 industry_col='sw_industry_l1',
                 industry_neutral=True
             )
             
-            # 重命名标准化后的列以匹配策略配置
-            factor_data.rename(columns={
-                'ep_ttm_zscore': 'value_zscore',
-                'roe_stability_zscore': 'quality_zscore', 
-                'rsi_20_zscore': 'momentum_zscore'
-            }, inplace=True)
-            
-            # 更新策略的因子列名配置
-            self.strategy.value_col = 'value_zscore'
-            self.strategy.quality_col = 'quality_zscore'
-            self.strategy.momentum_col = 'momentum_zscore'
+            self.logger.info(f"已标准化因子: {valid_factor_cols}")
             
             self.factor_data = factor_data
             
@@ -2702,7 +2728,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # 初始化并运行
-    runner = DailyUpdateRunner()
-    runner.run_daily_update()
+    main()
 

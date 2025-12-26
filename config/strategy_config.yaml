@@ -6,7 +6,7 @@
 data:
   # 股票池: hs300(沪深300), zz500(中证500), all(全市场)
   # 激进策略使用全市场选股，捕捉小市值机会
-  stock_pool: "all"
+  stock_pool: "hs300"
   
   # 历史数据开始日期
   start_date: "2020-01-01"
@@ -160,10 +160,10 @@ logging:
 # 回测配置
 backtest:
   # 回测开始日期
-  start_date: "2023-01-01"
+  start_date: "2024-01-01"
   
   # 回测结束日期
-  end_date: "2024-01-01"
+  end_date: "2025-01-01"
   
   # 初始资金
   initial_capital: 300000

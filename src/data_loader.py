@@ -168,7 +168,7 @@ class DataHandler(ABC):
         logger.info(f"数据已加载: {filepath}, 形状: {data.shape}")
         return data
     
-    def _retry_request(self, func: callable, *args, **kwargs) -> Any:
+    def _retry_request(self, func: Callable, *args, **kwargs) -> Any:
         """
         带重试机制的请求包装器
         
