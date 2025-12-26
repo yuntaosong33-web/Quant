@@ -10,7 +10,6 @@ Usage
 -----
     # 运行每日更新
     python main.py --daily-update
-    
     # 强制调仓（忽略日期检查）
     python main.py --daily-update --force-rebalance
     
@@ -349,13 +348,26 @@ class DailyUpdateRunner:
             data_config = self.config.get("data", {})
             stock_pool = data_config.get("stock_pool", "hs300")
             
-            # 获取股票列表
-            if stock_pool == "hs300":
-                stock_list = self.data_loader.get_index_stocks("000300")
-            elif stock_pool == "zz500":
-                stock_list = self.data_loader.get_index_stocks("000905")
+            # 获取股票列表（支持主要指数成分股）
+            # 使用指数成分股API比全市场API更稳定
+            stock_pool_to_index = {
+                "hs300": "000300",    # 沪深300
+                "zz500": "000905",    # 中证500
+                "zz1000": "000852",   # 中证1000
+                "sz50": "000016",     # 上证50
+                "cyb50": "399673",    # 创业板50
+            }
+            
+            if stock_pool in stock_pool_to_index:
+                index_code = stock_pool_to_index[stock_pool]
+                stock_list = self.data_loader.get_stock_list(index_code)
+            elif stock_pool == "all":
+                # 全市场需要使用stock_zh_a_spot_em，网络不稳定时可能失败
+                self.logger.warning("全市场模式网络依赖较高，建议使用指数成分股模式")
+                stock_list = self.data_loader.get_stock_list()
             else:
-                stock_list = self.data_loader.get_all_stocks()
+                self.logger.warning(f"未知的股票池 '{stock_pool}'，使用默认沪深300")
+                stock_list = self.data_loader.get_stock_list("000300")
             
             self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
             
@@ -366,19 +378,23 @@ class DailyUpdateRunner:
             
             # 下载OHLCV数据
             ohlcv_list = []
-            for i, stock in enumerate(stock_list[:50]):  # 限制数量用于演示
+            total_stocks = len(stock_list)
+            for i, stock in enumerate(stock_list):
                 try:
-                    df = self.data_loader.get_stock_daily(
+                    df = self.data_loader.fetch_daily_data(
                         stock, start_date, end_date
                     )
                     if df is not None and not df.empty:
+                        # 重置索引，将 DatetimeIndex 转换为 'date' 列
+                        if isinstance(df.index, pd.DatetimeIndex):
+                            df = df.reset_index(names=['date'])
                         df['stock_code'] = stock
                         ohlcv_list.append(df)
                 except Exception as e:
                     self.logger.debug(f"获取 {stock} 数据失败: {e}")
                 
-                if (i + 1) % 10 == 0:
-                    self.logger.info(f"已处理 {i + 1}/{len(stock_list[:50])} 只股票")
+                if (i + 1) % 50 == 0 or (i + 1) == total_stocks:
+                    self.logger.info(f"已处理 {i + 1}/{total_stocks} 只股票")
             
             if ohlcv_list:
                 self.ohlcv_data = pd.concat(ohlcv_list, ignore_index=True)
@@ -431,6 +447,27 @@ class DailyUpdateRunner:
             stocks = self.ohlcv_data['stock_code'].unique().tolist()
             total_stocks = len(stocks)
             self.logger.info(f"需获取 {total_stocks} 只股票的财务数据")
+            
+            # 预先获取全市场数据并缓存（避免为每只股票重复请求）
+            self.logger.info("预获取全市场行情数据以加速财务指标获取...")
+            spot_data_available = False
+            try:
+                spot_df = self.financial_loader._get_spot_data_cached()
+                spot_data_available = spot_df is not None and not spot_df.empty
+                if spot_data_available:
+                    self.logger.info("✅ 全市场行情数据就绪")
+            except Exception as e:
+                self.logger.warning(f"预获取全市场数据失败: {e}")
+            
+            # 如果全市场数据获取失败，尝试使用历史财务数据作为备份
+            if not spot_data_available:
+                fallback_df = self._load_fallback_financial_data(stocks)
+                if fallback_df is not None:
+                    self.logger.info(f"⚠️ 使用历史财务数据作为备份（{len(fallback_df)} 条）")
+                    self.financial_data = fallback_df
+                    self._excluded_stocks = set()
+                    return True
+                self.logger.warning("无可用的历史财务数据备份，将尝试逐只股票获取")
             
             # 使用真实数据接口获取财务指标
             financial_records = []
@@ -503,8 +540,8 @@ class DailyUpdateRunner:
                         f"失败: {len(failed_stocks)} ({current_failure_rate:.1%})"
                     )
                 
-                # 添加延时避免请求过快
-                time.sleep(0.1)
+                # 添加延时避免请求过快（已有缓存时可减少延时）
+                time.sleep(0.05)
             
             # ========== Fail Fast 检查 ==========
             failure_rate = len(failed_stocks) / total_stocks if total_stocks > 0 else 0
@@ -620,6 +657,72 @@ class DailyUpdateRunner:
                     except (ValueError, TypeError):
                         continue
         return default
+    
+    def _load_fallback_financial_data(
+        self, 
+        required_stocks: List[str]
+    ) -> Optional[pd.DataFrame]:
+        """
+        加载历史财务数据作为网络失败时的备份
+        
+        按日期倒序查找最近的财务数据文件，过滤出当前需要的股票。
+        
+        Parameters
+        ----------
+        required_stocks : List[str]
+            需要财务数据的股票代码列表
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            历史财务数据，如果无可用数据返回 None
+        """
+        # 查找历史财务数据文件
+        financial_files = sorted(
+            DATA_RAW_PATH.glob("financial_*.parquet"),
+            reverse=True  # 最新的优先
+        )
+        
+        if not financial_files:
+            self.logger.warning("未找到历史财务数据文件")
+            return None
+        
+        # 尝试加载最近的文件
+        for file_path in financial_files[:5]:  # 最多尝试5个文件
+            try:
+                df = pd.read_parquet(file_path)
+                
+                if df.empty or 'stock_code' not in df.columns:
+                    continue
+                
+                # 过滤出需要的股票
+                required_set = set(required_stocks)
+                df_filtered = df[df['stock_code'].isin(required_set)]
+                
+                if len(df_filtered) == 0:
+                    continue
+                
+                coverage = len(df_filtered) / len(required_set)
+                file_date = file_path.stem.replace("financial_", "")
+                
+                self.logger.info(
+                    f"📂 加载历史财务数据: {file_path.name}\n"
+                    f"   数据日期: {file_date}\n"
+                    f"   覆盖率: {len(df_filtered)}/{len(required_set)} ({coverage:.1%})"
+                )
+                
+                # 覆盖率太低则跳过
+                if coverage < 0.5:
+                    self.logger.warning(f"覆盖率过低 ({coverage:.1%})，尝试其他文件")
+                    continue
+                
+                return df_filtered
+                
+            except Exception as e:
+                self.logger.debug(f"加载 {file_path} 失败: {e}")
+                continue
+        
+        return None
     
     def _estimate_listing_days(self, stock: str) -> int:
         """
@@ -981,9 +1084,29 @@ class DailyUpdateRunner:
             # 准备数据
             ohlcv = self.ohlcv_data.copy()
             
-            # 确保日期列
-            if 'date' not in ohlcv.columns and 'trade_date' in ohlcv.columns:
-                ohlcv['date'] = pd.to_datetime(ohlcv['trade_date'])
+            # 确保日期列存在（处理 DatetimeIndex 和各种列名情况）
+            if 'date' not in ohlcv.columns:
+                if 'trade_date' in ohlcv.columns:
+                    ohlcv['date'] = pd.to_datetime(ohlcv['trade_date'])
+                elif '日期' in ohlcv.columns:
+                    ohlcv['date'] = pd.to_datetime(ohlcv['日期'])
+                elif isinstance(ohlcv.index, pd.DatetimeIndex):
+                    ohlcv = ohlcv.reset_index()
+                    # 重命名索引列为 'date'
+                    if ohlcv.columns[0] in ['index', 'date', '日期']:
+                        ohlcv.rename(columns={ohlcv.columns[0]: 'date'}, inplace=True)
+                    else:
+                        ohlcv['date'] = ohlcv.index
+                else:
+                    self.logger.warning("无法找到日期列，尝试从数据结构推断...")
+                    # 尝试重置索引
+                    ohlcv = ohlcv.reset_index()
+                    if 'index' in ohlcv.columns:
+                        ohlcv.rename(columns={'index': 'date'}, inplace=True)
+            
+            # 确保 date 列是 datetime 类型
+            if 'date' in ohlcv.columns:
+                ohlcv['date'] = pd.to_datetime(ohlcv['date'])
             
             # ========== 实盘安全：过滤掉被排除的股票 ==========
             excluded_stocks = getattr(self, '_excluded_stocks', set())
@@ -1140,23 +1263,32 @@ class DailyUpdateRunner:
         
         # 获取本月所有交易日
         if self.ohlcv_data is not None:
-            date_col = 'date' if 'date' in self.ohlcv_data.columns else 'trade_date'
-            trading_dates = pd.to_datetime(self.ohlcv_data[date_col].unique())
+            # 优先使用 DatetimeIndex，其次使用 date/trade_date 列
+            if isinstance(self.ohlcv_data.index, pd.DatetimeIndex):
+                trading_dates = self.ohlcv_data.index.unique()
+            elif 'date' in self.ohlcv_data.columns:
+                trading_dates = pd.to_datetime(self.ohlcv_data['date'].unique())
+            elif 'trade_date' in self.ohlcv_data.columns:
+                trading_dates = pd.to_datetime(self.ohlcv_data['trade_date'].unique())
+            else:
+                self.logger.warning("ohlcv_data 中未找到日期列或 DatetimeIndex，使用简化判断")
+                trading_dates = None
             
             # 筛选本月交易日
-            month_dates = trading_dates[
-                (trading_dates.year == date.year) & 
-                (trading_dates.month == date.month)
-            ]
-            
-            if len(month_dates) > 0:
-                last_trading_day = month_dates.max()
-                is_last_day = date >= last_trading_day
-                self.logger.info(
-                    f"本月最后交易日: {last_trading_day.strftime('%Y-%m-%d')}, "
-                    f"今日: {date.strftime('%Y-%m-%d')}, 是否调仓日: {is_last_day}"
-                )
-                return is_last_day
+            if trading_dates is not None:
+                month_dates = trading_dates[
+                    (trading_dates.year == date.year) & 
+                    (trading_dates.month == date.month)
+                ]
+                
+                if len(month_dates) > 0:
+                    last_trading_day = month_dates.max()
+                    is_last_day = date >= last_trading_day
+                    self.logger.info(
+                        f"本月最后交易日: {last_trading_day.strftime('%Y-%m-%d')}, "
+                        f"今日: {date.strftime('%Y-%m-%d')}, 是否调仓日: {is_last_day}"
+                    )
+                    return is_last_day
         
         # 简化判断：月末最后3天视为调仓日
         next_month = (date.replace(day=28) + timedelta(days=4)).replace(day=1)

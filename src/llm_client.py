@@ -1,7 +1,7 @@
 """
 LLM 客户端模块
 
-该模块提供与 OpenAI 兼容 API（如 DeepSeek、GPT-4o）的交互功能，
+该模块提供与 OpenAI 兼容 API（如 Qwen/通义千问、DeepSeek、GPT-4o）的交互功能，
 主要用于金融新闻情绪分析。
 
 Performance Notes
@@ -71,7 +71,7 @@ class LLMClient:
     LLM 客户端类
     
     封装 OpenAI 兼容 API 的调用，用于金融新闻情绪分析。
-    支持 DeepSeek、OpenAI 等兼容接口。
+    支持 Qwen/通义千问、DeepSeek、OpenAI 等兼容接口。
     
     包含熔断器（Circuit Breaker）机制：当连续 API 调用失败次数超过阈值时，
     抛出 LLMCircuitBreakerError 异常，停止交易操作。
@@ -188,7 +188,7 @@ class LLMClient:
         if not resolved_api_key:
             logger.warning(
                 "未配置 API Key，LLM 功能不可用。"
-                "请设置环境变量 DEEPSEEK_API_KEY 或 OPENAI_API_KEY"
+                "请设置环境变量 QWEN_API_KEY、DEEPSEEK_API_KEY 或 OPENAI_API_KEY"
             )
             return
         
@@ -223,10 +223,15 @@ class LLMClient:
         Notes
         -----
         按以下顺序查找：
-        1. DEEPSEEK_API_KEY
-        2. OPENAI_API_KEY
+        1. QWEN_API_KEY (阿里云通义千问)
+        2. DEEPSEEK_API_KEY
+        3. OPENAI_API_KEY
         """
-        return os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        return (
+            os.environ.get("QWEN_API_KEY") or
+            os.environ.get("DEEPSEEK_API_KEY") or
+            os.environ.get("OPENAI_API_KEY")
+        )
     
     def _get_base_url_from_env(self) -> str:
         """

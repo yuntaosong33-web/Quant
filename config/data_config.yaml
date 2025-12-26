@@ -4,9 +4,10 @@
 # 数据源配置
 data_source:
   provider: "akshare"  # 数据提供商
-  retry_times: 3       # 重试次数
-  retry_delay: 5       # 重试间隔（秒）
-  timeout: 30          # 超时时间（秒）
+  retry_times: 5       # 重试次数（网络不稳定时建议增加）
+  retry_delay: 3       # 基础重试间隔（秒），实际使用指数退避
+  timeout: 60          # 超时时间（秒）
+  request_delay: 0.5   # 请求间隔（秒），避免被限流
 
 # 股票池配置
 universe:
