@@ -7,14 +7,15 @@ LLM 客户端模块
 Performance Notes
 -----------------
 - 使用 tenacity 库实现指数退避重试
-- API 调用失败时返回中性分数 (0.0)，不影响策略运行
+- 实现熔断器（Circuit Breaker）机制：连续失败超过阈值时抛出异常停止交易
 - 支持从环境变量或配置文件读取 API 密钥
 """
 
 import json
 import logging
 import os
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
 
 try:
     from openai import OpenAI
@@ -36,12 +37,44 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class SentimentResult:
+    """
+    情绪分析结果数据类
+    
+    Attributes
+    ----------
+    score : float
+        情绪分数，范围 [-1.0, 1.0]
+    confidence : float
+        置信度，范围 [0.0, 1.0]
+    summary : str
+        分析摘要
+    """
+    score: float
+    confidence: float
+    summary: str = ""
+
+
+class LLMCircuitBreakerError(RuntimeError):
+    """
+    LLM 熔断器触发异常
+    
+    当 LLM API 连续失败次数超过阈值时抛出此异常，
+    用于停止交易以避免在 API 不可用时继续操作。
+    """
+    pass
+
+
 class LLMClient:
     """
     LLM 客户端类
     
     封装 OpenAI 兼容 API 的调用，用于金融新闻情绪分析。
     支持 DeepSeek、OpenAI 等兼容接口。
+    
+    包含熔断器（Circuit Breaker）机制：当连续 API 调用失败次数超过阈值时，
+    抛出 LLMCircuitBreakerError 异常，停止交易操作。
     
     Parameters
     ----------
@@ -58,6 +91,8 @@ class LLMClient:
         请求超时时间（秒），默认 30
     max_retries : int
         最大重试次数，默认 3
+    max_consecutive_failures : int
+        熔断器阈值：连续失败次数超过此值时触发熔断，默认 5
     
     Attributes
     ----------
@@ -69,19 +104,20 @@ class LLMClient:
     Examples
     --------
     >>> client = LLMClient()
-    >>> score = client.get_sentiment_score("公司业绩大幅增长，净利润同比增长50%")
-    >>> print(score)  # 0.8
+    >>> result = client.get_sentiment_score("公司业绩大幅增长，净利润同比增长50%")
+    >>> print(result.score, result.confidence)  # 0.8, 0.9
     
     >>> # 使用自定义配置
     >>> client = LLMClient(
     ...     api_key="sk-xxx",
     ...     base_url="https://api.openai.com/v1",
-    ...     model="gpt-4o"
+    ...     model="gpt-4o",
+    ...     max_consecutive_failures=5
     ... )
     
     Notes
     -----
-    - API 调用失败时返回 0.0（中性），不会抛出异常
+    - 熔断器触发时抛出 LLMCircuitBreakerError，不会静默失败
     - 使用指数退避重试策略应对临时网络问题
     - 日志记录所有 API 调用和错误
     """
@@ -92,12 +128,15 @@ class LLMClient:
     # 系统提示词
     SYSTEM_PROMPT = "You are a financial risk control expert."
     
-    # 用户提示词模板
+    # 用户提示词模板（包含置信度和摘要）
     USER_PROMPT_TEMPLATE = (
         "Analyze the following news for stock {symbol}: {news_content}. "
-        "Output a valid JSON object with a single field 'score' ranging from "
-        "-1.0 (Bankruptcy/Investigation/Delisting) to 1.0 (Major Breakthrough/Huge Profit). "
-        "0.0 is Neutral. Output only JSON."
+        "Output a valid JSON object with the following fields: "
+        "'score' (float, -1.0 to 1.0, where -1.0 = Bankruptcy/Investigation/Delisting, "
+        "0.0 = Neutral, 1.0 = Major Breakthrough/Huge Profit), "
+        "'confidence' (float, 0.0 to 1.0, how confident you are in this sentiment assessment), "
+        "'summary' (string, one-sentence reason for the score). "
+        "Output only JSON."
     )
     
     def __init__(
@@ -106,7 +145,8 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: str = "deepseek-chat",
         timeout: int = 30,
-        max_retries: int = 3
+        max_retries: int = 3,
+        max_consecutive_failures: int = 5
     ) -> None:
         """
         初始化 LLM 客户端
@@ -123,11 +163,17 @@ class LLMClient:
             请求超时时间
         max_retries : int
             最大重试次数
+        max_consecutive_failures : int
+            熔断器阈值，默认 5
         """
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
         self._client: Optional[Any] = None
+        
+        # 熔断器状态
+        self._consecutive_failures: int = 0
+        self._max_consecutive_failures: int = max_consecutive_failures
         
         # 检查依赖
         if not OPENAI_AVAILABLE:
@@ -157,7 +203,8 @@ class LLMClient:
                 timeout=timeout
             )
             logger.info(
-                f"LLM 客户端初始化成功: model={model}, base_url={resolved_base_url}"
+                f"LLM 客户端初始化成功: model={model}, base_url={resolved_base_url}, "
+                f"max_consecutive_failures={max_consecutive_failures}"
             )
         except Exception as e:
             logger.error(f"LLM 客户端初始化失败: {e}")
@@ -204,15 +251,66 @@ class LLMClient:
         """
         return self._client is not None
     
+    @property
+    def consecutive_failures(self) -> int:
+        """
+        获取当前连续失败次数
+        
+        Returns
+        -------
+        int
+            连续失败次数
+        """
+        return self._consecutive_failures
+    
+    @property
+    def is_circuit_breaker_open(self) -> bool:
+        """
+        检查熔断器是否触发
+        
+        Returns
+        -------
+        bool
+            熔断器是否已触发
+        """
+        return self._consecutive_failures >= self._max_consecutive_failures
+    
+    def reset_circuit_breaker(self) -> None:
+        """
+        手动重置熔断器状态
+        
+        用于在问题解决后恢复 API 调用功能。
+        """
+        self._consecutive_failures = 0
+        logger.info("LLM 熔断器已手动重置")
+    
+    def _check_circuit_breaker(self) -> None:
+        """
+        检查熔断器状态
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当连续失败次数超过阈值时抛出
+        """
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            error_msg = (
+                f"LLM Circuit Breaker Triggered: {self._consecutive_failures} "
+                f"consecutive failures (threshold: {self._max_consecutive_failures}). "
+                f"Trading halted. Manual intervention required."
+            )
+            logger.critical(error_msg)
+            raise LLMCircuitBreakerError(error_msg)
+    
     def get_sentiment_score(
         self,
         news_content: str,
         symbol: str = "UNKNOWN"
-    ) -> float:
+    ) -> SentimentResult:
         """
         获取新闻情绪分数
         
-        分析给定的新闻内容，返回情绪分数。
+        分析给定的新闻内容，返回情绪分数和置信度。
         
         Parameters
         ----------
@@ -223,35 +321,43 @@ class LLMClient:
         
         Returns
         -------
-        float
-            情绪分数，范围 [-1.0, 1.0]
-            - -1.0: 极度负面（破产、调查、退市）
-            - 0.0: 中性
-            - 1.0: 极度正面（重大突破、利润大增）
+        SentimentResult
+            包含 score, confidence, summary 的结果对象
+            - score: 情绪分数，范围 [-1.0, 1.0]
+            - confidence: 置信度，范围 [0.0, 1.0]
+            - summary: 分析摘要
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当熔断器触发时抛出（连续失败次数超过阈值）
         
         Notes
         -----
-        - 如果客户端不可用或调用失败，返回 0.0（中性）
-        - 如果新闻内容为空，返回 0.0
-        - 使用指数退避重试策略
+        - 如果客户端不可用，返回中性结果 (score=0.0, confidence=0.0)
+        - 如果新闻内容为空，返回中性结果
+        - 熔断器触发时不会静默失败，而是抛出异常
         
         Examples
         --------
-        >>> score = client.get_sentiment_score(
+        >>> result = client.get_sentiment_score(
         ...     "公司因财务造假被证监会立案调查",
         ...     symbol="000001"
         ... )
-        >>> print(score)  # -0.9
+        >>> print(result.score, result.confidence)  # -0.9, 0.95
         """
+        # 检查熔断器
+        self._check_circuit_breaker()
+        
         # 检查客户端可用性
         if not self.is_available:
             logger.debug(f"LLM 客户端不可用，返回中性分数: symbol={symbol}")
-            return 0.0
+            return SentimentResult(score=0.0, confidence=0.0, summary="LLM client unavailable")
         
         # 检查输入
         if not news_content or not news_content.strip():
             logger.debug(f"新闻内容为空，返回中性分数: symbol={symbol}")
-            return 0.0
+            return SentimentResult(score=0.0, confidence=0.0, summary="No news content")
         
         # 构建提示词
         user_prompt = self.USER_PROMPT_TEMPLATE.format(
@@ -261,13 +367,32 @@ class LLMClient:
         
         # 调用 API
         try:
-            score = self._call_api_with_retry(user_prompt, symbol)
-            return score
+            result = self._call_api_with_retry(user_prompt, symbol)
+            # 成功：重置熔断器
+            self._consecutive_failures = 0
+            return result
+        except LLMCircuitBreakerError:
+            # 熔断器异常直接抛出
+            raise
         except Exception as e:
-            logger.warning(f"获取情绪分数失败 (symbol={symbol}): {e}")
-            return 0.0
+            # 失败：递增熔断器计数
+            self._consecutive_failures += 1
+            logger.warning(
+                f"获取情绪分数失败 (symbol={symbol}): {e}. "
+                f"连续失败次数: {self._consecutive_failures}/{self._max_consecutive_failures}"
+            )
+            
+            # 检查是否需要触发熔断
+            self._check_circuit_breaker()
+            
+            # 未触发熔断时返回中性结果
+            return SentimentResult(
+                score=0.0,
+                confidence=0.0,
+                summary=f"API call failed: {str(e)[:100]}"
+            )
     
-    def _call_api_with_retry(self, user_prompt: str, symbol: str) -> float:
+    def _call_api_with_retry(self, user_prompt: str, symbol: str) -> SentimentResult:
         """
         带重试的 API 调用
         
@@ -280,15 +405,15 @@ class LLMClient:
         
         Returns
         -------
-        float
-            情绪分数
+        SentimentResult
+            情绪分析结果
         """
         if TENACITY_AVAILABLE:
             return self._call_api_with_tenacity(user_prompt, symbol)
         else:
             return self._call_api_simple_retry(user_prompt, symbol)
     
-    def _call_api_with_tenacity(self, user_prompt: str, symbol: str) -> float:
+    def _call_api_with_tenacity(self, user_prompt: str, symbol: str) -> SentimentResult:
         """
         使用 tenacity 的重试逻辑
         
@@ -301,8 +426,8 @@ class LLMClient:
         
         Returns
         -------
-        float
-            情绪分数
+        SentimentResult
+            情绪分析结果
         """
         @retry(
             stop=stop_after_attempt(self.max_retries),
@@ -310,12 +435,12 @@ class LLMClient:
             retry=retry_if_exception_type((Exception,)),
             reraise=True
         )
-        def _do_call() -> float:
+        def _do_call() -> SentimentResult:
             return self._single_api_call(user_prompt, symbol)
         
         return _do_call()
     
-    def _call_api_simple_retry(self, user_prompt: str, symbol: str) -> float:
+    def _call_api_simple_retry(self, user_prompt: str, symbol: str) -> SentimentResult:
         """
         简单重试逻辑（无 tenacity 时使用）
         
@@ -328,8 +453,8 @@ class LLMClient:
         
         Returns
         -------
-        float
-            情绪分数
+        SentimentResult
+            情绪分析结果
         """
         import time
         
@@ -348,7 +473,7 @@ class LLMClient:
         
         raise last_exception if last_exception else RuntimeError("API 调用失败")
     
-    def _single_api_call(self, user_prompt: str, symbol: str) -> float:
+    def _single_api_call(self, user_prompt: str, symbol: str) -> SentimentResult:
         """
         单次 API 调用
         
@@ -361,8 +486,8 @@ class LLMClient:
         
         Returns
         -------
-        float
-            情绪分数
+        SentimentResult
+            情绪分析结果
         
         Raises
         ------
@@ -378,21 +503,24 @@ class LLMClient:
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.1,  # 低温度以获得更一致的输出
-            max_tokens=50,    # 只需要短输出
+            max_tokens=150,   # 增加 token 限制以容纳 summary
             response_format={"type": "json_object"}  # 强制 JSON 输出
         )
         
         # 解析响应
         content = response.choices[0].message.content
-        score = self._parse_score_from_response(content)
+        result = self._parse_score_from_response(content)
         
-        logger.debug(f"LLM 返回情绪分数: symbol={symbol}, score={score}")
-        return score
+        logger.debug(
+            f"LLM 返回情绪分数: symbol={symbol}, "
+            f"score={result.score}, confidence={result.confidence}"
+        )
+        return result
     
     @staticmethod
-    def _parse_score_from_response(content: str) -> float:
+    def _parse_score_from_response(content: str) -> SentimentResult:
         """
-        从 LLM 响应中解析分数
+        从 LLM 响应中解析分数和置信度
         
         Parameters
         ----------
@@ -401,13 +529,19 @@ class LLMClient:
         
         Returns
         -------
-        float
-            解析出的分数，范围限制在 [-1.0, 1.0]
+        SentimentResult
+            解析出的结果，包含 score, confidence, summary
         
         Raises
         ------
         ValueError
             无法解析响应时抛出
+        
+        Notes
+        -----
+        - score 范围限制在 [-1.0, 1.0]
+        - confidence 范围限制在 [0.0, 1.0]，缺失时默认 0.5
+        - summary 缺失时默认为空字符串
         """
         if not content:
             raise ValueError("LLM 返回空响应")
@@ -420,18 +554,24 @@ class LLMClient:
         if "score" not in data:
             raise ValueError(f"响应中缺少 'score' 字段: {content}")
         
+        # 解析 score
         score = float(data["score"])
+        score = max(-1.0, min(1.0, score))  # 限制范围
         
-        # 限制范围
-        score = max(-1.0, min(1.0, score))
+        # 解析 confidence（可选，默认 0.5）
+        confidence = float(data.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))  # 限制范围
         
-        return score
+        # 解析 summary（可选，默认空字符串）
+        summary = str(data.get("summary", ""))
+        
+        return SentimentResult(score=score, confidence=confidence, summary=summary)
     
     def analyze_batch(
         self,
         news_dict: Dict[str, str],
         parallel: bool = False
-    ) -> Dict[str, float]:
+    ) -> Dict[str, SentimentResult]:
         """
         批量分析多条新闻
         
@@ -444,8 +584,13 @@ class LLMClient:
         
         Returns
         -------
-        Dict[str, float]
-            股票代码到情绪分数的映射
+        Dict[str, SentimentResult]
+            股票代码到情绪分析结果的映射
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当熔断器触发时抛出
         
         Examples
         --------
@@ -453,15 +598,15 @@ class LLMClient:
         ...     "000001": "公司业绩大幅增长",
         ...     "000002": "被监管部门处罚"
         ... }
-        >>> scores = client.analyze_batch(news)
-        >>> print(scores)
-        {'000001': 0.7, '000002': -0.6}
+        >>> results = client.analyze_batch(news)
+        >>> print(results["000001"].score)
+        0.7
         """
-        results: Dict[str, float] = {}
+        results: Dict[str, SentimentResult] = {}
         
         for symbol, news_content in news_dict.items():
-            score = self.get_sentiment_score(news_content, symbol)
-            results[symbol] = score
+            result = self.get_sentiment_score(news_content, symbol)
+            results[symbol] = result
         
         return results
 
@@ -492,6 +637,6 @@ def create_llm_client_from_config(config: Dict[str, Any]) -> LLMClient:
         base_url=llm_config.get("base_url"),
         model=llm_config.get("model", "deepseek-chat"),
         timeout=llm_config.get("request_timeout", 30),
-        max_retries=llm_config.get("max_retries", 3)
+        max_retries=llm_config.get("max_retries", 3),
+        max_consecutive_failures=llm_config.get("max_consecutive_failures", 5)
     )
-

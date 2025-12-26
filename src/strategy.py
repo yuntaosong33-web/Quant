@@ -748,6 +748,8 @@ class MultiFactorStrategy(BaseStrategy):
         self._llm_config = self.config.get("llm", {})
         self._enable_sentiment_filter: bool = self._llm_config.get("enable_sentiment_filter", False)
         self._sentiment_threshold: float = self._llm_config.get("sentiment_threshold", -0.5)
+        self._min_confidence: float = self._llm_config.get("min_confidence", 0.7)
+        self._sentiment_buffer_multiplier: int = self._llm_config.get("sentiment_buffer_multiplier", 3)
         self._sentiment_engine = None
         
         # 初始化情绪分析引擎（如果启用）
@@ -756,7 +758,8 @@ class MultiFactorStrategy(BaseStrategy):
                 from src.features import SentimentEngine
                 self._sentiment_engine = SentimentEngine(self._llm_config)
                 logger.info(
-                    f"情绪分析过滤已启用: threshold={self._sentiment_threshold}"
+                    f"情绪分析过滤已启用: threshold={self._sentiment_threshold}, "
+                    f"min_confidence={self._min_confidence}, buffer_multiplier={self._sentiment_buffer_multiplier}"
                 )
             except ImportError:
                 logger.warning(
@@ -1106,73 +1109,10 @@ class MultiFactorStrategy(BaseStrategy):
         filter_stats['次新股'] = before - len(day_data)
         
         # ==========================================
-        # 过滤条件 7: 情绪分析过滤（黑天鹅事件风控）
-        # 剔除情绪分数低于阈值的股票
+        # 注意：情绪分析已移至 _apply_sentiment_filter 方法
+        # 采用 "Filter-Then-Analyze" 模式：仅对 Top N * buffer 的候选股票进行情绪分析
+        # 这显著减少了 LLM API 调用次数，降低成本并提高效率
         # ==========================================
-        if self._enable_sentiment_filter and self._sentiment_engine is not None:
-            if not day_data.empty:
-                before = len(day_data)
-                
-                # 获取股票代码列表
-                stock_col = self.stock_col if self.stock_col in day_data.columns else None
-                if stock_col is None:
-                    # 尝试从索引获取
-                    if isinstance(day_data.index, pd.MultiIndex):
-                        stock_codes = day_data.index.get_level_values(-1).tolist()
-                    else:
-                        stock_codes = day_data.index.tolist()
-                else:
-                    stock_codes = day_data[stock_col].tolist()
-                
-                # 获取情绪分数
-                try:
-                    date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-                    sentiment_scores = self._sentiment_engine.calculate_sentiment(
-                        stock_codes, date_str
-                    )
-                    
-                    # 构建过滤掩码
-                    # 情绪分数低于阈值的股票将被过滤
-                    # 缺失数据视为中性 (0.0)，允许交易
-                    if stock_col:
-                        scores_aligned = day_data[stock_col].map(
-                            lambda x: sentiment_scores.get(x, 0.0)
-                        )
-                    else:
-                        if isinstance(day_data.index, pd.MultiIndex):
-                            idx_values = day_data.index.get_level_values(-1)
-                        else:
-                            idx_values = day_data.index
-                        scores_aligned = pd.Series(
-                            [sentiment_scores.get(x, 0.0) for x in idx_values],
-                            index=day_data.index
-                        )
-                    
-                    # 过滤低于阈值的股票
-                    negative_sentiment_mask = scores_aligned < self._sentiment_threshold
-                    
-                    # 记录被过滤的股票（用于调试）
-                    filtered_stocks = []
-                    if negative_sentiment_mask.any():
-                        if stock_col:
-                            filtered_stocks = day_data.loc[negative_sentiment_mask, stock_col].tolist()
-                        else:
-                            if isinstance(day_data.index, pd.MultiIndex):
-                                filtered_stocks = day_data.loc[negative_sentiment_mask].index.get_level_values(-1).tolist()
-                            else:
-                                filtered_stocks = day_data.loc[negative_sentiment_mask].index.tolist()
-                        
-                        for stock in filtered_stocks:
-                            score = sentiment_scores.get(stock, 0.0)
-                            logger.debug(
-                                f"情绪过滤: {stock} score={score:.2f} < threshold={self._sentiment_threshold}"
-                            )
-                    
-                    day_data = day_data[~negative_sentiment_mask]
-                    filter_stats['负面情绪'] = before - len(day_data)
-                    
-                except Exception as e:
-                    logger.warning(f"情绪分析失败: {e}，跳过情绪过滤")
         
         # 汇总日志
         total_filtered = initial_count - len(day_data)
@@ -1187,6 +1127,123 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 无股票被过滤, 剩余 {len(day_data)}")
         
         return day_data
+    
+    def _apply_sentiment_filter(
+        self,
+        candidates: List[str],
+        date: pd.Timestamp
+    ) -> List[str]:
+        """
+        对预选候选股票应用 LLM 情绪分析过滤
+        
+        采用 "Filter-Then-Analyze" 模式：
+        仅对 Top N * buffer 的候选股票进行情绪分析，而非全市场股票。
+        这显著减少了 LLM API 调用次数，降低成本并提高效率。
+        
+        Parameters
+        ----------
+        candidates : List[str]
+            预选的股票代码列表（通常为 Top N * buffer）
+        date : pd.Timestamp
+            分析日期
+        
+        Returns
+        -------
+        List[str]
+            通过情绪过滤的股票代码列表
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当 LLM API 连续失败超过阈值时抛出，停止交易
+        
+        Notes
+        -----
+        过滤规则：
+        1. score < sentiment_threshold: 剔除（负面情绪）
+        2. confidence < min_confidence: 剔除并记录警告（不确定分析结果）
+        
+        异常处理：
+        - LLMCircuitBreakerError: 直接抛出，停止交易
+        - 其他异常: 记录警告，返回原候选列表（fail-safe）
+        """
+        if not candidates:
+            return []
+        
+        if not self._enable_sentiment_filter or self._sentiment_engine is None:
+            return candidates
+        
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        
+        try:
+            # 导入熔断器异常类
+            try:
+                from src.llm_client import LLMCircuitBreakerError
+            except ImportError:
+                from llm_client import LLMCircuitBreakerError
+            
+            # 调用情绪分析引擎（返回 DataFrame）
+            sentiment_df = self._sentiment_engine.calculate_sentiment(candidates, date_str)
+            
+            if sentiment_df.empty:
+                logger.warning(f"情绪分析返回空结果，保留所有候选股票")
+                return candidates
+            
+            # 过滤逻辑
+            filtered_candidates: List[str] = []
+            low_confidence_count = 0
+            negative_sentiment_count = 0
+            
+            for _, row in sentiment_df.iterrows():
+                stock_code = row["stock_code"]
+                score = row["score"]
+                confidence = row["confidence"]
+                
+                # 规则1: 检查情绪分数
+                if score < self._sentiment_threshold:
+                    negative_sentiment_count += 1
+                    logger.debug(
+                        f"情绪过滤 (负面): {stock_code} score={score:.2f} "
+                        f"< threshold={self._sentiment_threshold}"
+                    )
+                    continue
+                
+                # 规则2: 检查置信度
+                if confidence < self._min_confidence:
+                    low_confidence_count += 1
+                    logger.warning(
+                        f"Skipping {stock_code} due to low confidence: "
+                        f"confidence={confidence:.2f} < min={self._min_confidence}"
+                    )
+                    continue
+                
+                # 通过所有检查
+                filtered_candidates.append(stock_code)
+            
+            logger.info(
+                f"情绪过滤完成 ({date_str}): "
+                f"输入 {len(candidates)} 只, "
+                f"通过 {len(filtered_candidates)} 只, "
+                f"负面情绪剔除 {negative_sentiment_count} 只, "
+                f"低置信度剔除 {low_confidence_count} 只"
+            )
+            
+            return filtered_candidates
+        
+        except Exception as e:
+            # 检查是否是熔断器异常
+            error_type = type(e).__name__
+            if "CircuitBreaker" in error_type:
+                # 熔断器触发，直接抛出，停止交易
+                logger.critical(f"LLM 熔断器触发，停止交易: {e}")
+                raise
+            
+            # 其他异常：fail-safe，返回原候选列表
+            logger.warning(
+                f"情绪分析失败 ({date_str}): {e}. "
+                f"Fail-safe: 保留所有 {len(candidates)} 只候选股票"
+            )
+            return candidates
     
     def select_top_stocks(
         self,
@@ -1403,16 +1460,40 @@ class MultiFactorStrategy(BaseStrategy):
             # 1. 每日风控检查
             is_risk_triggered = market_risk_series.loc[date]
             
-            # 2. 调仓逻辑
+            # 2. 调仓逻辑（采用 Filter-Then-Analyze 模式）
             if date in rebalance_dates:
                 # 调仓日: 重新选股 (无论是否有风控，都更新选股列表以备后用)
                 filtered_data = self.filter_stocks(data, date)
                 
                 if not filtered_data.empty:
-                    current_holdings = self.select_top_stocks(filtered_data)
+                    # Step 1: 获取扩展候选列表（Top N * buffer）
+                    buffer_n = self.top_n * self._sentiment_buffer_multiplier
+                    pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)
+                    
+                    # Step 2: 应用情绪过滤（Just-in-Time 分析）
+                    if self._enable_sentiment_filter and self._sentiment_engine is not None:
+                        try:
+                            final_candidates = self._apply_sentiment_filter(pre_candidates, date)
+                        except Exception as e:
+                            # 检查是否是熔断器异常
+                            error_type = type(e).__name__
+                            if "CircuitBreaker" in error_type:
+                                # 熔断器触发，抛出异常停止交易
+                                raise
+                            # 其他异常：记录警告，使用原候选列表
+                            logger.warning(f"情绪过滤失败: {e}，使用原候选列表")
+                            final_candidates = pre_candidates
+                    else:
+                        final_candidates = pre_candidates
+                    
+                    # Step 3: 最终选取 Top N
+                    current_holdings = final_candidates[:self.top_n]
+                    
                     logger.debug(
                         f"调仓日 {date.strftime('%Y-%m-%d')}: "
-                        f"选中 {len(current_holdings)} 只股票"
+                        f"预选 {len(pre_candidates)} 只 -> "
+                        f"情绪过滤后 {len(final_candidates)} 只 -> "
+                        f"最终选中 {len(current_holdings)} 只股票"
                     )
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
@@ -1950,14 +2031,42 @@ class MultiFactorStrategy(BaseStrategy):
             
             # ========================================
             # Step 2: 调仓日逻辑（仅在无风控时执行）
+            # 采用 Filter-Then-Analyze 模式
             # ========================================
             if date in rebalance_dates:
                 # 调仓日: 重新选股并优化权重
                 filtered_data = self.filter_stocks(factor_data, date)
                 
                 if not filtered_data.empty:
-                    # 选取 Top N 股票
-                    selected_stocks = self.select_top_stocks(filtered_data)
+                    # Step 2.1: 获取扩展候选列表（Top N * buffer）
+                    buffer_n = self.top_n * self._sentiment_buffer_multiplier
+                    pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)
+                    
+                    # Step 2.2: 应用情绪过滤（Just-in-Time 分析）
+                    if self._enable_sentiment_filter and self._sentiment_engine is not None:
+                        try:
+                            final_candidates = self._apply_sentiment_filter(pre_candidates, date)
+                        except Exception as e:
+                            # 检查是否是熔断器异常
+                            error_type = type(e).__name__
+                            if "CircuitBreaker" in error_type:
+                                # 熔断器触发，抛出异常停止交易
+                                raise
+                            # 其他异常：记录警告，使用原候选列表
+                            logger.warning(f"情绪过滤失败: {e}，使用原候选列表")
+                            final_candidates = pre_candidates
+                    else:
+                        final_candidates = pre_candidates
+                    
+                    # Step 2.3: 最终选取 Top N
+                    selected_stocks = final_candidates[:self.top_n]
+                    
+                    logger.debug(
+                        f"调仓日 {date.strftime('%Y-%m-%d')}: "
+                        f"预选 {len(pre_candidates)} 只 -> "
+                        f"情绪过滤后 {len(final_candidates)} 只 -> "
+                        f"最终选中 {len(selected_stocks)} 只股票"
+                    )
                     
                     if selected_stocks:
                         # 根据优化目标计算权重

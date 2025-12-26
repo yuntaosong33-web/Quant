@@ -105,6 +105,7 @@ risk:
 
 # LLM 情绪分析配置
 # 用于过滤有重大负面新闻的股票（黑天鹅事件风控）
+# 采用 "Filter-Then-Analyze" 模式：仅对 Top N * buffer 的候选股票进行情绪分析
 llm:
   # 提供商: deepseek, openai, 或其他 OpenAI 兼容接口
   provider: "deepseek"
@@ -133,6 +134,25 @@ llm:
   
   # API 最大重试次数
   max_retries: 3
+  
+  # ===== 新增：熔断器与置信度配置 =====
+  
+  # 熔断器阈值：连续 API 调用失败次数
+  # 超过此阈值时，系统将抛出 LLMCircuitBreakerError 异常停止交易
+  # 这是一个安全机制，防止在 API 不可用时继续操作
+  max_consecutive_failures: 5
+  
+  # 最低置信度阈值
+  # LLM 返回的置信度低于此值的分析结果将被忽略
+  # 置信度范围: 0.0 (完全不确定) 到 1.0 (非常确定)
+  # 低置信度的股票会被跳过并记录警告日志
+  min_confidence: 0.7
+  
+  # 情绪分析缓冲区乘数
+  # 选取 top_n * buffer_multiplier 只股票进行情绪分析
+  # 例如: top_n=3, buffer_multiplier=3 → 分析 9 只候选股票
+  # 这确保即使部分股票被情绪过滤剔除，仍有足够的备选
+  sentiment_buffer_multiplier: 3
 
 # 交易配置
 trading:

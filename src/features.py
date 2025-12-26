@@ -2165,6 +2165,8 @@ class SentimentEngine:
     使用 LLM 分析股票新闻情绪，用于风险过滤。
     支持本地缓存避免重复调用 API。
     
+    缓存结构支持 score 和 confidence 两个字段，并向后兼容旧版本的纯分数缓存。
+    
     Parameters
     ----------
     llm_config : Optional[Dict[str, Any]]
@@ -2176,13 +2178,14 @@ class SentimentEngine:
         - cache_path: 缓存文件路径
         - request_timeout: 请求超时时间
         - max_retries: 最大重试次数
+        - max_consecutive_failures: 熔断器阈值
     
     Attributes
     ----------
     llm_client : LLMClient
         LLM 客户端实例
-    cache : Dict[str, float]
-        情绪分数缓存
+    cache : Dict[str, Dict[str, float]]
+        情绪分数缓存，结构为 {key: {"score": float, "confidence": float}}
     cache_path : Path
         缓存文件路径
     
@@ -2190,14 +2193,15 @@ class SentimentEngine:
     --------
     >>> config = {"model": "deepseek-chat", "cache_path": "data/processed/sentiment_cache.json"}
     >>> engine = SentimentEngine(config)
-    >>> scores = engine.calculate_sentiment(["000001", "000002"], "2024-01-15")
-    >>> print(scores)
+    >>> result = engine.calculate_sentiment(["000001", "000002"], "2024-01-15")
+    >>> print(result)
     
     Notes
     -----
     - 缓存键格式: "{stock_code}_{date}"
-    - API 调用失败时返回 0.0（中性）
-    - 新闻获取失败时返回 0.0（中性）
+    - 缓存值包含 score 和 confidence 两个字段
+    - 向后兼容：旧版纯 float 缓存会被转换为 {"score": value, "confidence": 0.5}
+    - 熔断器触发时会抛出 LLMCircuitBreakerError 异常
     """
     
     # 默认缓存路径
@@ -2215,7 +2219,7 @@ class SentimentEngine:
         from pathlib import Path
         
         self.config = llm_config or {}
-        self.cache: Dict[str, float] = {}
+        self.cache: Dict[str, Dict[str, float]] = {}
         self.cache_path = Path(self.config.get("cache_path", self.DEFAULT_CACHE_PATH))
         
         # 初始化 LLM 客户端
@@ -2253,19 +2257,44 @@ class SentimentEngine:
             base_url=self.config.get("base_url"),
             model=self.config.get("model", "deepseek-chat"),
             timeout=self.config.get("request_timeout", 30),
-            max_retries=self.config.get("max_retries", 3)
+            max_retries=self.config.get("max_retries", 3),
+            max_consecutive_failures=self.config.get("max_consecutive_failures", 5)
         )
     
     def _load_cache(self) -> None:
         """
         从文件加载缓存
+        
+        支持向后兼容：将旧版纯 float 格式转换为新的 dict 格式
         """
         import json
         
         if self.cache_path.exists():
             try:
                 with open(self.cache_path, "r", encoding="utf-8") as f:
-                    self.cache = json.load(f)
+                    raw_cache = json.load(f)
+                
+                # 向后兼容：转换旧版纯 float 格式
+                self.cache = {}
+                migrated_count = 0
+                for key, value in raw_cache.items():
+                    if isinstance(value, (int, float)):
+                        # 旧版格式：纯分数，转换为新格式
+                        self.cache[key] = {"score": float(value), "confidence": 0.5}
+                        migrated_count += 1
+                    elif isinstance(value, dict) and "score" in value:
+                        # 新版格式：包含 score 和 confidence
+                        self.cache[key] = {
+                            "score": float(value.get("score", 0.0)),
+                            "confidence": float(value.get("confidence", 0.5))
+                        }
+                    else:
+                        logger.warning(f"跳过无效缓存项: {key}")
+                
+                if migrated_count > 0:
+                    logger.info(f"已迁移 {migrated_count} 条旧版缓存记录")
+                    self._save_cache()  # 保存迁移后的缓存
+                
                 logger.debug(f"加载情绪缓存: {len(self.cache)} 条记录")
             except Exception as e:
                 logger.warning(f"加载情绪缓存失败: {e}")
@@ -2409,7 +2438,7 @@ class SentimentEngine:
         stock_code: str,
         date: str,
         use_cache: bool = True
-    ) -> float:
+    ) -> Dict[str, float]:
         """
         获取单只股票的情绪分数
         
@@ -2424,43 +2453,58 @@ class SentimentEngine:
         
         Returns
         -------
-        float
-            情绪分数 [-1.0, 1.0]，失败时返回 0.0
+        Dict[str, float]
+            包含 "score" 和 "confidence" 的字典
+            - score: 情绪分数 [-1.0, 1.0]
+            - confidence: 置信度 [0.0, 1.0]
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当 LLM 熔断器触发时抛出（来自 LLMClient）
         """
         cache_key = self._get_cache_key(stock_code, date)
         
         # 检查缓存
         if use_cache and cache_key in self.cache:
-            logger.debug(f"命中缓存: {cache_key} = {self.cache[cache_key]}")
-            return self.cache[cache_key]
+            cached_value = self.cache[cache_key]
+            logger.debug(
+                f"命中缓存: {cache_key} = score:{cached_value['score']}, "
+                f"confidence:{cached_value['confidence']}"
+            )
+            return cached_value
         
         # 检查 LLM 客户端
         if self.llm_client is None or not self.llm_client.is_available:
             logger.debug(f"LLM 不可用，返回中性分数: {stock_code}")
-            return 0.0
+            return {"score": 0.0, "confidence": 0.0}
         
         # 获取新闻
         news_content = self._fetch_news(stock_code, date)
         
         if not news_content:
             # 没有新闻，返回中性
-            score = 0.0
+            result = {"score": 0.0, "confidence": 0.0}
         else:
-            # 调用 LLM 分析
-            score = self.llm_client.get_sentiment_score(news_content, stock_code)
+            # 调用 LLM 分析（返回 SentimentResult）
+            sentiment_result = self.llm_client.get_sentiment_score(news_content, stock_code)
+            result = {
+                "score": sentiment_result.score,
+                "confidence": sentiment_result.confidence
+            }
         
         # 更新缓存
-        self.cache[cache_key] = score
+        self.cache[cache_key] = result
         self._save_cache()
         
-        return score
+        return result
     
     def calculate_sentiment(
         self,
         stock_list: List[str],
         date: str,
         use_cache: bool = True
-    ) -> pd.Series:
+    ) -> pd.DataFrame:
         """
         批量计算股票情绪分数
         
@@ -2475,29 +2519,38 @@ class SentimentEngine:
         
         Returns
         -------
-        pd.Series
-            情绪分数序列，索引为股票代码
+        pd.DataFrame
+            情绪分析结果，包含以下列：
+            - stock_code: 股票代码
+            - score: 情绪分数 [-1.0, 1.0]
+            - confidence: 置信度 [0.0, 1.0]
+        
+        Raises
+        ------
+        LLMCircuitBreakerError
+            当 LLM 熔断器触发时抛出
         
         Examples
         --------
         >>> engine = SentimentEngine()
-        >>> scores = engine.calculate_sentiment(
+        >>> result = engine.calculate_sentiment(
         ...     ["000001", "000002", "600000"],
         ...     "2024-01-15"
         ... )
-        >>> print(scores)
-        000001    0.2
-        000002   -0.5
-        600000    0.0
-        dtype: float64
+        >>> print(result)
+          stock_code  score  confidence
+        0     000001    0.2         0.9
+        1     000002   -0.5         0.8
+        2     600000    0.0         0.0
         
         Notes
         -----
         - 缓存命中的股票不会重复调用 API
-        - API 调用失败的股票返回 0.0（中性）
+        - API 调用失败的股票返回 score=0.0, confidence=0.0
         - 批量调用后自动保存缓存
+        - 熔断器触发时会抛出异常，停止后续调用
         """
-        scores: Dict[str, float] = {}
+        results: List[Dict[str, Any]] = []
         cache_hits = 0
         api_calls = 0
         
@@ -2506,13 +2559,22 @@ class SentimentEngine:
             
             # 检查缓存
             if use_cache and cache_key in self.cache:
-                scores[stock_code] = self.cache[cache_key]
+                cached_value = self.cache[cache_key]
+                results.append({
+                    "stock_code": stock_code,
+                    "score": cached_value["score"],
+                    "confidence": cached_value["confidence"]
+                })
                 cache_hits += 1
                 continue
             
             # 需要调用 API
-            score = self.get_sentiment_score(stock_code, date, use_cache=False)
-            scores[stock_code] = score
+            sentiment = self.get_sentiment_score(stock_code, date, use_cache=False)
+            results.append({
+                "stock_code": stock_code,
+                "score": sentiment["score"],
+                "confidence": sentiment["confidence"]
+            })
             api_calls += 1
         
         logger.info(
@@ -2521,7 +2583,7 @@ class SentimentEngine:
             f"api_calls={api_calls}"
         )
         
-        return pd.Series(scores, name="sentiment_score")
+        return pd.DataFrame(results)
     
     def clear_cache(self) -> None:
         """
@@ -2550,11 +2612,11 @@ class SentimentEngine:
         Returns
         -------
         pd.DataFrame
-            缓存的分数数据，包含 stock_code, date, score 列
+            缓存的分数数据，包含 stock_code, date, score, confidence 列
         """
         records = []
         
-        for key, score in self.cache.items():
+        for key, value in self.cache.items():
             parts = key.rsplit("_", 1)
             if len(parts) != 2:
                 continue
@@ -2570,7 +2632,8 @@ class SentimentEngine:
             records.append({
                 "stock_code": stock_code,
                 "date": cache_date,
-                "score": score
+                "score": value.get("score", 0.0),
+                "confidence": value.get("confidence", 0.5)
             })
         
         return pd.DataFrame(records)
