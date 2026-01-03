@@ -42,7 +42,7 @@ strategy:
   
   # 选股参数（集中持仓，追求高弹性）
   top_n: 6              # 选取6只股票，降低单只股票风险
-  min_listing_days: 126  # 最小上市天数（约6个月）
+  min_listing_days: 252  # 最小上市天数（约1年，避开次新股）
   
   # 板块过滤（适用于无对应交易权限的情况）
   exclude_chinext: true   # 排除创业板（300xxx, 301xxx）- 需开通创业板权限
@@ -70,8 +70,8 @@ portfolio:
   total_capital: 300000
   
   # 单只股票最大权重
-  # 对于3只股票的激进策略，允许更高集中度
-  max_weight: 0.40
+  # 对于10只股票的激进策略，单只上限25%
+  max_weight: 0.25
   
   # 单只股票最小权重
   min_weight: 0.0

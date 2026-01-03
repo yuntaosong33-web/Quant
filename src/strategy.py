@@ -1140,7 +1140,7 @@ class MultiFactorStrategy(BaseStrategy):
             filter_stats['流动性不足'] = before - len(day_data)
         else:
             logger.debug("数据中缺少 'amount' 列，跳过流动性过滤")
-        
+            
         # ==========================================
         # 过滤条件 4: 剔除 ST/*ST/退市股票
         # ==========================================
@@ -1181,7 +1181,9 @@ class MultiFactorStrategy(BaseStrategy):
         # 过滤条件 6: 剔除上市不满 6 个月的股票
         # ==========================================
         before = len(day_data)
-        if 'listing_days' in day_data.columns:
+        if 'days_listed' in day_data.columns:
+            day_data = day_data[day_data['days_listed'] >= self.min_listing_days]
+        elif 'listing_days' in day_data.columns:
             day_data = day_data[day_data['listing_days'] >= self.min_listing_days]
         elif 'list_date' in day_data.columns:
             list_dates = pd.to_datetime(day_data['list_date'])
