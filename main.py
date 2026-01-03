@@ -1626,6 +1626,27 @@ class DailyUpdateRunner:
         else:
             raise ValueError(f"不支持的报告格式: {format}")
     
+    def _get_latest_prices(self) -> Dict[str, float]:
+        """获取所有股票的最新收盘价"""
+        if self.ohlcv_data is None or self.ohlcv_data.empty:
+            return {}
+            
+        try:
+            # 确定日期列
+            date_col = 'date' if 'date' in self.ohlcv_data.columns else 'trade_date'
+            if date_col not in self.ohlcv_data.columns:
+                return {}
+                
+            # 获取每个股票的最后一条记录
+            # 假设数据可能未排序，先排序
+            df_sorted = self.ohlcv_data.sort_values(by=date_col)
+            latest_prices = df_sorted.groupby('stock_code')['close'].last().to_dict()
+            
+            return latest_prices
+        except Exception as e:
+            self.logger.warning(f"获取最新价格映射失败: {e}")
+            return {}
+
     def _generate_markdown_report(
         self,
         buy_orders: Dict[str, float],
@@ -1633,6 +1654,8 @@ class DailyUpdateRunner:
         report_date: str
     ) -> str:
         """生成 Markdown 格式报告"""
+        latest_prices = self._get_latest_prices()
+
         lines = [
             f"# 每日调仓报告",
             f"",
@@ -1687,8 +1710,12 @@ class DailyUpdateRunner:
             ])
             
             for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
-                # 假设股价为10元，估算股数
-                estimated_shares = int(amount / 10 / 100) * 100  # 整百股
+                # 获取最新价格，默认为10元
+                price = latest_prices.get(stock, 10.0)
+                if price <= 0: price = 10.0
+                
+                # 估算股数
+                estimated_shares = int(amount / price / 100) * 100  # 整百股
                 lines.append(f"| {stock} | ¥{amount:,.0f} | {estimated_shares} |")
             
             lines.append(f"")
@@ -1711,7 +1738,9 @@ class DailyUpdateRunner:
             ])
             
             for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
-                estimated_shares = int(amount / 10 / 100) * 100
+                price = latest_prices.get(stock, 10.0)
+                if price <= 0: price = 10.0
+                estimated_shares = int(amount / price / 100) * 100
                 lines.append(f"| {stock} | ¥{amount:,.0f} | {estimated_shares} |")
             
             lines.append(f"")
@@ -1750,13 +1779,16 @@ class DailyUpdateRunner:
         report_date: str
     ) -> str:
         """生成 HTML 格式报告"""
+        latest_prices = self._get_latest_prices()
         portfolio_config = self.config.get("portfolio", {})
         total_capital = portfolio_config.get("total_capital", 1000000)
         
         # 买入表格行
         buy_rows = ""
         for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
-            estimated_shares = int(amount / 10 / 100) * 100
+            price = latest_prices.get(stock, 10.0)
+            if price <= 0: price = 10.0
+            estimated_shares = int(amount / price / 100) * 100
             buy_rows += f"""
                 <tr>
                     <td>{stock}</td>
@@ -1768,7 +1800,9 @@ class DailyUpdateRunner:
         # 卖出表格行
         sell_rows = ""
         for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
-            estimated_shares = int(amount / 10 / 100) * 100
+            price = latest_prices.get(stock, 10.0)
+            if price <= 0: price = 10.0
+            estimated_shares = int(amount / price / 100) * 100
             sell_rows += f"""
                 <tr>
                     <td>{stock}</td>
@@ -2227,7 +2261,8 @@ def _send_daily_notification(
 
 def run_daily_update(
     force_rebalance: bool = False,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    no_llm: bool = False
 ) -> bool:
     """
     运行每日更新流程
@@ -2246,6 +2281,8 @@ def run_daily_update(
         是否强制调仓（忽略日期检查）
     config : Optional[Dict[str, Any]]
         配置参数
+    no_llm : bool
+        是否禁用 LLM 风控
     
     Returns
     -------
@@ -2255,11 +2292,30 @@ def run_daily_update(
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
     logger.info("开始每日更新流程")
+    if no_llm:
+        logger.info("参数设置: 禁用 LLM 风控")
     logger.info("=" * 60)
     
     try:
         # 初始化运行器
         runner = DailyUpdateRunner(config)
+        
+        # 处理 LLM 禁用
+        if no_llm:
+            if "llm" in runner.config:
+                runner.config["llm"] = {}
+                # 同时也更新 runner 内部可能已经初始化的组件配置
+                # 注意：DailyUpdateRunner 初始化时已经用 config 初始化了组件
+                # 所以最好是先修改 config 再初始化 runner，或者 config 传递 None 并在内部处理
+                # 由于 runner 已经初始化，我们需要手动通过 runner 修改
+                pass
+            
+            # 由于 runner 已经初始化，我们需要重新初始化受影响的组件
+            # 或者更好的方式是在 DailyUpdateRunner 内部处理 no_llm
+            # 这里为了简单，直接修改 config，并重新初始化 feature_calculator
+            runner.config["llm"] = {}
+            runner._init_components()  # 重新初始化组件以应用新配置
+
         
         # Step 1: 更新市场数据
         logger.info("Step 1/8: 更新市场数据")
@@ -2766,7 +2822,8 @@ def run_backtest(
     start_date: str,
     end_date: str,
     config: Optional[Dict[str, Any]] = None,
-    strategy_type: str = "multi_factor"
+    strategy_type: str = "multi_factor",
+    no_llm: bool = False
 ) -> bool:
     """
     运行策略回测
@@ -2784,6 +2841,8 @@ def run_backtest(
         回测配置参数
     strategy_type : str
         策略类型: 'multi_factor', 'ma_cross'
+    no_llm : bool
+        是否禁用 LLM 风控
     
     Returns
     -------
@@ -2810,6 +2869,8 @@ def run_backtest(
     logger.info("=" * 60)
     logger.info(f"开始回测: {start_date} ~ {end_date}")
     logger.info("使用引擎: BacktestEngine (权重驱动 + 大盘风控)")
+    if no_llm:
+        logger.info("参数设置: 禁用 LLM 风控")
     logger.info("=" * 60)
     
     try:
@@ -2822,6 +2883,10 @@ def run_backtest(
             except FileNotFoundError:
                 logger.warning(f"配置文件 {CONFIG_PATH} 不存在，使用默认配置")
                 config = {}
+        
+        # 处理 LLM 禁用
+        if no_llm:
+            config["llm"] = {}
         
         # 提取配置
         backtest_config = config.get("backtest", {})
@@ -3533,6 +3598,12 @@ def main():
         help="日志级别"
     )
     
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="禁用 LLM 风控功能（强制覆盖配置）"
+    )
+    
     args = parser.parse_args()
     
     # 设置日志
@@ -3544,7 +3615,10 @@ def main():
     logger.info("A股量化交易系统启动")
     
     if args.daily_update:
-        success = run_daily_update(force_rebalance=args.force_rebalance)
+        success = run_daily_update(
+            force_rebalance=args.force_rebalance,
+            no_llm=args.no_llm
+        )
         exit(0 if success else 1)
     
     elif args.backtest:
@@ -3552,7 +3626,8 @@ def main():
         success = run_backtest(
             start_date=args.start,
             end_date=args.end,
-            strategy_type=args.strategy
+            strategy_type=args.strategy,
+            no_llm=args.no_llm
         )
         exit(0 if success else 1)
     
