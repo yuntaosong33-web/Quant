@@ -2010,6 +2010,11 @@ class MultiFactorStrategy(BaseStrategy):
             return self._equal_weights(selected_stocks)
         
         try:
+            # 如果优化目标是等权重，直接返回
+            if objective == "equal_weight":
+                logger.info("使用等权重分配策略")
+                return self._equal_weights(selected_stocks)
+            
             # 计算预期收益率
             mu = expected_returns.mean_historical_return(stock_prices)
             

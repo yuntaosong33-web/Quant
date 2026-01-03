@@ -335,7 +335,7 @@ class DailyUpdateRunner:
     
     def update_market_data(self) -> bool:
         """
-        更新市场数据
+        更新市场数据（带缓存检查）
         
         Returns
         -------
@@ -345,6 +345,17 @@ class DailyUpdateRunner:
         self.logger.info("开始更新市场数据...")
         
         try:
+            # 检查今日缓存
+            ohlcv_path = DATA_RAW_PATH / f"ohlcv_{self.today.strftime('%Y%m%d')}.parquet"
+            if ohlcv_path.exists():
+                try:
+                    self.ohlcv_data = pd.read_parquet(ohlcv_path)
+                    if not self.ohlcv_data.empty:
+                        self.logger.info(f"📂 使用缓存数据: {ohlcv_path.name}，共 {len(self.ohlcv_data)} 条记录")
+                        return True
+                except Exception as e:
+                    self.logger.warning(f"读取缓存失败: {e}，将重新下载")
+            
             data_config = self.config.get("data", {})
             stock_pool = data_config.get("stock_pool", "hs300")
             
@@ -416,7 +427,7 @@ class DailyUpdateRunner:
     
     def update_financial_data(self) -> bool:
         """
-        更新财务数据（实盘安全版）
+        更新财务数据（实盘安全版，带缓存检查）
         
         使用 DataLoader.fetch_financial_indicator 获取真实的 PE、PB、ROE 等数据。
         采用 Fail Fast 机制，确保实盘安全：
@@ -435,6 +446,17 @@ class DailyUpdateRunner:
             当财务数据获取失败率超过 30% 时
         """
         self.logger.info("开始更新财务数据（实盘安全模式）...")
+        
+        # 检查今日缓存
+        financial_path = DATA_RAW_PATH / f"financial_{self.today.strftime('%Y%m%d')}.parquet"
+        if financial_path.exists():
+            try:
+                self.financial_data = pd.read_parquet(financial_path)
+                if not self.financial_data.empty:
+                    self.logger.info(f"📂 使用缓存数据: {financial_path.name}，共 {len(self.financial_data)} 条记录")
+                    return True
+            except Exception as e:
+                self.logger.warning(f"读取缓存失败: {e}，将重新下载")
         
         # 失败率阈值（超过此比例将触发 Critical Error）
         FAILURE_THRESHOLD = 0.30  # 30%
@@ -1154,6 +1176,11 @@ class DailyUpdateRunner:
                 lambda x: self._calculate_rsi(x, 20)
             )
             
+            # 1.5. 动量因子 ROC_20（20日变动率）
+            factor_data['roc_20'] = factor_data.groupby('stock_code')['close'].transform(
+                lambda x: x.pct_change(20) * 100  # 转换为百分比
+            )
+            
             # 2. 小市值因子 small_cap（激进型策略使用）
             # small_cap = -log(流通市值)，市值越小分数越高
             if 'circ_mv' in factor_data.columns:
@@ -1194,9 +1221,9 @@ class DailyUpdateRunner:
             # ==================== Z-Score 标准化 ====================
             date_col = 'date' if 'date' in factor_data.columns else 'trade_date'
             
-            # 对所有计算的因子进行 Z-Score 标准化（行业中性化）
+            # 对所有计算的因子进行 Z-Score 标准化
             factor_cols_to_normalize = [
-                'rsi_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability'
+                'rsi_20', 'roc_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability'
             ]
             # 只标准化存在且有效的因子列
             valid_factor_cols = [
@@ -1204,15 +1231,21 @@ class DailyUpdateRunner:
                 if col in factor_data.columns and factor_data[col].notna().any()
             ]
             
+            # 检查是否有行业字段，决定是否进行行业中性化
+            has_industry = 'sw_industry_l1' in factor_data.columns and factor_data['sw_industry_l1'].notna().any()
+            
             factor_data = z_score_normalize(
                 factor_data,
                 factor_cols=valid_factor_cols,
                 date_col=date_col,
-                industry_col='sw_industry_l1',
-                industry_neutral=True
+                industry_col='sw_industry_l1' if has_industry else None,
+                industry_neutral=has_industry
             )
             
-            self.logger.info(f"已标准化因子: {valid_factor_cols}")
+            if has_industry:
+                self.logger.info(f"已标准化因子（行业中性化）: {valid_factor_cols}")
+            else:
+                self.logger.info(f"已标准化因子（市场中性化）: {valid_factor_cols}")
             
             self.factor_data = factor_data
             

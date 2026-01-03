@@ -11,8 +11,8 @@ data:
   # 历史数据开始日期
   start_date: "2020-01-01"
   
-  # 每次增量更新的天数
-  update_days: 5
+  # 每次增量更新的天数（建议至少30天，以支持ROC_20等因子计算）
+  update_days: 30
   
   # 数据存储路径
   raw_data_path: "data/raw"
