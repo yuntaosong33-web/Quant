@@ -2289,52 +2289,56 @@ def merge_price_and_fundamental(
 
 class SentimentEngine:
     """
-    情绪分析引擎
+    情绪分析引擎（优化版）
     
     使用 LLM 分析股票新闻情绪，用于风险过滤。
-    支持本地缓存避免重复调用 API。
+    支持异步并发分析和智能缓存。
     
-    缓存结构支持 score 和 confidence 两个字段，并向后兼容旧版本的纯分数缓存。
+    核心优化：
+    - 异步并发：批量分析时使用 asyncio 并发请求
+    - 智能缓存：LRU + TTL + 批量持久化
+    - 性能监控：API 延迟、Token 使用量统计
+    - 新闻预处理：Token 精确截断
     
     Parameters
     ----------
     llm_config : Optional[Dict[str, Any]]
         LLM 配置字典，包含：
-        - provider: 提供商 ("deepseek", "openai")
+        - provider: 提供商 ("deepseek", "openai", "qwen")
         - model: 模型名称
+        - fallback_model: 备用模型
         - base_url: API 端点
-        - api_key: API 密钥（可选，优先使用环境变量）
+        - api_key: API 密钥
         - cache_path: 缓存文件路径
+        - cache_ttl_days: 缓存过期天数
         - request_timeout: 请求超时时间
         - max_retries: 最大重试次数
         - max_consecutive_failures: 熔断器阈值
+        - max_concurrent: 最大并发请求数
+        - detailed_prompts: 是否使用详细提示词
     
     Attributes
     ----------
     llm_client : LLMClient
-        LLM 客户端实例
-    cache : Dict[str, Dict[str, float]]
-        情绪分数缓存，结构为 {key: {"score": float, "confidence": float}}
-    cache_path : Path
-        缓存文件路径
+        LLM 客户端实例（优化版）
     
     Examples
     --------
-    >>> config = {"model": "deepseek-chat", "cache_path": "data/processed/sentiment_cache.json"}
+    >>> config = {
+    ...     "model": "qwen-max",
+    ...     "cache_path": "data/processed/sentiment_cache.json",
+    ...     "max_concurrent": 5
+    ... }
     >>> engine = SentimentEngine(config)
     >>> result = engine.calculate_sentiment(["000001", "000002"], "2024-01-15")
     >>> print(result)
     
     Notes
     -----
-    - 缓存键格式: "{stock_code}_{date}"
-    - 缓存值包含 score 和 confidence 两个字段
-    - 向后兼容：旧版纯 float 缓存会被转换为 {"score": value, "confidence": 0.5}
+    - 缓存由 LLMClient 内部管理，支持 TTL 过期和 LRU 淘汰
     - 熔断器触发时会抛出 LLMCircuitBreakerError 异常
+    - 支持异步批量分析以提高效率
     """
-    
-    # 默认缓存路径
-    DEFAULT_CACHE_PATH = "data/processed/sentiment_cache.json"
     
     def __init__(self, llm_config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -2345,27 +2349,25 @@ class SentimentEngine:
         llm_config : Optional[Dict[str, Any]]
             LLM 配置字典
         """
-        from pathlib import Path
+        import asyncio
         
         self.config = llm_config or {}
-        self.cache: Dict[str, Dict[str, float]] = {}
-        self.cache_path = Path(self.config.get("cache_path", self.DEFAULT_CACHE_PATH))
         
-        # 初始化 LLM 客户端
+        # 初始化优化版 LLM 客户端
         self.llm_client = self._create_llm_client()
         
-        # 加载缓存
-        self._load_cache()
+        # 新闻获取缓存（避免重复获取）
+        self._news_cache: Dict[str, str] = {}
         
         logger.info(
             f"SentimentEngine 初始化完成: "
-            f"cache_path={self.cache_path}, "
-            f"cached_entries={len(self.cache)}"
+            f"model={self.config.get('model', 'deepseek-chat')}, "
+            f"max_concurrent={self.config.get('max_concurrent', 5)}"
         )
     
     def _create_llm_client(self) -> Any:
         """
-        创建 LLM 客户端
+        创建优化版 LLM 客户端
         
         Returns
         -------
@@ -2385,87 +2387,15 @@ class SentimentEngine:
             api_key=self.config.get("api_key"),
             base_url=self.config.get("base_url"),
             model=self.config.get("model", "deepseek-chat"),
+            fallback_model=self.config.get("fallback_model"),
             timeout=self.config.get("request_timeout", 30),
             max_retries=self.config.get("max_retries", 3),
-            max_consecutive_failures=self.config.get("max_consecutive_failures", 5)
+            max_consecutive_failures=self.config.get("max_consecutive_failures", 5),
+            max_concurrent=self.config.get("max_concurrent", 5),
+            cache_path=self.config.get("cache_path", "data/processed/sentiment_cache.json"),
+            cache_ttl_days=self.config.get("cache_ttl_days", 7),
+            detailed_prompts=self.config.get("detailed_prompts", True)
         )
-    
-    def _load_cache(self) -> None:
-        """
-        从文件加载缓存
-        
-        支持向后兼容：将旧版纯 float 格式转换为新的 dict 格式
-        """
-        import json
-        
-        if self.cache_path.exists():
-            try:
-                with open(self.cache_path, "r", encoding="utf-8") as f:
-                    raw_cache = json.load(f)
-                
-                # 向后兼容：转换旧版纯 float 格式
-                self.cache = {}
-                migrated_count = 0
-                for key, value in raw_cache.items():
-                    if isinstance(value, (int, float)):
-                        # 旧版格式：纯分数，转换为新格式
-                        self.cache[key] = {"score": float(value), "confidence": 0.5}
-                        migrated_count += 1
-                    elif isinstance(value, dict) and "score" in value:
-                        # 新版格式：包含 score 和 confidence
-                        self.cache[key] = {
-                            "score": float(value.get("score", 0.0)),
-                            "confidence": float(value.get("confidence", 0.5))
-                        }
-                    else:
-                        logger.warning(f"跳过无效缓存项: {key}")
-                
-                if migrated_count > 0:
-                    logger.info(f"已迁移 {migrated_count} 条旧版缓存记录")
-                    self._save_cache()  # 保存迁移后的缓存
-                
-                logger.debug(f"加载情绪缓存: {len(self.cache)} 条记录")
-            except Exception as e:
-                logger.warning(f"加载情绪缓存失败: {e}")
-                self.cache = {}
-        else:
-            self.cache = {}
-    
-    def _save_cache(self) -> None:
-        """
-        保存缓存到文件
-        """
-        import json
-        
-        try:
-            # 确保目录存在
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(self.cache, f, ensure_ascii=False, indent=2)
-            logger.debug(f"保存情绪缓存: {len(self.cache)} 条记录")
-        except Exception as e:
-            logger.warning(f"保存情绪缓存失败: {e}")
-    
-    def _get_cache_key(self, stock_code: str, date: str) -> str:
-        """
-        生成缓存键
-        
-        Parameters
-        ----------
-        stock_code : str
-            股票代码
-        date : str
-            日期字符串
-        
-        Returns
-        -------
-        str
-            缓存键
-        """
-        # 标准化日期格式
-        date_str = str(date)[:10]  # 取前10个字符（YYYY-MM-DD）
-        return f"{stock_code}_{date_str}"
     
     def _fetch_news(self, stock_code: str, date: str) -> str:
         """
@@ -2490,7 +2420,13 @@ class SentimentEngine:
         - 使用 akshare.stock_news_em() 获取东方财富新闻
         - 获取失败时返回空字符串，不影响策略运行
         - 新闻内容会被截断以控制 API 调用成本
+        - 内置简单缓存避免重复获取
         """
+        # 检查新闻缓存
+        cache_key = f"{stock_code}_{date}"
+        if cache_key in self._news_cache:
+            return self._news_cache[cache_key]
+        
         try:
             import akshare as ak
         except ImportError:
@@ -2504,11 +2440,11 @@ class SentimentEngine:
                 clean_code = clean_code[:6]
             
             # 获取股票新闻
-            # stock_news_em 返回最近的新闻，不需要日期参数
             news_df = ak.stock_news_em(symbol=clean_code)
             
             if news_df is None or news_df.empty:
                 logger.debug(f"未找到股票新闻: {stock_code}")
+                self._news_cache[cache_key] = ""
                 return ""
             
             # 过滤指定日期附近的新闻（前后3天）
@@ -2521,11 +2457,9 @@ class SentimentEngine:
                 )
                 filtered_news = news_df[date_mask]
             else:
-                # 如果没有日期列，取最新的5条
                 filtered_news = news_df.head(5)
             
             if filtered_news.empty:
-                # 没有指定日期的新闻，取最新的3条
                 filtered_news = news_df.head(3)
             
             # 提取新闻标题和内容
@@ -2538,7 +2472,6 @@ class SentimentEngine:
                 if title_col and pd.notna(row.get(title_col)):
                     text_parts.append(str(row[title_col]))
                 if content_col and pd.notna(row.get(content_col)):
-                    # 限制内容长度
                     content = str(row[content_col])[:200]
                     text_parts.append(content)
                 if text_parts:
@@ -2546,7 +2479,6 @@ class SentimentEngine:
             
             combined_news = " | ".join(news_texts)
             
-            # 限制总长度
             if len(combined_news) > 1500:
                 combined_news = combined_news[:1500] + "..."
             
@@ -2556,10 +2488,13 @@ class SentimentEngine:
                 f"text_len={len(combined_news)}"
             )
             
+            # 缓存新闻
+            self._news_cache[cache_key] = combined_news
             return combined_news
             
         except Exception as e:
             logger.warning(f"获取股票新闻失败 (stock={stock_code}): {e}")
+            self._news_cache[cache_key] = ""
             return ""
     
     def get_sentiment_score(
@@ -2592,17 +2527,6 @@ class SentimentEngine:
         LLMCircuitBreakerError
             当 LLM 熔断器触发时抛出（来自 LLMClient）
         """
-        cache_key = self._get_cache_key(stock_code, date)
-        
-        # 检查缓存
-        if use_cache and cache_key in self.cache:
-            cached_value = self.cache[cache_key]
-            logger.debug(
-                f"命中缓存: {cache_key} = score:{cached_value['score']}, "
-                f"confidence:{cached_value['confidence']}"
-            )
-            return cached_value
-        
         # 检查 LLM 客户端
         if self.llm_client is None or not self.llm_client.is_available:
             logger.debug(f"LLM 不可用，返回中性分数: {stock_code}")
@@ -2612,27 +2536,29 @@ class SentimentEngine:
         news_content = self._fetch_news(stock_code, date)
         
         if not news_content:
-            # 没有新闻，返回中性
-            result = {"score": 0.0, "confidence": 0.0}
-        else:
-            # 调用 LLM 分析（返回 SentimentResult）
-            sentiment_result = self.llm_client.get_sentiment_score(news_content, stock_code)
-            result = {
-                "score": sentiment_result.score,
-                "confidence": sentiment_result.confidence
-            }
+            return {"score": 0.0, "confidence": 0.0}
         
-        # 更新缓存
-        self.cache[cache_key] = result
-        self._save_cache()
+        # 调用 LLM 分析
+        sentiment_result = self.llm_client.get_sentiment_score(
+            news_content=news_content,
+            symbol=stock_code,
+            use_cache=use_cache,
+            date=date
+        )
         
-        return result
+        return {
+            "score": sentiment_result.score,
+            "confidence": sentiment_result.confidence,
+            "summary": sentiment_result.summary,
+            "category": sentiment_result.category
+        }
     
     def calculate_sentiment(
         self,
         stock_list: List[str],
         date: str,
-        use_cache: bool = True
+        use_cache: bool = True,
+        parallel: bool = True
     ) -> pd.DataFrame:
         """
         批量计算股票情绪分数
@@ -2645,6 +2571,8 @@ class SentimentEngine:
             日期字符串
         use_cache : bool, optional
             是否使用缓存，默认 True
+        parallel : bool, optional
+            是否并行处理，默认 True
         
         Returns
         -------
@@ -2664,7 +2592,8 @@ class SentimentEngine:
         >>> engine = SentimentEngine()
         >>> result = engine.calculate_sentiment(
         ...     ["000001", "000002", "600000"],
-        ...     "2024-01-15"
+        ...     "2024-01-15",
+        ...     parallel=True
         ... )
         >>> print(result)
           stock_code  score  confidence
@@ -2674,54 +2603,98 @@ class SentimentEngine:
         
         Notes
         -----
+        - 并行模式使用 asyncio 并发请求，显著提高效率
         - 缓存命中的股票不会重复调用 API
         - API 调用失败的股票返回 score=0.0, confidence=0.0
-        - 批量调用后自动保存缓存
         - 熔断器触发时会抛出异常，停止后续调用
         """
-        results: List[Dict[str, Any]] = []
-        cache_hits = 0
-        api_calls = 0
+        if not stock_list:
+            return pd.DataFrame(columns=["stock_code", "score", "confidence"])
         
+        # 检查 LLM 客户端
+        if self.llm_client is None or not self.llm_client.is_available:
+            logger.warning("LLM 客户端不可用，返回空的情绪分数")
+            return pd.DataFrame([
+                {"stock_code": code, "score": 0.0, "confidence": 0.0}
+                for code in stock_list
+            ])
+        
+        # 预先获取所有新闻（串行，避免 AkShare 并发问题）
+        news_dict: Dict[str, str] = {}
         for stock_code in stock_list:
-            cache_key = self._get_cache_key(stock_code, date)
-            
-            # 检查缓存
-            if use_cache and cache_key in self.cache:
-                cached_value = self.cache[cache_key]
-                results.append({
-                    "stock_code": stock_code,
-                    "score": cached_value["score"],
-                    "confidence": cached_value["confidence"]
-                })
-                cache_hits += 1
-                continue
-            
-            # 需要调用 API
-            sentiment = self.get_sentiment_score(stock_code, date, use_cache=False)
-            results.append({
-                "stock_code": stock_code,
-                "score": sentiment["score"],
-                "confidence": sentiment["confidence"]
-            })
-            api_calls += 1
+            news_content = self._fetch_news(stock_code, date)
+            if news_content:
+                news_dict[stock_code] = news_content
         
         logger.info(
+            f"新闻获取完成: 共 {len(stock_list)} 只股票, "
+            f"有新闻 {len(news_dict)} 只"
+        )
+        
+        # 调用 LLM 批量分析
+        if news_dict:
+            sentiment_results = self.llm_client.analyze_batch(
+                news_dict=news_dict,
+                date=date,
+                use_cache=use_cache,
+                parallel=parallel
+            )
+        else:
+            sentiment_results = {}
+        
+        # 构建结果 DataFrame
+        results = []
+        for stock_code in stock_list:
+            if stock_code in sentiment_results:
+                result = sentiment_results[stock_code]
+                results.append({
+                    "stock_code": stock_code,
+                    "score": result.score,
+                    "confidence": result.confidence
+                })
+            else:
+                # 无新闻的股票
+                results.append({
+                    "stock_code": stock_code,
+                    "score": 0.0,
+                    "confidence": 0.0
+                })
+        
+        # 获取性能指标
+        metrics = self.llm_client.metrics
+        logger.info(
             f"情绪分析完成: stocks={len(stock_list)}, "
-            f"cache_hits={cache_hits}, "
-            f"api_calls={api_calls}"
+            f"api_calls={metrics.success_count}, "
+            f"cache_hits={metrics.cache_hits}, "
+            f"avg_latency={metrics.avg_latency_ms:.1f}ms"
         )
         
         return pd.DataFrame(results)
     
     def clear_cache(self) -> None:
-        """
-        清空缓存
-        """
-        self.cache = {}
-        if self.cache_path.exists():
-            self.cache_path.unlink()
+        """清空缓存"""
+        if self.llm_client is not None:
+            self.llm_client.clear_cache()
+        self._news_cache.clear()
         logger.info("情绪缓存已清空")
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        获取性能指标
+        
+        Returns
+        -------
+        Dict[str, Any]
+            性能指标字典，包含调用次数、成功率、平均延迟等
+        """
+        if self.llm_client is None:
+            return {}
+        return self.llm_client.metrics.to_dict()
+    
+    def reset_metrics(self) -> None:
+        """重置性能指标"""
+        if self.llm_client is not None:
+            self.llm_client.reset_metrics()
     
     def get_cached_scores(
         self,
@@ -2743,9 +2716,14 @@ class SentimentEngine:
         pd.DataFrame
             缓存的分数数据，包含 stock_code, date, score, confidence 列
         """
-        records = []
+        if self.llm_client is None:
+            return pd.DataFrame(columns=["stock_code", "date", "score", "confidence"])
         
-        for key, value in self.cache.items():
+        # 从 LLM 客户端的缓存中提取
+        cache_data = self.llm_client._cache._memory_cache.to_dict()
+        
+        records = []
+        for key, value in cache_data.items():
             parts = key.rsplit("_", 1)
             if len(parts) != 2:
                 continue

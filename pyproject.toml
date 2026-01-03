@@ -43,6 +43,12 @@ dependencies = [
     "pyarrow>=14.0.0",
     "tqdm>=4.66.0",
     "pyportfolioopt>=1.5.5",
+    # LLM 情绪分析模块依赖
+    "openai>=1.0.0",
+    "httpx>=0.25.0",
+    "tenacity>=8.2.0",
+    "pydantic>=2.0.0",
+    "tiktoken>=0.5.0",
 ]
 
 [project.optional-dependencies]
