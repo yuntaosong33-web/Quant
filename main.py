@@ -1226,6 +1226,21 @@ class DailyUpdateRunner:
             else:
                 factor_data['ep_ttm'] = np.nan
             
+            # 新增：ROC_20 动量因子计算
+            # 使用 numba 加速的 roc 方法（如果 features 模块有提供，否则使用 pandas）
+            # 这里简单使用 pandas 实现
+            try:
+                # 兼容旧逻辑：如果之前计算过，这里不会报错但也不会覆盖（除非使用 assign）
+                # 注意：calculate_factors 中的 factor_data 是合并了 financial_data 的大表
+                # 应该按 stock_code 分组计算
+                factor_data['roc_20'] = factor_data.groupby('stock_code')['close'].transform(
+                    lambda x: x.pct_change(20) * 100
+                )
+                self.logger.debug(f"手动计算 roc_20 完成 (calculate_factors)，有效率: {factor_data['roc_20'].notna().mean():.1%}")
+            except Exception as e:
+                self.logger.warning(f"手动计算 roc_20 失败 (calculate_factors): {e}")
+                factor_data['roc_20'] = np.nan
+
             # 5. 传统质量因子 ROE_Stability（保守型策略使用）
             if 'roe' in factor_data.columns:
                 factor_data['roe_stability'] = factor_data['roe']
@@ -1249,6 +1264,12 @@ class DailyUpdateRunner:
                 col for col in factor_cols_to_normalize 
                 if col in factor_data.columns and factor_data[col].notna().any()
             ]
+            
+            self.logger.info(f"准备标准化的因子列: {valid_factor_cols}")
+            if 'roc_20' not in valid_factor_cols:
+                self.logger.warning(f"roc_20 不在标准化列表中! Columns: {factor_data.columns.tolist()}")
+                if 'roc_20' in factor_data.columns:
+                    self.logger.warning(f"roc_20 数据概览: {factor_data['roc_20'].describe()}")
             
             # 检查是否有行业字段，决定是否进行行业中性化
             has_industry = 'sw_industry_l1' in factor_data.columns and factor_data['sw_industry_l1'].notna().any()
@@ -1629,19 +1650,43 @@ class DailyUpdateRunner:
     def _get_latest_prices(self) -> Dict[str, float]:
         """获取所有股票的最新收盘价"""
         if self.ohlcv_data is None or self.ohlcv_data.empty:
+            self.logger.warning("ohlcv_data 为空，无法获取最新价格")
             return {}
             
         try:
             # 确定日期列
-            date_col = 'date' if 'date' in self.ohlcv_data.columns else 'trade_date'
-            if date_col not in self.ohlcv_data.columns:
+            date_col = next((col for col in ['date', 'trade_date', 'timestamp'] if col in self.ohlcv_data.columns), None)
+            
+            # 确定股票代码列
+            stock_col = next((col for col in ['stock_code', 'symbol', 'code', 'ts_code'] if col in self.ohlcv_data.columns), None)
+            
+            # 确定收盘价列
+            price_col = next((col for col in ['close', 'close_price'] if col in self.ohlcv_data.columns), None)
+            
+            if not date_col or not price_col:
+                self.logger.warning(f"缺少必要列: date_col={date_col}, price_col={price_col}")
+                return {}
+
+            df = self.ohlcv_data.copy()
+            
+            # 如果没有股票代码列，尝试从索引获取
+            if not stock_col:
+                if isinstance(df.index, pd.MultiIndex):
+                    # 假设 MultiIndex 是 (date, stock_code) 或 (stock_code, date)
+                    # 这里简化处理，暂不支持 MultiIndex 自动推断，建议 Reset Index
+                    df = df.reset_index()
+                    stock_col = next((col for col in ['stock_code', 'symbol', 'code', 'ts_code'] if col in df.columns), None)
+            
+            if not stock_col:
+                self.logger.warning("无法找到股票代码列")
                 return {}
                 
             # 获取每个股票的最后一条记录
-            # 假设数据可能未排序，先排序
-            df_sorted = self.ohlcv_data.sort_values(by=date_col)
-            latest_prices = df_sorted.groupby('stock_code')['close'].last().to_dict()
+            # 先按日期排序
+            df_sorted = df.sort_values(by=date_col)
+            latest_prices = df_sorted.groupby(stock_col)[price_col].last().to_dict()
             
+            self.logger.info(f"已获取 {len(latest_prices)} 只股票的最新价格")
             return latest_prices
         except Exception as e:
             self.logger.warning(f"获取最新价格映射失败: {e}")
@@ -2656,6 +2701,12 @@ def _generate_backtest_factor_data(
         # 计算 RSI_20
         rsi_20 = calculate_rsi(df['close'], period=20)
         
+        # 计算 ROC_20 (动量因子)
+        roc_20 = pd.Series(np.nan, index=df.index)
+        if 'close' in df.columns:
+            # 20日变动率 = (Today - 20DaysAgo) / 20DaysAgo * 100
+            roc_20 = df['close'].pct_change(20) * 100
+        
         # 计算 5 日平均换手率
         turnover_5d = pd.Series(np.nan, index=df.index)
         if 'turnover' in df.columns:
@@ -2717,6 +2768,7 @@ def _generate_backtest_factor_data(
                 'stock_code': stock_code,
                 'close': close_price,
                 'rsi_20': rsi_val,
+                'roc_20': roc_20.get(date, np.nan) if date in roc_20.index else np.nan,
                 'turnover_5d': turnover_val,
                 # 小市值因子（核心）
                 'small_cap': small_cap,
@@ -2755,6 +2807,16 @@ def _generate_backtest_factor_data(
         lambda g: zscore_by_date(g, 'rsi_20')
     ).reset_index(level=0, drop=True)
     
+    # 计算 ROC_20 Z-Score (真正的动量因子)
+    if 'roc_20' in factor_df.columns:
+        factor_df['roc_20_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'roc_20')
+        ).reset_index(level=0, drop=True)
+        logger.info(f"roc_20_zscore 生成完成，有效率: {factor_df['roc_20_zscore'].notna().mean():.1%}")
+    else:
+        factor_df['roc_20_zscore'] = np.nan
+        logger.warning("无法计算 roc_20_zscore: roc_20 列缺失")
+
     # 检查是否有有效的 small_cap 数据（来自财务数据或换手率估算）
     has_valid_small_cap = factor_df['small_cap'].notna().any()
     

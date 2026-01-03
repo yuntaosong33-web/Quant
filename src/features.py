@@ -1796,6 +1796,15 @@ class FactorCalculator:
             logger.warning(f"RSI_20 因子计算失败: {e}")
             result['rsi_20'] = np.nan
         
+        # 新增：ROC_20 动量因子
+        try:
+            # 修正：FactorCalculator 没有 roc 方法，调用 TechnicalFeatures.roc 静态方法
+            result['roc_20'] = TechnicalFeatures.roc(result['close'], period=20)
+            logger.info("ROC_20 因子计算完成")
+        except Exception as e:
+            logger.warning(f"ROC_20 因子计算失败: {e}")
+            result['roc_20'] = np.nan
+        
         try:
             result['ivol'] = self.calculate_ivol(period=20)
             logger.info("IVOL 因子计算完成")
