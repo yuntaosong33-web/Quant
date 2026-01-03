@@ -196,6 +196,8 @@ class DailyUpdateRunner:
         
         # 策略
         strategy_config = self.config.get("strategy", {})
+        llm_config = self.config.get("llm", {})
+        
         self.strategy = MultiFactorStrategy(
             name=strategy_config.get("name", "Multi-Factor Strategy"),
             config={
@@ -204,8 +206,12 @@ class DailyUpdateRunner:
                 "quality_weight": strategy_config.get("quality_weight", 0.3),
                 "momentum_weight": strategy_config.get("momentum_weight", 0.4),
                 "size_weight": strategy_config.get("size_weight", 0.3),
+                "sentiment_weight": strategy_config.get("sentiment_weight", 0.0),  # 情绪因子权重
                 "top_n": strategy_config.get("top_n", 3),
                 "min_listing_days": strategy_config.get("min_listing_days", 126),
+                # 板块过滤配置
+                "exclude_chinext": strategy_config.get("exclude_chinext", False),  # 排除创业板
+                "exclude_star": strategy_config.get("exclude_star", False),  # 排除科创板
                 # 因子列名配置（从配置文件读取，支持激进型小市值策略）
                 "value_col": strategy_config.get("value_col", "small_cap_zscore"),
                 "quality_col": strategy_config.get("quality_col", "turnover_5d_zscore"),
@@ -214,6 +220,8 @@ class DailyUpdateRunner:
                 # 调仓配置
                 "rebalance_frequency": strategy_config.get("rebalance_frequency", "weekly"),
                 "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.02),
+                # LLM 情绪分析配置
+                "llm": llm_config,
             }
         )
     
@@ -1193,12 +1201,23 @@ class DailyUpdateRunner:
                 factor_data['small_cap'] = np.nan
             
             # 3. 换手率因子 turnover_5d（激进型策略使用）
+            # 支持多种列名：turn（AkShare spot_em）或 turnover（其他数据源）
+            turn_col = None
             if 'turn' in factor_data.columns:
-                factor_data['turnover_5d'] = factor_data.groupby('stock_code')['turn'].transform(
+                turn_col = 'turn'
+            elif 'turnover' in factor_data.columns:
+                turn_col = 'turnover'
+            elif 'turnover_rate' in factor_data.columns:
+                turn_col = 'turnover_rate'
+            
+            if turn_col is not None:
+                factor_data['turnover_5d'] = factor_data.groupby('stock_code')[turn_col].transform(
                     lambda x: x.rolling(5, min_periods=1).mean()
                 )
+                self.logger.debug(f"使用 '{turn_col}' 列计算换手率因子")
             else:
                 factor_data['turnover_5d'] = np.nan
+                self.logger.warning("未找到换手率列 (turn/turnover/turnover_rate)，换手率因子将为 NaN")
             
             # 4. 传统价值因子 EP_TTM（保守型策略使用）
             if 'pe_ttm' in factor_data.columns:

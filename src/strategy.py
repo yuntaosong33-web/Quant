@@ -727,6 +727,10 @@ class MultiFactorStrategy(BaseStrategy):
 
         self.min_listing_days: int = self.config.get("min_listing_days", 126)  # 约6个月
         
+        # 板块过滤配置
+        self._exclude_chinext: bool = self.config.get("exclude_chinext", False)  # 排除创业板
+        self._exclude_star: bool = self.config.get("exclude_star", False)  # 排除科创板
+        
         # 因子列名配置（支持自定义列名）
         self.value_col: str = self.config.get("value_col", "value_zscore")
         self.quality_col: str = self.config.get("quality_col", "quality_zscore")
@@ -1190,6 +1194,41 @@ class MultiFactorStrategy(BaseStrategy):
         filter_stats['次新股'] = before - len(day_data)
         
         # ==========================================
+        # 过滤条件 7: 剔除创业板股票（可配置）
+        # 创业板代码以 300xxx 或 301xxx 开头
+        # ==========================================
+        stock_col = self.stock_col if self.stock_col in day_data.columns else 'symbol'
+        
+        if self._exclude_chinext:
+            if stock_col in day_data.columns:
+                before = len(day_data)
+                # 创业板股票代码以 300 或 301 开头
+                chinext_mask = day_data[stock_col].astype(str).str[:3].isin(['300', '301'])
+                day_data = day_data[~chinext_mask]
+                filter_stats['创业板'] = before - len(day_data)
+            elif isinstance(day_data.index, pd.Index):
+                before = len(day_data)
+                chinext_mask = day_data.index.astype(str).str[:3].isin(['300', '301'])
+                day_data = day_data[~chinext_mask]
+                filter_stats['创业板'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 8: 剔除科创板股票（可配置）
+        # 科创板代码以 688xxx 开头
+        # ==========================================
+        if self._exclude_star:
+            if stock_col in day_data.columns:
+                before = len(day_data)
+                star_mask = day_data[stock_col].astype(str).str[:3] == '688'
+                day_data = day_data[~star_mask]
+                filter_stats['科创板'] = before - len(day_data)
+            elif isinstance(day_data.index, pd.Index):
+                before = len(day_data)
+                star_mask = day_data.index.astype(str).str[:3] == '688'
+                day_data = day_data[~star_mask]
+                filter_stats['科创板'] = before - len(day_data)
+        
+        # ==========================================
         # 注意：情绪分析已移至 _apply_sentiment_filter 方法
         # 采用 "Filter-Then-Analyze" 模式：仅对 Top N * buffer 的候选股票进行情绪分析
         # 这显著减少了 LLM API 调用次数，降低成本并提高效率
@@ -1401,9 +1440,32 @@ class MultiFactorStrategy(BaseStrategy):
         stock_col = self.stock_col if self.stock_col in data.columns else 'symbol'
         
         # ==========================================
-        # 第一阶段：技术面初筛（基础得分）
+        # 数据预处理：确保每只股票只有一条记录（使用最新日期）
         # ==========================================
         data = data.copy()
+        
+        # 确定日期列
+        date_col_name = None
+        if self.date_col in data.columns:
+            date_col_name = self.date_col
+        elif 'trade_date' in data.columns:
+            date_col_name = 'trade_date'
+        elif isinstance(data.index, pd.DatetimeIndex):
+            data = data.reset_index()
+            date_col_name = 'index' if 'index' in data.columns else data.columns[0]
+        elif isinstance(data.index, pd.MultiIndex):
+            data = data.reset_index()
+            date_col_name = data.columns[0]
+        
+        # 去重：每只股票只保留最新日期的记录
+        if stock_col in data.columns and date_col_name is not None:
+            data = data.sort_values(date_col_name, ascending=False)
+            data = data.drop_duplicates(subset=[stock_col], keep='first')
+            logger.debug(f"数据去重完成：保留 {len(data)} 只股票的最新记录")
+        
+        # ==========================================
+        # 第一阶段：技术面初筛（基础得分）
+        # ==========================================
         data['base_score'] = self.calculate_total_score(data, sentiment_scores=None)
         
         # 剔除得分为 NaN 的股票
@@ -1429,6 +1491,8 @@ class MultiFactorStrategy(BaseStrategy):
                     top_stocks = valid_data.nlargest(n, 'base_score').index.tolist()
             else:
                 top_stocks = valid_data.nlargest(n, 'base_score')[stock_col].tolist()
+            # 确保去重并保持顺序
+            top_stocks = list(dict.fromkeys(top_stocks))[:n]
             return top_stocks
         
         # ==========================================
@@ -1568,6 +1632,9 @@ class MultiFactorStrategy(BaseStrategy):
                 top_stocks = candidate_data.nlargest(n, 'final_score').index.tolist()
         else:
             top_stocks = candidate_data.nlargest(n, 'final_score')[stock_col].tolist()
+        
+        # 确保去重并保持顺序
+        top_stocks = list(dict.fromkeys(top_stocks))[:n]
         
         logger.debug(
             f"第三阶段最终排名: {len(pre_candidates)} 只候选股 -> "

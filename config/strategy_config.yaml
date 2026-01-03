@@ -44,6 +44,10 @@ strategy:
   top_n: 6              # 选取6只股票，降低单只股票风险
   min_listing_days: 126  # 最小上市天数（约6个月）
   
+  # 板块过滤（适用于无对应交易权限的情况）
+  exclude_chinext: true   # 排除创业板（300xxx, 301xxx）- 需开通创业板权限
+  exclude_star: false     # 排除科创板（688xxx）- 需开通科创板权限
+  
   # 因子列名配置（与 features.py 产出列名一致）
   # turnover_5d_zscore: 5日平均换手率的标准化
   # roc_20_zscore: 20日变动率(ROC)的标准化 - 使用新添加的 ROC_20 因子
