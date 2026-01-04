@@ -64,9 +64,11 @@ class TushareDataLoader:
     """
     
     # API 请求限流参数
-    REQUEST_INTERVAL = 0.12  # 每次请求间隔（秒），Tushare 限制约 500 次/分钟
+    # 普通用户限制: 200 次/分钟 = 3.33 次/秒，安全起见设为 0.35 秒间隔
+    REQUEST_INTERVAL = 0.35  # 每次请求间隔（秒）
     MAX_RETRIES = 3
-    RETRY_DELAY = 1.0
+    RETRY_DELAY = 2.0  # 重试延迟
+    RATE_LIMIT_DELAY = 60.0  # 触发频率限制后等待时间（秒）
     
     # 股票池代码映射
     INDEX_CODE_MAPPING = {
@@ -157,9 +159,15 @@ class TushareDataLoader:
                 if result is not None and not result.empty:
                     return result
             except Exception as e:
-                logger.warning(f"API 请求失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
-                if attempt < self.MAX_RETRIES - 1:
-                    time.sleep(self.RETRY_DELAY * (attempt + 1))
+                error_msg = str(e)
+                # 检查是否触发频率限制
+                if "每分钟最多访问" in error_msg or "抱歉" in error_msg:
+                    logger.warning(f"触发 API 频率限制，等待 {self.RATE_LIMIT_DELAY} 秒后重试...")
+                    time.sleep(self.RATE_LIMIT_DELAY)
+                else:
+                    logger.warning(f"API 请求失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                    if attempt < self.MAX_RETRIES - 1:
+                        time.sleep(self.RETRY_DELAY * (attempt + 1))
         return None
     
     # ==================== 指数成分股 ====================
@@ -341,10 +349,12 @@ class TushareDataLoader:
         start_date: str,
         end_date: str,
         adj: str = "qfq",
-        show_progress: bool = True
+        show_progress: bool = True,
+        batch_size: int = 150,
+        batch_sleep: float = 20.0
     ) -> pd.DataFrame:
         """
-        批量获取日线数据
+        批量获取日线数据（带限流保护）
         
         Parameters
         ----------
@@ -358,6 +368,10 @@ class TushareDataLoader:
             复权方式
         show_progress : bool
             是否显示进度
+        batch_size : int
+            每批次处理的股票数量（默认 150）
+        batch_sleep : float
+            每批次之间的休息时间（秒）
         
         Returns
         -------
@@ -373,8 +387,14 @@ class TushareDataLoader:
                 df["stock_code"] = stock
                 all_data.append(df)
             
+            # 进度日志
             if show_progress and (i + 1) % 50 == 0:
                 logger.info(f"日线数据进度: {i + 1}/{total}")
+            
+            # 批次休息（避免触发频率限制）
+            if (i + 1) % batch_size == 0 and (i + 1) < total:
+                logger.info(f"已处理 {i + 1} 只，休息 {batch_sleep} 秒避免触发频率限制...")
+                time.sleep(batch_sleep)
         
         if not all_data:
             return pd.DataFrame()
@@ -534,10 +554,12 @@ class TushareDataLoader:
     def fetch_financial_batch(
         self,
         stock_list: List[str],
-        show_progress: bool = True
+        show_progress: bool = True,
+        batch_size: int = 100,
+        batch_sleep: float = 30.0
     ) -> pd.DataFrame:
         """
-        批量获取财务指标
+        批量获取财务指标（带限流保护）
         
         Parameters
         ----------
@@ -545,6 +567,10 @@ class TushareDataLoader:
             股票代码列表
         show_progress : bool
             是否显示进度
+        batch_size : int
+            每批次处理的股票数量（默认 100）
+        batch_sleep : float
+            每批次之间的休息时间（秒）
         
         Returns
         -------
@@ -562,13 +588,24 @@ class TushareDataLoader:
                 df["stock_code"] = stock
                 all_data.append(df)
             
+            # 进度日志
             if show_progress and (i + 1) % 50 == 0:
                 logger.info(f"财务指标进度: {i + 1}/{total}")
+            
+            # 批次休息（避免触发频率限制）
+            if (i + 1) % batch_size == 0 and (i + 1) < total:
+                logger.info(f"已处理 {i + 1} 只，休息 {batch_sleep} 秒避免触发频率限制...")
+                time.sleep(batch_sleep)
         
         if not all_data:
             return pd.DataFrame()
         
-        result = pd.concat(all_data, ignore_index=True)
+        # 过滤掉全空的 DataFrame，避免 FutureWarning
+        valid_data = [df for df in all_data if not df.isna().all().all()]
+        if not valid_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(valid_data, ignore_index=True)
         logger.info(f"批量获取财务指标完成: {len(stock_list)} 只股票, {len(result)} 条记录")
         return result
     

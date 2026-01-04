@@ -578,12 +578,21 @@ class DailyUpdateRunner:
             self.logger.info("获取财务指标 (ROE, 毛利率等)...")
             fina_df = self.tushare_loader.fetch_financial_batch(stocks, show_progress=True)
             
-            # 合并数据
+            # 合并数据（避免重复列）
             if not basic_df.empty:
                 if not fina_df.empty:
-                    # 合并 basic 和 fina
+                    # 从 fina_df 中只取 basic_df 中不存在的列 + stock_code
+                    fina_cols = ['stock_code', 'roe', 'roe_dt']
+                    # 检查是否有 gross_margin/net_margin，且 basic_df 中没有
+                    for col in ['gross_margin', 'net_margin']:
+                        if col in fina_df.columns and col not in basic_df.columns:
+                            fina_cols.append(col)
+                    
+                    # 确保只选择存在的列
+                    fina_cols = [c for c in fina_cols if c in fina_df.columns]
+                    
                     merged_df = basic_df.merge(
-                        fina_df[['stock_code', 'roe', 'roe_dt', 'gross_margin', 'net_margin']],
+                        fina_df[fina_cols],
                         on='stock_code',
                         how='left'
                     )
@@ -595,12 +604,19 @@ class DailyUpdateRunner:
                 self.logger.error("无法获取任何财务数据")
                 return False
             
+            # 去除重复列（如果存在）
+            merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+            
             # 标准化列名
             if 'stock_code' not in merged_df.columns and 'ts_code' in merged_df.columns:
                 merged_df['stock_code'] = merged_df['ts_code'].str[:6]
             
             # 添加数据有效性标记
-            merged_df['data_valid'] = merged_df['circ_mv'].notna() | merged_df['total_mv'].notna()
+            mv_cols = [c for c in ['circ_mv', 'total_mv'] if c in merged_df.columns]
+            if mv_cols:
+                merged_df['data_valid'] = merged_df[mv_cols].notna().any(axis=1)
+            else:
+                merged_df['data_valid'] = True
             
             # 估算上市天数
             merged_df['listing_days'] = merged_df['stock_code'].apply(self._estimate_listing_days)
