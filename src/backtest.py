@@ -218,6 +218,14 @@ class BacktestEngine:
                 "或预计算的 target_weights 参数"
             )
         
+        # =======================================================
+        # [CRITICAL FIX] 防止前视偏差 (Look-ahead Bias)
+        # =======================================================
+        # 策略在 Day T 收盘后生成信号/权重，只能在 Day T+1 执行
+        # 因此必须将权重滞后一天
+        logger.info("应用 T+1 交易规则：将目标权重滞后一天执行")
+        weights = weights.shift(1).fillna(0.0)
+
         # ========================================
         # Step 3: 执行回测
         # ========================================
@@ -351,31 +359,49 @@ class BacktestEngine:
             target_shares_dict: Dict[str, int] = {}
             insufficient_capital_count = 0  # 记录资金不足无法买1手的情况
             
-            for stock_idx, stock in enumerate(stocks):
-                price = today_prices[stock_idx]
-                weight = today_weights[stock_idx]
+            # [FIX] Lazy Rebalancing: 检查当日权重是否全为 NaN
+            # 如果全为 NaN，说明是非调仓日，直接沿用当前持仓（Buy and Hold）
+            is_lazy_day = np.isnan(today_weights).all()
+            
+            if is_lazy_day:
+                # 非调仓日：目标持仓 = 当前持仓
+                target_shares_dict = shares.copy()
+                # logger.debug(f"非调仓日 {date}: 保持持仓不动")
+            else:
+                # 调仓日：正常计算目标权重
+                # 注意：today_weights 中可能包含 NaN（未持有的股票），需视为 0
+                # 但如果整行都是 NaN 已经被上面捕获了。
+                # 这里处理部分 NaN 的情况（虽然 target_weights 初始化时非调仓日是全 NaN）
                 
-                # 跳过无效价格
-                if np.isnan(price) or price <= 0:
-                    target_shares_dict[stock] = 0
-                    continue
-                
-                # 计算目标市值
-                target_value = total_equity * weight
-                
-                # 计算目标股数（向下取整到整手）
-                target_shares = int(target_value / price / self.ROUND_LOT) * self.ROUND_LOT
-                
-                # ===== 小资金警告：目标金额不足买入1手 =====
-                if target_value > 0 and target_shares == 0:
-                    insufficient_capital_count += 1
-                    min_required = price * self.ROUND_LOT  # 买1手需要的最小资金
-                    logger.warning(
-                        f"{stock} 目标金额 {target_value:.0f} 不足买入1手 "
-                        f"(股价 {price:.2f}, 需要 {min_required:.0f})，已放弃买入"
-                    )
-                
-                target_shares_dict[stock] = max(0, target_shares)
+                for stock_idx, stock in enumerate(stocks):
+                    price = today_prices[stock_idx]
+                    weight = today_weights[stock_idx]
+                    
+                    # 处理 NaN 权重：视为 0
+                    if np.isnan(weight):
+                        weight = 0.0
+                    
+                    # 跳过无效价格
+                    if np.isnan(price) or price <= 0:
+                        target_shares_dict[stock] = 0
+                        continue
+                    
+                    # 计算目标市值
+                    target_value = total_equity * weight
+                    
+                    # 计算目标股数（向下取整到整手）
+                    target_shares = int(target_value / price / self.ROUND_LOT) * self.ROUND_LOT
+                    
+                    # ===== 小资金警告：目标金额不足买入1手 =====
+                    if target_value > 0 and target_shares == 0:
+                        insufficient_capital_count += 1
+                        min_required = price * self.ROUND_LOT  # 买1手需要的最小资金
+                        logger.warning(
+                            f"{stock} 目标金额 {target_value:.0f} 不足买入1手 "
+                            f"(股价 {price:.2f}, 需要 {min_required:.0f})，已放弃买入"
+                        )
+                    
+                    target_shares_dict[stock] = max(0, target_shares)
             
             # 累计小资金不足的次数
             insufficient_capital_total += insufficient_capital_count
@@ -1118,6 +1144,9 @@ class VBTProBacktester:
         """
         # 简单策略：买入信号shift后作为卖出信号
         # 即每次新的买入信号触发时，卖出之前的持仓
+        # [WARNING] 这是一个极简的退出逻辑，仅用于演示或基准测试
+        # 实际策略应基于止损/止盈或反向信号
+        logger.warning("使用默认极简退出策略 (Next Entry Rebalance)，可能不符合预期")
         exits = entries.shift(1, fill_value=False)
         return exits
     

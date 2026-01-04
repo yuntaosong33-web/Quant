@@ -5,7 +5,7 @@
 # 数据配置
 data:
   # 股票池: hs300(沪深300), zz500(中证500), zz1000(中证1000), all(全市场)
-  # 中证1000提供更高弹性，适合动量+情绪策略
+  # [SWITCH] 切换到中证1000以配合激进动量策略
   stock_pool: "zz1000"
   
   # 历史数据开始日期
@@ -18,53 +18,45 @@ data:
   raw_data_path: "data/raw"
   processed_data_path: "data/processed"
 
-# 策略配置 - 中证1000强动量+情绪进攻策略
+# 策略配置 - 中证1000多因子策略
 strategy:
   # 策略名称
-  name: "Aggressive Momentum & Sentiment"
+  name: "Balanced Multi-Factor"
   
-  # 因子权重配置 (强动量 + 情绪进攻型 - 30万资金实盘优化版)
-  # Base_Score = value_weight * Value_Z + quality_weight * Turnover_Z 
-  #            + momentum_weight * ROC20_Z + size_weight * SmallCap_Z
-  # Final_Score = Base_Score + sentiment_weight * Sentiment_Score
-  # 
-  # 策略逻辑（去微盘化）：
-  # - 放弃估值因子（中盘股已无估值优势）
-  # - 完全移除小市值因子（避免流动性差的微盘股，已通过 zz1000 股池锁定市值范围）
-  # - 核心依赖动量因子（ROC_20）捕捉趋势，权重提升至 0.7
-  # - 换手率因子确保资金活跃度，权重提升至 0.3
-  # - LLM 情绪因子作为 Alpha 加成（额外加成，不计入基础权重）
-  # - 基础权重之和 (value+quality+momentum+size) = 1.0
-  value_weight: 0.0      # 放弃估值因子
-  quality_weight: 0.3    # 换手率因子（资金活跃度，对应 turnover_5d_zscore）↑ 0.2 → 0.3
-  momentum_weight: 0.7   # 核心动量因子（对应 roc_20_zscore）↑ 0.3 → 0.7
-  size_weight: 0.0       # 完全移除小市值因子，避免微盘股流动性风险 ↓ 0.3 → 0.0
-  sentiment_weight: 0.2  # 情绪因子权重（LLM 分析结果作为 Alpha 加成，额外加权）
+  # 因子权重配置 (平衡型 - 动量+小市值+低波)
+  # 注：价值因子因数据源限制(PE数据缺失)暂时禁用
+  value_weight: 0.0      # 价值因子 - 禁用（数据源不支持）
+  quality_weight: 0.2    # 低波因子 (IVOL) - 20%
+  momentum_weight: 0.45  # 动量因子 - 45%（+5%）
+  size_weight: 0.35      # 小市值因子 - 35%（+5%）
+  sentiment_weight: 0.0  # 禁用情绪因子
   
-  # 选股参数（集中持仓，30万资金优化）
-  # 5只股票 × 6万/只，确保单笔交易远超2万，消除最低5元佣金的比例损耗
-  top_n: 5              # 选取5只股票，每只约6万资金
-  min_listing_days: 252  # 最小上市天数（约1年，避开次新股）
+  # 选股参数
+  top_n: 4              # 持仓4只，聚焦高质量
+  min_listing_days: 126 # 约6个月上市时间
   
-  # 板块过滤（适用于无对应交易权限的情况）
-  exclude_chinext: true   # 排除创业板（300xxx, 301xxx）- 需开通创业板权限
-  exclude_star: false     # 排除科创板（688xxx）- 需开通科创板权限
+  # 风控熔断阈值
+  turnover_threshold: 10.0   # 禁用换手率熔断
+  volatility_threshold: 2.0  # 适中的波动率限制
   
-  # 因子列名配置（与 features.py 产出列名一致）
-  # turnover_5d_zscore: 5日平均换手率的标准化
-  # roc_20_zscore: 20日变动率(ROC)的标准化 - 使用新添加的 ROC_20 因子
-  value_col: "value_zscore"           # 未使用（权重为0）
-  quality_col: "turnover_5d_zscore"   # 换手率因子
-  momentum_col: "roc_20_zscore"       # 核心动量因子：20日变动率
-  size_col: "small_cap_zscore"        # 未使用（权重为0）
+  # 板块过滤
+  exclude_chinext: false  # 启用创业板
+  exclude_star: false     # 启用科创板
   
-  # 调仓频率: monthly(月度), weekly(周度)
-  # 月度调仓减少交易次数，降低交易成本（适合30万资金规模）
-  rebalance_frequency: "monthly"
+  # 因子列名配置
+  value_col: "value_zscore"
+  quality_col: "ivol_zscore"
+  momentum_col: "sharpe_60_zscore"   # 60日夏普动量（更稳定）
+  size_col: "small_cap_zscore"
   
-  # 再平衡缓冲区：权重变化小于此阈值时不调整
-  # 10%缓冲区减少非必要的微调，降低交易频率和成本
-  rebalance_buffer: 0.10
+  # 调仓频率
+  rebalance_frequency: "weekly"
+  
+  # 再平衡缓冲区
+  rebalance_buffer: 0.30    # 30% 缓冲减少交易
+  
+  # 持股惯性加分
+  holding_bonus: 0.5        # 0.5 标准差（经验证的最优值）
 
 # 投资组合配置 - 激进型（集中持仓）
 portfolio:
@@ -94,7 +86,7 @@ portfolio:
   # 协方差计算回溯天数
   lookback_days: 252
 
-# 风险控制配置 - 激进型参数（30万资金实盘优化）
+  # 风险控制配置 - 激进型参数（30万资金实盘优化）
 risk:
   # 止损比例（放宽：避免频繁被洗）
   stop_loss: 0.08
@@ -112,16 +104,16 @@ risk:
   # ATR 止损根据市场波动率自动调整止损位，比固定比例止损更智能
   use_atr_stop_loss: true       # 启用 ATR 止损
   atr_period: 14                # ATR 计算周期（14日）
-  atr_multiplier: 2.0           # ATR 止损倍数（入场价 - 2 × ATR）
+  atr_multiplier: 1.5           # ATR 止损倍数（激进策略收紧至1.5，跑得快）
   atr_trailing: true            # 是否启用移动止损（跟踪盈利）
   
-  # 大盘风控参数（激进型：使用 MA60 + 20日跌幅判断）
-  # 仅当大盘跌破60日均线且20日跌幅超过5%时才触发熔断
+  # 大盘风控参数
+  # 仅当大盘跌破60日均线且20日跌幅超过8%时才触发熔断
   market_risk:
-    enabled: true
-    ma_period: 20           # 使用20日均线（反应更灵敏）
-    drop_threshold: 0.05    # 20日跌幅阈值（5%）
-    drop_lookback: 20       # 跌幅回溯天数
+    enabled: true         # 启用风控
+    ma_period: 60
+    drop_threshold: 0.08  # 8% 跌幅阈值
+    drop_lookback: 20
 
 # LLM 情绪分析配置（优化版）
 # 情绪进攻型策略：情绪分数作为 Alpha 因子加成，而非仅用于过滤
@@ -262,5 +254,8 @@ backtest:
   initial_capital: 300000
   
   # 基准指数
-  # ZZ1000 (000852) 与中证1000股池匹配，适合动量策略
-  benchmark: "000852"  # 中证1000
+  # [SWITCH] 配合股票池切换，基准改为沪深300 (000300)
+  benchmark: "000300"  # 沪深300
+
+  # 回测最大股票数量（避免数据下载耗时过长，全市场回测请设为 5000）
+  max_stocks: 2000

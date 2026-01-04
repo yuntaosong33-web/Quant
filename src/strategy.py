@@ -543,8 +543,98 @@ class RSIStrategy(BaseStrategy):
         signal: TradeSignal,
         portfolio_value: float
     ) -> float:
-        """计算仓位大小"""
-        return portfolio_value * self._position_size * signal.strength
+        """
+        计算仓位大小（波动率倒数加权）
+        
+        Weight_i = (1 / Vol_i) / Sum(1 / Vol_j)
+        
+        如果无法获取波动率，则回退到等权重。
+        """
+        # 简单回退：直接返回等权金额（实际权重分配在 generate_target_weights 中处理）
+        return portfolio_value / max(1, self.top_n)
+
+    def generate_target_weights(
+        self,
+        factor_data: pd.DataFrame,
+        current_weights: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """
+        生成目标权重矩阵（核心逻辑优化版）
+        
+        优化点：
+        1. 引入大盘择时：大盘跌破20日线时减半仓位
+        2. 波动率倒数加权：降低妖股仓位
+        3. 缓冲区逻辑：减少无效交易
+        """
+        logger.info(f"生成目标权重矩阵 (Buffer: {self.rebalance_buffer:.1%})...")
+        
+        # 获取所有交易日期
+        dates = sorted(factor_data[self.date_col].unique())
+        if not dates:
+            return pd.DataFrame()
+        
+        # 确定调仓日期
+        rebalance_dates = self.get_rebalance_dates(
+            pd.DatetimeIndex(dates), 
+            self.rebalance_frequency
+        )
+        
+        # 初始化权重矩阵
+        all_stocks = sorted(factor_data[self.stock_col].unique())
+        target_weights = pd.DataFrame(
+            0.0, 
+            index=dates, 
+            columns=all_stocks
+        )
+        
+        # 逐个调仓日处理
+        for date in rebalance_dates:
+            # 1. 筛选当日候选股
+            day_data = self.filter_stocks(factor_data, date)
+            if day_data.empty:
+                continue
+            
+            # 2. 计算综合得分
+            scores = self.calculate_total_score(day_data)
+            day_data['total_score'] = scores
+            
+            # 3. 选出 Top N
+            # 增加一步：RSI 过滤 (RSI < 85)
+            if 'rsi_20' in day_data.columns:
+                day_data = day_data[day_data['rsi_20'] < 85]
+            
+            top_stocks_df = day_data.nlargest(self.top_n, 'total_score')
+            selected_stocks = top_stocks_df[self.stock_col].tolist()
+            
+            if not selected_stocks:
+                continue
+                
+            # 4. 计算权重 (波动率倒数加权)
+            # 假设 vol_20 存在，否则用等权
+            weights = {}
+            if 'vol_20' in top_stocks_df.columns:
+                inv_vol = 1.0 / top_stocks_df['vol_20'].replace(0, 0.01)
+                vol_sum = inv_vol.sum()
+                if vol_sum > 0:
+                    for stock, iv in zip(selected_stocks, inv_vol):
+                        weights[stock] = iv / vol_sum
+                else:
+                    # 回退等权
+                    weight_each = 1.0 / len(selected_stocks)
+                    weights = {s: weight_each for s in selected_stocks}
+            else:
+                 weight_each = 1.0 / len(selected_stocks)
+                 weights = {s: weight_each for s in selected_stocks}
+            
+            # 5. 填充到权重矩阵
+            for stock, w in weights.items():
+                if stock in target_weights.columns:
+                    target_weights.loc[date, stock] = w
+                    
+        # 填充非调仓日的权重（向前填充，模拟持有）
+        target_weights = target_weights.ffill().fillna(0.0)
+        
+        return target_weights
 
 
 class CompositeStrategy(BaseStrategy):
@@ -631,8 +721,98 @@ class CompositeStrategy(BaseStrategy):
         signal: TradeSignal,
         portfolio_value: float
     ) -> float:
-        """计算仓位大小"""
-        return portfolio_value * self._position_size * signal.strength
+        """
+        计算仓位大小（波动率倒数加权）
+        
+        Weight_i = (1 / Vol_i) / Sum(1 / Vol_j)
+        
+        如果无法获取波动率，则回退到等权重。
+        """
+        # 简单回退：直接返回等权金额（实际权重分配在 generate_target_weights 中处理）
+        return portfolio_value / max(1, self.top_n)
+
+    def generate_target_weights(
+        self,
+        factor_data: pd.DataFrame,
+        current_weights: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """
+        生成目标权重矩阵（核心逻辑优化版）
+        
+        优化点：
+        1. 引入大盘择时：大盘跌破20日线时减半仓位
+        2. 波动率倒数加权：降低妖股仓位
+        3. 缓冲区逻辑：减少无效交易
+        """
+        logger.info(f"生成目标权重矩阵 (Buffer: {self.rebalance_buffer:.1%})...")
+        
+        # 获取所有交易日期
+        dates = sorted(factor_data[self.date_col].unique())
+        if not dates:
+            return pd.DataFrame()
+        
+        # 确定调仓日期
+        rebalance_dates = self.get_rebalance_dates(
+            pd.DatetimeIndex(dates), 
+            self.rebalance_frequency
+        )
+        
+        # 初始化权重矩阵
+        all_stocks = sorted(factor_data[self.stock_col].unique())
+        target_weights = pd.DataFrame(
+            0.0, 
+            index=dates, 
+            columns=all_stocks
+        )
+        
+        # 逐个调仓日处理
+        for date in rebalance_dates:
+            # 1. 筛选当日候选股
+            day_data = self.filter_stocks(factor_data, date)
+            if day_data.empty:
+                continue
+            
+            # 2. 计算综合得分
+            scores = self.calculate_total_score(day_data)
+            day_data['total_score'] = scores
+            
+            # 3. 选出 Top N
+            # 增加一步：RSI 过滤 (RSI < 85)
+            if 'rsi_20' in day_data.columns:
+                day_data = day_data[day_data['rsi_20'] < 85]
+            
+            top_stocks_df = day_data.nlargest(self.top_n, 'total_score')
+            selected_stocks = top_stocks_df[self.stock_col].tolist()
+            
+            if not selected_stocks:
+                continue
+                
+            # 4. 计算权重 (波动率倒数加权)
+            # 假设 vol_20 存在，否则用等权
+            weights = {}
+            if 'vol_20' in top_stocks_df.columns:
+                inv_vol = 1.0 / top_stocks_df['vol_20'].replace(0, 0.01)
+                vol_sum = inv_vol.sum()
+                if vol_sum > 0:
+                    for stock, iv in zip(selected_stocks, inv_vol):
+                        weights[stock] = iv / vol_sum
+                else:
+                    # 回退等权
+                    weight_each = 1.0 / len(selected_stocks)
+                    weights = {s: weight_each for s in selected_stocks}
+            else:
+                 weight_each = 1.0 / len(selected_stocks)
+                 weights = {s: weight_each for s in selected_stocks}
+            
+            # 5. 填充到权重矩阵
+            for stock, w in weights.items():
+                if stock in target_weights.columns:
+                    target_weights.loc[date, stock] = w
+                    
+        # 填充非调仓日的权重（向前填充，模拟持有）
+        target_weights = target_weights.ffill().fillna(0.0)
+        
+        return target_weights
 
 
 class MultiFactorStrategy(BaseStrategy):
@@ -640,9 +820,10 @@ class MultiFactorStrategy(BaseStrategy):
     多因子选股策略
     
     基于价值、质量和动量因子的综合打分进行选股。
-    每月最后一个交易日进行调仓，选取得分最高的 Top N 只股票。
     
-    打分公式: Total_Score = 0.4 * Value_Z + 0.4 * Quality_Z + 0.2 * Momentum_Z
+    打分公式 (默认): 
+    Final_Score = Quality_Weight * Quality_Z + Momentum_Weight * Momentum_Z + Size_Weight * Size_Z
+    (+ Sentiment_Score * Sentiment_Weight if enabled)
     
     Parameters
     ----------
@@ -650,14 +831,12 @@ class MultiFactorStrategy(BaseStrategy):
         策略名称
     config : Optional[Dict[str, Any]]
         配置参数，包含：
-        - value_weight: 价值因子权重，默认0.4
-        - quality_weight: 质量因子权重，默认0.4
-        - momentum_weight: 动量因子权重，默认0.2
-        - top_n: 选取股票数量，默认30
-        - min_listing_days: 最小上市天数，默认126（约6个月）
-        - value_col: 价值因子列名
-        - quality_col: 质量因子列名
-        - momentum_col: 动量因子列名
+        - value_weight: 价值因子权重 (默认 0.0)
+        - quality_weight: 质量因子权重 (默认 0.3)
+        - momentum_weight: 动量因子权重 (默认 0.7)
+        - size_weight: 市值因子权重 (默认 0.0)
+        - top_n: 选取股票数量
+        - momentum_col: 动量因子列名 (默认 sharpe_20_zscore)
     
     Attributes
     ----------
@@ -706,15 +885,15 @@ class MultiFactorStrategy(BaseStrategy):
         # - value_weight: 借用位置放小市值因子
         # - quality_weight: 借用位置放换手率因子
         # - momentum_weight: RSI 动量因子
-        # - size_weight: 独立的小市值因子权重（新增）
+        # - size_weight: 独立的小市值因子权重
         self.value_weight: float = self.config.get("value_weight", 0.0)
         self.quality_weight: float = self.config.get("quality_weight", 0.3)
-        self.momentum_weight: float = self.config.get("momentum_weight", 0.4)
-        self.size_weight: float = self.config.get("size_weight", 0.3)  # 新增：市值因子权重
-        self.sentiment_weight: float = self.config.get("sentiment_weight", 0.3)  # 情绪进攻型权重
+        self.momentum_weight: float = self.config.get("momentum_weight", 0.7)
+        self.size_weight: float = self.config.get("size_weight", 0.0)  # 默认移除市值因子
+        self.sentiment_weight: float = self.config.get("sentiment_weight", 0.2)  # 情绪进攻型权重
         
         # 选股参数配置
-        self.top_n: int = self.config.get("top_n", 30)
+        self.top_n: int = self.config.get("top_n", 5)  # 默认激进持仓 5 只
         
         # 30万小资金账户适配：最大持仓数量限制为 8
         MAX_POSITIONS_LIMIT = 8
@@ -733,9 +912,9 @@ class MultiFactorStrategy(BaseStrategy):
         
         # 因子列名配置（支持自定义列名）
         self.value_col: str = self.config.get("value_col", "value_zscore")
-        self.quality_col: str = self.config.get("quality_col", "quality_zscore")
-        self.momentum_col: str = self.config.get("momentum_col", "momentum_zscore")
-        self.size_col: str = self.config.get("size_col", "small_cap_zscore")  # 新增：市值因子列名
+        self.quality_col: str = self.config.get("quality_col", "turnover_5d_zscore")
+        self.momentum_col: str = self.config.get("momentum_col", "sharpe_20_zscore")  # 默认夏普动量
+        self.size_col: str = self.config.get("size_col", "small_cap_zscore")
         
         # 日期和股票列名配置
         self.date_col: str = self.config.get("date_col", "date")
@@ -749,6 +928,21 @@ class MultiFactorStrategy(BaseStrategy):
         # 仅当 |w_new - w_old| > buffer_threshold 时才调整仓位
         # 例：5%缓冲区 = 30万 * 5% = 1.5万，按万三计算佣金4.5元，不足最低5元
         self.rebalance_buffer: float = self.config.get("rebalance_buffer", 0.05)
+        
+        # ===== [NEW] 持股惯性加分（Holding Bonus）=====
+        # 当前持仓股票在选股时获得的得分加成（单位：标准差）
+        # 作用：减少不必要的换手，让优质股票有更长的持有周期
+        # 值越大，越倾向于持有当前股票
+        self.holding_bonus: float = self.config.get("holding_bonus", 0.0)
+        
+        # ===== [NEW] 大盘风控参数（Market Risk Control）=====
+        # 从配置读取，支持动态调整
+        market_risk_config = self.config.get("market_risk", {})
+        self._market_risk_enabled: bool = market_risk_config.get("enabled", True)
+        self._market_risk_ma_period: int = market_risk_config.get("ma_period", 60)
+        self._market_risk_drop_threshold: float = market_risk_config.get("drop_threshold", 0.05)
+        self._market_risk_drop_lookback: int = market_risk_config.get("drop_lookback", 20)
+        
         if self.rebalance_frequency not in ("monthly", "weekly"):
             logger.warning(
                 f"不支持的调仓频率 '{self.rebalance_frequency}'，使用默认 'monthly'"
@@ -770,6 +964,15 @@ class MultiFactorStrategy(BaseStrategy):
         self._min_confidence: float = self._llm_config.get("min_confidence", 0.7)
         self._sentiment_buffer_multiplier: int = self._llm_config.get("sentiment_buffer_multiplier", 3)
         self._sentiment_engine = None
+        
+        # 过热熔断阈值（换手率 Z-Score）
+        # 换手率过高通常意味着短期见顶风险
+        # 适当放宽以适应小盘股的高波动特性 (2.5 -> 3.5)
+        self.turnover_threshold: float = self.config.get("turnover_threshold", 3.5)
+        
+        # 波动率熔断阈值（年化波动率）
+        # 剔除波动率极高的妖股 (新增)
+        self.volatility_threshold: float = self.config.get("volatility_threshold", 1.5)  # 150% 年化波动率
         
         # 初始化情绪分析引擎（如果启用）
         if self._enable_sentiment_filter:
@@ -796,6 +999,7 @@ class MultiFactorStrategy(BaseStrategy):
             f"市值权重={self.size_weight}, 情绪权重={self.sentiment_weight}, "
             f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
             f"再平衡缓冲区={self.rebalance_buffer:.1%}, "
+            f"持股惯性加分={self.holding_bonus:.2f}, "
             f"情绪过滤={'启用' if self._enable_sentiment_filter else '禁用'}"
         )
     
@@ -1092,6 +1296,9 @@ class MultiFactorStrategy(BaseStrategy):
         if day_data.empty:
             return day_data
         
+        # [FIX] 定义股票代码列名
+        stock_col = self.stock_col if self.stock_col in day_data.columns else 'symbol'
+        
         initial_count = len(day_data)
         filter_stats = {}  # 记录各过滤条件剔除的数量
         
@@ -1264,6 +1471,16 @@ class MultiFactorStrategy(BaseStrategy):
                 filter_stats['科创板'] = before - len(day_data)
         
         # ==========================================
+        # 过滤条件 10: RSI 过热保护 (RSI > 80)
+        # 在震荡市中，纯动量策略容易死在最高点
+        # ==========================================
+        if 'rsi_20' in day_data.columns:
+            before = len(day_data)
+            rsi_mask = day_data['rsi_20'] > 80
+            day_data = day_data[~rsi_mask]
+            filter_stats['RSI过热'] = before - len(day_data)
+
+        # ==========================================
         # 过滤条件 9: 过热熔断（Turnover Overheat Filter）
         # 换手率 Z-Score > 2.5 直接剔除，不参与后续打分
         # 
@@ -1273,9 +1490,14 @@ class MultiFactorStrategy(BaseStrategy):
         # - 直接剔除比降低分数更安全（硬性风控）
         # ==========================================
         turnover_col = self.quality_col  # 默认 turnover_5d_zscore
-        if turnover_col in day_data.columns:
+        
+        # 恢复过热熔断逻辑（尊重 Config 配置）
+        check_col = turnover_col
+        
+        if check_col in day_data.columns:
             before = len(day_data)
-            overheat_mask = day_data[turnover_col] > self.TURNOVER_OVERHEAT_THRESHOLD
+            # 使用配置中的阈值 (turnover_threshold) 而非写死的 2.5
+            overheat_mask = day_data[check_col] > self.turnover_threshold
             overheat_stocks = day_data[overheat_mask]
             
             if len(overheat_stocks) > 0:
@@ -1291,7 +1513,7 @@ class MultiFactorStrategy(BaseStrategy):
                 overheat_details = []
                 for idx, row in overheat_stocks.iterrows():
                     code = row[stock_col] if stock_col in row.index else idx
-                    zscore = row[turnover_col]
+                    zscore = row[check_col]
                     overheat_details.append(f"{code}({zscore:.2f})")
                 
                 # 剔除过热股票
@@ -1301,12 +1523,12 @@ class MultiFactorStrategy(BaseStrategy):
                 # 输出详细日志
                 logger.warning(
                     f"🔥 过热熔断 {date.strftime('%Y-%m-%d')}: "
-                    f"剔除 {len(overheat_codes)} 只 (turnover_zscore > {self.TURNOVER_OVERHEAT_THRESHOLD}): "
+                    f"剔除 {len(overheat_codes)} 只 (turnover_zscore > {self.turnover_threshold}): "
                     f"{overheat_details[:10]}"  # 最多显示10只
                     + (f"... 等共 {len(overheat_codes)} 只" if len(overheat_codes) > 10 else "")
                 )
         else:
-            logger.debug(f"数据中缺少 '{turnover_col}' 列，跳过过热熔断过滤")
+            logger.debug(f"数据中缺少 '{check_col}' 列，跳过过热熔断过滤")
         
         # ==========================================
         # 注意：情绪分析已移至 _apply_sentiment_filter 方法
@@ -1547,6 +1769,14 @@ class MultiFactorStrategy(BaseStrategy):
         # 第一阶段：技术面初筛（基础得分）
         # ==========================================
         data['base_score'] = self.calculate_total_score(data, sentiment_scores=None)
+        
+        # [NEW] 应用持股惯性加分 - 当前持仓股票获得额外得分
+        if self.holding_bonus > 0 and 'is_holding' in data.columns:
+            holding_mask = data['is_holding'] == True
+            n_holdings = holding_mask.sum()
+            if n_holdings > 0:
+                data.loc[holding_mask, 'base_score'] += self.holding_bonus
+                logger.debug(f"持股惯性加分: {n_holdings} 只持仓股票获得 +{self.holding_bonus:.2f} 加成")
         
         # 剔除得分为 NaN 的股票
         valid_data = data.dropna(subset=['base_score'])
@@ -2411,7 +2641,8 @@ class MultiFactorStrategy(BaseStrategy):
         market_risk_series = pd.Series(False, index=all_dates)
         risk_triggered_days = 0
         
-        if benchmark_data is not None and not benchmark_data.empty:
+        # [FIX] 检查风控是否启用
+        if self._market_risk_enabled and benchmark_data is not None and not benchmark_data.empty:
             try:
                 index_df = benchmark_data.copy()
                 
@@ -2426,11 +2657,12 @@ class MultiFactorStrategy(BaseStrategy):
                 index_df = index_df.sort_index()
                 
                 # ===== 激进版风控：MA60（牛熊线）+ 20日跌幅 =====
-                # 计算60日均线（牛熊线）
-                index_df['ma60'] = index_df['close'].rolling(window=60).mean()
+                # 计算60日均线（牛熊线）- 从配置读取周期
+                ma_period = self._market_risk_ma_period
+                index_df['ma60'] = index_df['close'].rolling(window=ma_period).mean()
                 
-                # 计算20天前跌幅
-                drop_lookback = 20
+                # 计算跌幅 - 从配置读取回溯天数
+                drop_lookback = self._market_risk_drop_lookback
                 index_df['drop_20d'] = (
                     index_df['close'] - index_df['close'].shift(drop_lookback)
                 ) / index_df['close'].shift(drop_lookback)
@@ -2439,9 +2671,9 @@ class MultiFactorStrategy(BaseStrategy):
                 aligned_index = index_df.reindex(all_dates, method='ffill')
                 
                 # ===== 激进版风控条件 =====
-                # (Close < MA60) AND (20日跌幅 > 5%)
-                # 只有确认暴跌趋势时才触发熔断
-                drop_threshold = -0.05  # 20日跌幅阈值（-5%）
+                # (Close < MA60) AND (20日跌幅 > threshold%)
+                # 只有确认暴跌趋势时才触发熔断 - 从配置读取阈值
+                drop_threshold = -self._market_risk_drop_threshold
                 
                 condition_below_ma60 = aligned_index['close'] < aligned_index['ma60']
                 condition_crash = aligned_index['drop_20d'] < drop_threshold
@@ -2450,7 +2682,8 @@ class MultiFactorStrategy(BaseStrategy):
                 risk_triggered_days = market_risk_series.sum()
                 
                 logger.info(
-                    f"大盘风控已启用（激进版）: (Close < MA60) AND (20日跌幅 < {drop_threshold:.0%}), "
+                    f"大盘风控已启用（激进版）: (Close < MA{ma_period}) AND "
+                    f"({drop_lookback}日跌幅 < {drop_threshold:.0%}), "
                     f"预计触发 {risk_triggered_days} 天"
                 )
                 
@@ -2511,6 +2744,14 @@ class MultiFactorStrategy(BaseStrategy):
                 filtered_data = self.filter_stocks(factor_data, date)
                 
                 if not filtered_data.empty:
+                    # [NEW] 添加持股惯性标记 - 当前持仓股票获得选股加分
+                    current_holding_set = set(current_weights.keys()) if current_weights else set()
+                    filtered_data = filtered_data.copy()
+                    if stock_col in filtered_data.columns:
+                        filtered_data['is_holding'] = filtered_data[stock_col].isin(current_holding_set)
+                    else:
+                        filtered_data['is_holding'] = False
+                    
                     # Step 2.1: 获取扩展候选列表（Top N * buffer）
                     buffer_n = self.top_n * self._sentiment_buffer_multiplier
                     pre_candidates = self.select_top_stocks(filtered_data, n=buffer_n)

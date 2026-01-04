@@ -671,6 +671,15 @@ class TechnicalFeatures(FeatureEngine):
             "kdj_k": lambda df: self.kdj(df["high"], df["low"], df["close"])[0],
             "kdj_d": lambda df: self.kdj(df["high"], df["low"], df["close"])[1],
             "kdj_j": lambda df: self.kdj(df["high"], df["low"], df["close"])[2],
+            # [Added] 波动率因子 - 用于风控过滤
+            "vol_20": lambda df: self.volatility(df["close"], 20),
+            # [Added] 特质波动率 (IVOL) - 捕捉纯粹风险
+            "ivol_20": lambda df: self.calculate_ivol(20),
+            # [Added] 高级因子：夏普动量 & 路径效率
+            "sharpe_20": lambda df: self.rolling_sharpe(df["close"], 20),
+            "efficiency_20": lambda df: self.path_efficiency(df["close"], 20),
+            # [Added] 威廉指标 - 用于超买超卖判断
+            "williams_r_14": lambda df: self.williams_r(df["high"], df["low"], df["close"], 14),
         }
     
     def calculate(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -699,6 +708,66 @@ class TechnicalFeatures(FeatureEngine):
         logger.info(f"技术指标计算完成，共 {len(self._features)} 个因子")
         return result
     
+    @staticmethod
+    def rolling_sharpe(series: pd.Series, period: int = 20) -> pd.Series:
+        """
+        滚动夏普比率 (Rolling Sharpe Ratio)
+        
+        衡量单位波动风险下的超额收益（假设无风险利率为0简化计算）。
+        相比纯动量，更偏好稳健上涨的股票。
+        
+        Parameters
+        ----------
+        series : pd.Series
+            价格序列
+        period : int
+            计算周期
+        
+        Returns
+        -------
+        pd.Series
+            年化夏普比率
+        """
+        returns = series.pct_change()
+        # min_periods 设为 period 的一半，保证初期有数据
+        mean = returns.rolling(window=period, min_periods=period//2).mean()
+        std = returns.rolling(window=period, min_periods=period//2).std()
+        
+        # 避免除以零
+        sharpe = (mean / std.replace(0, np.nan)) * np.sqrt(252)
+        return sharpe
+
+    @staticmethod
+    def path_efficiency(series: pd.Series, period: int = 20) -> pd.Series:
+        """
+        路径效率 (Path Efficiency / Efficiency Ratio)
+        
+        衡量价格走势的平滑程度。
+        ER = Net Change / Sum of Absolute Changes
+        ER 接近 1 表示单边趋势极强且平滑；ER 接近 0 表示震荡。
+        
+        Parameters
+        ----------
+        series : pd.Series
+            价格序列
+        period : int
+            计算周期
+        
+        Returns
+        -------
+        pd.Series
+            效率系数 (0-1)
+        """
+        # 净变动幅度
+        net_change = (series - series.shift(period)).abs()
+        
+        # 每日变动幅度的总和
+        sum_abs_change = series.diff().abs().rolling(window=period, min_periods=period//2).sum()
+        
+        # 避免除以零
+        er = net_change / sum_abs_change.replace(0, np.nan)
+        return er
+
     @staticmethod
     def sma(series: pd.Series, period: int) -> pd.Series:
         """
@@ -1804,6 +1873,14 @@ class FactorCalculator:
         except Exception as e:
             logger.warning(f"ROC_20 因子计算失败: {e}")
             result['roc_20'] = np.nan
+            
+        # [Added] 新增：Sharpe_20 夏普动量因子
+        try:
+            result['sharpe_20'] = TechnicalFeatures.rolling_sharpe(result['close'], period=20)
+            logger.info("Sharpe_20 因子计算完成")
+        except Exception as e:
+            logger.warning(f"Sharpe_20 因子计算失败: {e}")
+            result['sharpe_20'] = np.nan
         
         try:
             result['ivol'] = self.calculate_ivol(period=20)

@@ -220,6 +220,10 @@ class DailyUpdateRunner:
                 # 调仓配置
                 "rebalance_frequency": strategy_config.get("rebalance_frequency", "weekly"),
                 "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.02),
+                # [NEW] 持股惯性加分
+                "holding_bonus": strategy_config.get("holding_bonus", 0.0),
+                # [NEW] 大盘风控配置
+                "market_risk": self.config.get("risk", {}).get("market_risk", {}),
                 # LLM 情绪分析配置
                 "llm": llm_config,
             }
@@ -1251,13 +1255,35 @@ class DailyUpdateRunner:
             factor_data['ivol'] = factor_data.groupby('stock_code')['close'].transform(
                 lambda x: x.pct_change().rolling(20).std() * np.sqrt(252)
             )
+            # 重命名为与回测一致的列名
+            factor_data['ivol_20'] = factor_data['ivol']
+            
+            # 7. Sharpe 动量因子（核心动量因子）
+            # sharpe_20 = 20日收益 / 20日波动率
+            def _calc_sharpe(close_series: pd.Series, period: int) -> pd.Series:
+                """计算 Sharpe 风格动量因子"""
+                returns = close_series.pct_change()
+                mean_ret = returns.rolling(period, min_periods=max(5, period // 2)).mean()
+                std_ret = returns.rolling(period, min_periods=max(5, period // 2)).std()
+                # 避免除零
+                sharpe = mean_ret / (std_ret + 1e-8)
+                return sharpe
+            
+            factor_data['sharpe_20'] = factor_data.groupby('stock_code')['close'].transform(
+                lambda x: _calc_sharpe(x, 20)
+            )
+            factor_data['sharpe_60'] = factor_data.groupby('stock_code')['close'].transform(
+                lambda x: _calc_sharpe(x, 60)
+            )
+            self.logger.debug(f"Sharpe 因子计算完成: sharpe_20 有效率 {factor_data['sharpe_20'].notna().mean():.1%}, sharpe_60 有效率 {factor_data['sharpe_60'].notna().mean():.1%}")
             
             # ==================== Z-Score 标准化 ====================
             date_col = 'date' if 'date' in factor_data.columns else 'trade_date'
             
             # 对所有计算的因子进行 Z-Score 标准化
             factor_cols_to_normalize = [
-                'rsi_20', 'roc_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability'
+                'rsi_20', 'roc_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability',
+                'ivol_20', 'sharpe_20', 'sharpe_60'  # 新增因子
             ]
             # 只标准化存在且有效的因子列
             valid_factor_cols = [
@@ -1286,6 +1312,31 @@ class DailyUpdateRunner:
                 self.logger.info(f"已标准化因子（行业中性化）: {valid_factor_cols}")
             else:
                 self.logger.info(f"已标准化因子（市场中性化）: {valid_factor_cols}")
+            
+            # ==================== 因子别名映射 ====================
+            # 将标准化后的因子映射到策略配置使用的列名
+            # 策略配置中可能使用 sharpe_60_zscore, ivol_zscore, value_zscore 等
+            factor_alias_mapping = {
+                # 动量因子别名
+                'sharpe_20_zscore': 'sharpe_20_zscore',
+                'sharpe_60_zscore': 'sharpe_60_zscore',
+                'momentum_zscore': 'roc_20_zscore',  # 默认动量因子
+                # 质量因子别名
+                'ivol_zscore': 'ivol_20_zscore',  # 低波动质量因子
+                'quality_zscore': 'roe_stability_zscore',  # 默认质量因子
+                'turnover_5d_zscore': 'turnover_5d_zscore',
+                # 价值因子别名
+                'value_zscore': 'ep_ttm_zscore',
+                # 小市值因子别名
+                'size_zscore': 'small_cap_zscore',
+            }
+            
+            for alias, source in factor_alias_mapping.items():
+                if source in factor_data.columns and alias not in factor_data.columns:
+                    factor_data[alias] = factor_data[source]
+                    self.logger.debug(f"创建因子别名: {alias} <- {source}")
+            
+            self.logger.info(f"因子别名映射完成，可用因子列: {[c for c in factor_data.columns if c.endswith('_zscore')]}")
             
             self.factor_data = factor_data
             
@@ -2701,6 +2752,22 @@ def _generate_backtest_factor_data(
         # 计算 RSI_20
         rsi_20 = calculate_rsi(df['close'], period=20)
         
+        # 计算 Sharpe_20 (新动量因子)
+        # 滚动年化夏普比率 = (mean(returns) / std(returns)) * sqrt(252)
+        sharpe_20 = pd.Series(np.nan, index=df.index)
+        sharpe_60 = pd.Series(np.nan, index=df.index)
+        if 'close' in df.columns:
+            returns = df['close'].pct_change()
+            # min_periods=10: 至少需要半个窗口的数据
+            mean_ret = returns.rolling(20, min_periods=10).mean()
+            std_ret = returns.rolling(20, min_periods=10).std()
+            sharpe_20 = (mean_ret / std_ret.replace(0, np.nan)) * np.sqrt(252)
+            
+            # [NEW] Sharpe_60: 更平滑的长周期动量因子
+            mean_ret_60 = returns.rolling(60, min_periods=30).mean()
+            std_ret_60 = returns.rolling(60, min_periods=30).std()
+            sharpe_60 = (mean_ret_60 / std_ret_60.replace(0, np.nan)) * np.sqrt(252)
+
         # 计算 ROC_20 (动量因子)
         roc_20 = pd.Series(np.nan, index=df.index)
         if 'close' in df.columns:
@@ -2712,6 +2779,14 @@ def _generate_backtest_factor_data(
         if 'turnover' in df.columns:
             turnover_5d = df['turnover'].rolling(5, min_periods=1).mean()
         
+        # [Added] 预计算 IVOL_20 (特质波动率)
+        ivol_20 = pd.Series(np.nan, index=df.index)
+        if 'close' in df.columns:
+             # 计算日收益率
+             daily_ret = df['close'].pct_change()
+             # 滚动标准差 * 年化因子
+             ivol_20 = daily_ret.rolling(20, min_periods=5).std() * np.sqrt(252)
+
         # 获取财务数据（作为优先使用的静态市值）
         fin_data = financial_map.get(stock_code, {})
         static_circ_mv = fin_data.get('circ_mv', np.nan)
@@ -2763,11 +2838,19 @@ def _generate_backtest_factor_data(
             else:
                 small_cap = np.nan
             
+            # 计算 ROE 稳定性（简化版：用 PE 的倒数作为 ROE 代理，计算其波动率）
+            # 注意：准确的 roe_stability 需要季度财务数据，这里仅作占位
+            # 实际生产中应在 data_loader 加载完整的季度 ROE 数据
+            roe_proxy = ep_ttm  # 假设 EP ≈ ROE (在 PB=1 时成立)
+            roe_stability = roe_proxy if pd.notna(roe_proxy) else 0.0
+            
             factor_records.append({
                 'date': date,
                 'stock_code': stock_code,
                 'close': close_price,
                 'rsi_20': rsi_val,
+                'sharpe_20': sharpe_20.get(date, np.nan) if date in sharpe_20.index else np.nan,
+                'sharpe_60': sharpe_60.get(date, np.nan) if date in sharpe_60.index else np.nan,
                 'roc_20': roc_20.get(date, np.nan) if date in roc_20.index else np.nan,
                 'turnover_5d': turnover_val,
                 # 小市值因子（核心）
@@ -2775,7 +2858,10 @@ def _generate_backtest_factor_data(
                 'circ_mv': circ_mv,
                 # 价值因子
                 'ep_ttm': ep_ttm,
-                'roe_stability': np.nan,  # 需要更多财务数据
+                # 质量因子 (新增)
+                'roe_stability': roe_stability,
+                # 新增因子：特质波动率 (IVOL)
+                'ivol_20': ivol_20.get(date, np.nan) if date in ivol_20.index else np.nan, 
                 # 估算上市天数（默认足够长以通过过滤）
                 'listing_days': 1000,
                 # 涨跌停标志（简化：默认无涨跌停）
@@ -2804,13 +2890,34 @@ def _generate_backtest_factor_data(
     
     # 计算 RSI Z-Score（动量因子）
     factor_df['momentum_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-        lambda g: zscore_by_date(g, 'rsi_20')
+        lambda g: zscore_by_date(g, 'rsi_20'), include_groups=False
     ).reset_index(level=0, drop=True)
     
-    # 计算 ROC_20 Z-Score (真正的动量因子)
+    # [Added] 计算 Sharpe_20 Z-Score (新的核心动量因子)
+    if 'sharpe_20' in factor_df.columns:
+        factor_df['sharpe_20_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'sharpe_20'), include_groups=False
+        ).reset_index(level=0, drop=True)
+        logger.info(f"sharpe_20_zscore 生成完成，有效率: {factor_df['sharpe_20_zscore'].notna().mean():.1%}")
+    else:
+        # 如果 features.py 还没计算 sharpe_20，则尝试计算它（针对回测模式因子未更新的情况）
+        logger.warning("Warning: 'sharpe_20' not found in features, skipping z-score calculation")
+        factor_df['sharpe_20_zscore'] = np.nan
+
+    # [NEW] 计算 Sharpe_60 Z-Score (长周期动量因子 - 更稳定)
+    if 'sharpe_60' in factor_df.columns:
+        factor_df['sharpe_60_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+            lambda g: zscore_by_date(g, 'sharpe_60'), include_groups=False
+        ).reset_index(level=0, drop=True)
+        logger.info(f"sharpe_60_zscore 生成完成，有效率: {factor_df['sharpe_60_zscore'].notna().mean():.1%}")
+    else:
+        factor_df['sharpe_60_zscore'] = np.nan
+        logger.warning("Warning: 'sharpe_60' not found, long-term momentum unavailable")
+
+    # 计算 ROC_20 Z-Score (兼容旧版动量因子)
     if 'roc_20' in factor_df.columns:
         factor_df['roc_20_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-            lambda g: zscore_by_date(g, 'roc_20')
+            lambda g: zscore_by_date(g, 'roc_20'), include_groups=False
         ).reset_index(level=0, drop=True)
         logger.info(f"roc_20_zscore 生成完成，有效率: {factor_df['roc_20_zscore'].notna().mean():.1%}")
     else:
@@ -2823,18 +2930,43 @@ def _generate_backtest_factor_data(
     # 计算 Small Cap Z-Score（小市值因子）
     if has_valid_small_cap:
         factor_df['small_cap_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-            lambda g: zscore_by_date(g, 'small_cap')
+            lambda g: zscore_by_date(g, 'small_cap'), include_groups=False
         ).reset_index(level=0, drop=True)
         
         # 计算换手率 Z-Score
         factor_df['turnover_5d_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-            lambda g: zscore_by_date(g, 'turnover_5d')
+            lambda g: zscore_by_date(g, 'turnover_5d'), include_groups=False
         ).reset_index(level=0, drop=True)
         
+        # [Added] 计算 ROE 稳定性 Z-Score (新的质量因子)
+        # 如果财务数据中包含 roe_stability (需在 features.py 计算)，这里进行标准化
+        if 'roe_stability' in factor_df.columns:
+            factor_df['roe_stability_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+                lambda g: zscore_by_date(g, 'roe_stability'), include_groups=False
+            ).reset_index(level=0, drop=True)
+        else:
+            # 如果上游未计算 roe_stability，暂时用 roe (ep_ttm的倒数近似) 或设为 0
+            # 这里为了不报错，先设为 0，后续需在 features.py 确保计算
+            factor_df['roe_stability_zscore'] = 0.0
+            logger.warning("Warning: 'roe_stability' not found, quality factor set to 0")
+
+        # [Added] 计算 IVOL Z-Score (低波因子)
+        # IVOL 越低越好，因此取负号
+        if 'ivol_20' in factor_df.columns:
+             # 注意：IVOL可能为0或NaN，需要处理
+            factor_df['ivol_20'] = factor_df['ivol_20'].replace(0, np.nan)
+            factor_df['ivol_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+                lambda g: zscore_by_date(g, 'ivol_20'), include_groups=False
+            ).reset_index(level=0, drop=True)
+            # 反转因子方向：波动率越低分越高
+            factor_df['ivol_zscore'] = -factor_df['ivol_zscore']
+        else:
+            factor_df['ivol_zscore'] = 0.0
+
         # 计算价值因子 Z-Score（需要财务数据）
         if has_financial:
             factor_df['value_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-                lambda g: zscore_by_date(g, 'ep_ttm')
+                lambda g: zscore_by_date(g, 'ep_ttm'), include_groups=False
             ).reset_index(level=0, drop=True)
         else:
             factor_df['value_zscore'] = np.nan
@@ -3000,6 +3132,22 @@ def run_backtest(
                 stock_list = data_loader.get_hs300_constituents()
         elif stock_pool == "hs300":
             stock_list = data_loader.get_hs300_constituents()
+        elif stock_pool == "zz1000":
+            # 获取中证1000成分股
+            try:
+                import akshare as ak
+                df = ak.index_stock_cons(symbol="000852")
+                if df is not None and not df.empty:
+                    code_col = next((c for c in df.columns if '代码' in c), None)
+                    if code_col:
+                        stock_list = df[code_col].tolist()
+                        logger.info(f"获取中证1000成分股成功，共 {len(stock_list)} 只")
+            except Exception as e:
+                logger.warning(f"获取中证1000成分股失败: {e}")
+                
+            if not stock_list:
+                logger.warning("无法获取中证1000成分股，尝试从本地缓存加载或使用示例股票")
+                # TODO: 实现本地缓存加载逻辑
         else:
             stock_list = data_loader.get_hs300_constituents()
         
@@ -3018,16 +3166,71 @@ def run_backtest(
         start_fmt = start_date.replace("-", "")
         end_fmt = end_date.replace("-", "")
         
+        # [OPTIMIZED] 优先从本地缓存加载数据
+        # 路径: data/lake/daily/{stock}.parquet
+        local_cache_dir = Path("data/lake/daily")
+        loaded_from_cache = 0
+        
         for i, stock in enumerate(stock_list):
+            df = None
             try:
-                df = data_loader.fetch_daily_price(stock, start_fmt, end_fmt)
+                # 1. 尝试读取本地缓存
+                cache_file = local_cache_dir / f"{stock}.parquet"
+                if cache_file.exists():
+                    try:
+                        cached_df = pd.read_parquet(cache_file)
+                        
+                        # 处理日期：可能在 'date' 列或作为 index
+                        if 'date' not in cached_df.columns:
+                            # 日期可能是 index，尝试 reset_index
+                            if isinstance(cached_df.index, pd.DatetimeIndex):
+                                cached_df = cached_df.reset_index()
+                                cached_df.columns = ['date'] + list(cached_df.columns[1:])
+                            elif cached_df.index.name == 'date' or cached_df.index.name == 'trade_date':
+                                cached_df = cached_df.reset_index()
+                        
+                        # 确保 date 列存在
+                        if not cached_df.empty and 'date' in cached_df.columns:
+                            cached_df['date'] = pd.to_datetime(cached_df['date'])
+                            cache_start = cached_df['date'].min()
+                            cache_end = cached_df['date'].max()
+                            req_start = pd.to_datetime(start_date)
+                            req_end = pd.to_datetime(end_date)
+                            
+                            # [FIX] 放宽日期检查：允许 7 天的误差（处理节假日和数据延迟）
+                            # 因为实际交易日可能比日历日少
+                            tolerance = pd.Timedelta(days=7)
+                            if cache_start <= req_start and cache_end >= (req_end - tolerance):
+                                # 筛选时间段
+                                df = cached_df[(cached_df['date'] >= req_start) & (cached_df['date'] <= cache_end)].copy()
+                                if not df.empty:
+                                    df = df.set_index('date').sort_index()
+                                    loaded_from_cache += 1
+                    except Exception as e:
+                        logger.debug(f"读取本地缓存 {stock} 失败: {e}")
+
+                # 2. 如果本地没有或不满足，则下载
+                if df is None or df.empty:
+                    df = data_loader.fetch_daily_price(stock, start_fmt, end_fmt)
+                    
+                    # [NEW] 下载成功后保存到本地缓存
+                    if df is not None and not df.empty:
+                        try:
+                            local_cache_dir.mkdir(parents=True, exist_ok=True)
+                            # 保存时将 index 转为 date 列
+                            save_df = df.reset_index()
+                            save_df.columns = ['date'] + list(save_df.columns[1:])
+                            save_df.to_parquet(cache_file, index=False)
+                        except Exception as e:
+                            logger.debug(f"保存缓存 {stock} 失败: {e}")
+                
                 if df is not None and not df.empty:
                     price_data_dict[stock] = df
             except Exception as e:
                 logger.debug(f"获取 {stock} 数据失败: {e}")
             
-            if (i + 1) % 20 == 0:
-                logger.info(f"数据加载进度: {i + 1}/{len(stock_list)}")
+            if (i + 1) % 100 == 0:
+                logger.info(f"数据加载进度: {i + 1}/{len(stock_list)} (缓存命中: {loaded_from_cache})")
         
         if not price_data_dict:
             logger.error("未获取到任何历史数据")
@@ -3192,6 +3395,10 @@ def run_backtest(
                     "min_listing_days": strategy_config.get("min_listing_days", 126),
                     "rebalance_frequency": strategy_config.get("rebalance_frequency", "monthly"),
                     "rebalance_buffer": strategy_config.get("rebalance_buffer", 0.05),
+                    # [NEW] 持股惯性加分
+                    "holding_bonus": strategy_config.get("holding_bonus", 0.0),
+                    # [NEW] 大盘风控配置（从 risk 部分读取）
+                    "market_risk": config.get("risk", {}).get("market_risk", {}),
                     # 因子列名配置
                     "value_col": value_col,
                     "quality_col": strategy_config.get("quality_col", "quality_zscore"),
