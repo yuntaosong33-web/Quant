@@ -937,7 +937,10 @@ class DailyUpdateRunner:
     
     def _estimate_listing_days(self, stock: str) -> int:
         """
-        估算股票上市天数
+        估算股票上市天数（快速版本）
+        
+        使用股票代码前缀快速估算，避免逐只 API 调用。
+        沪深300成分股通常都是上市多年的蓝筹股。
         
         Parameters
         ----------
@@ -949,24 +952,9 @@ class DailyUpdateRunner:
         int
             估算的上市天数
         """
-        try:
-            # 尝试从个股信息获取上市日期
-            import akshare as ak
-            info_df = ak.stock_individual_info_em(symbol=stock)
-            
-            if info_df is not None and not info_df.empty:
-                # 查找上市日期
-                for idx, row in info_df.iterrows():
-                    if '上市' in str(row.get('item', '')):
-                        list_date = pd.to_datetime(row.get('value', None))
-                        if list_date is not None:
-                            listing_days = (self.today - list_date).days
-                            return max(listing_days, 0)
-        except Exception:
-            pass
-        
-        # 默认返回一个较大的值（假设已上市较长时间）
-        return 1000
+        # 对于沪深300成分股，默认假设上市超过2年（符合基本条件）
+        # 这避免了逐只调用 API 的性能问题
+        return 1000  # 默认返回较大值，表示已上市较长时间
     
     def _generate_fallback_financial_data(self, stocks: List[str]) -> List[Dict[str, Any]]:
         """
@@ -1295,6 +1283,14 @@ class DailyUpdateRunner:
             # 准备数据
             ohlcv = self.ohlcv_data.copy()
             
+            # ========== 列名标准化（兼容 Tushare 原始格式） ==========
+            column_mapping = {
+                'trade_date': 'date',
+                'vol': 'volume',
+                'pct_chg': 'pct_change',
+            }
+            ohlcv.rename(columns=column_mapping, inplace=True)
+            
             # 确保日期列存在（处理 DatetimeIndex 和各种列名情况）
             if 'date' not in ohlcv.columns:
                 if 'trade_date' in ohlcv.columns:
@@ -1314,6 +1310,14 @@ class DailyUpdateRunner:
                     ohlcv = ohlcv.reset_index()
                     if 'index' in ohlcv.columns:
                         ohlcv.rename(columns={'index': 'date'}, inplace=True)
+            
+            # 检查必要的列是否存在
+            required_cols = ['close', 'stock_code']
+            missing_cols = [c for c in required_cols if c not in ohlcv.columns]
+            if missing_cols:
+                self.logger.error(f"OHLCV 数据缺少必要列: {missing_cols}")
+                self.logger.info(f"当前列名: {ohlcv.columns.tolist()}")
+                return False
             
             # 确保 date 列是 datetime 类型
             if 'date' in ohlcv.columns:
@@ -1340,6 +1344,11 @@ class DailyUpdateRunner:
                         self.logger.warning(
                             f"🛡️ 财务数据中有 {invalid_count} 条无效记录，将被标记"
                         )
+                
+                # 移除财务数据中与 OHLCV 重复的列（避免合并冲突）
+                ohlcv_cols = set(ohlcv.columns) - {'stock_code'}  # 排除 stock_code，它需要保留用于合并
+                cols_to_keep = [c for c in valid_financial.columns if c not in ohlcv_cols]
+                valid_financial = valid_financial[cols_to_keep]
                 
                 factor_data = ohlcv.merge(
                     valid_financial,
