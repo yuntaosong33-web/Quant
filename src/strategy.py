@@ -2265,8 +2265,27 @@ class MultiFactorStrategy(BaseStrategy):
         end_date : Optional[pd.Timestamp]
             结束日期
         current_holdings_weights : Optional[Dict[str, float]]
-            当前持仓权重字典，用于再平衡缓冲区计算。
+            当前持仓权重字典，用于懒惰再平衡计算。
             如果为 None，则使用前一日的目标权重。
+            
+            **⚠️ 重要警告 - Drifted Weights 要求**：
+            
+            此参数必须传入 **漂移后权重（Drifted Weights）**，即：
+            
+            ``weight[stock] = (最新收盘价 × 持仓股数) / 当前总资产``
+            
+            **错误用法**：直接传入上期目标权重（Target Weights）
+            
+            **原因**：懒惰再平衡的核心思想是"Let profits run"（让盈利奔跑）。
+            如果某只股票大涨，其市值权重会自然漂移增大，我们应该保持这个
+            增大后的权重，而不是强行卖出盈利部分回归到上期目标权重。
+            
+            **示例**：
+            - 上期目标权重：A股 20%, B股 20%, C股 20%, D股 20%, E股 20%
+            - A股大涨50%后漂移权重：A股 26.7%, B股 18.3%, C股 18.3%, D股 18.3%, E股 18.3%
+            - 正确：传入漂移权重 → A股保持26.7%，不产生交易
+            - 错误：传入目标权重 → 系统会卖出A股6.7%的仓位，违背动量原则
+            
         rebalance_threshold : Optional[float]
             再平衡阈值，默认使用 self.rebalance_buffer (5%)。
             仅当 |new_weight - current_weight| > 阈值时才调整该股票仓位。
@@ -2309,6 +2328,22 @@ class MultiFactorStrategy(BaseStrategy):
         - 条件：(Close < MA60) AND (20日跌幅 < -5%)
         - 触发时：强制清空所有仓位
         - 目的：规避系统性下跌风险
+        
+        **⚠️ Drifted Weights 与动量策略的关系**：
+        
+        懒惰再平衡的核心哲学是 "Let profits run, cut losses short"。
+        当传入正确的漂移后权重时：
+        
+        - 盈利股票的权重自然增大 → 保持增大后的权重 → 让利润奔跑
+        - 亏损股票的权重自然缩小 → 保持缩小后的权重 → 减少损失敞口
+        
+        这与动量策略的理念高度一致：强者恒强，弱者恒弱。
+        
+        **计算 Drifted Weights 的公式**::
+        
+            for stock, shares in current_positions.items():
+                market_value = latest_price[stock] * shares
+                drifted_weight[stock] = market_value / total_portfolio_value
         
         Examples
         --------
@@ -2544,6 +2579,29 @@ class MultiFactorStrategy(BaseStrategy):
                             final_weights: Dict[str, float] = {}
                             
                             # Step 1: 继续持有的股票 - 沿用当前权重，不产生任何交易
+                            # 
+                            # ⚠️ 关键假设：current_weights 必须是 Drifted Weights（漂移后权重）
+                            # 
+                            # Drifted Weights = (当前股价 × 持仓股数) / 当前总资产
+                            # 
+                            # 为什么需要 Drifted Weights？
+                            # ────────────────────────────
+                            # 动量策略核心：Let profits run（让盈利奔跑）
+                            # 
+                            # 场景：A股大涨50%
+                            # - 上期目标权重：20%
+                            # - 漂移后权重：26.7%（因涨幅自然增大）
+                            # 
+                            # 如果传入上期目标权重（20%）：
+                            #   → 系统会卖出6.7%仓位，把盈利部分变现
+                            #   → 违背"让盈利奔跑"的动量原则 ❌
+                            # 
+                            # 如果传入漂移后权重（26.7%）：
+                            #   → 保持26.7%权重不变，不产生交易
+                            #   → 符合动量策略，强者恒强 ✅
+                            # 
+                            # 调用方责任：确保传入的是基于最新价格计算的真实权重！
+                            # 
                             for stock in continuing_stocks:
                                 final_weights[stock] = current_weights[stock]
                                 skipped_adjustments += 1  # 记录跳过的调整次数
