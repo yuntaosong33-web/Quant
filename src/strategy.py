@@ -1006,13 +1006,16 @@ class MultiFactorStrategy(BaseStrategy):
     
     # ===== 小资金实盘优化：流动性与可交易性过滤常量 =====
     # 最低日成交额（元），低于此值的股票流动性不足
-    MIN_DAILY_AMOUNT = 20_000_000  # 2000万
+    # 中证1000尾部股票流动性较差，提高到5000万以避免滑点陷阱
+    MIN_DAILY_AMOUNT = 50_000_000  # 5000万（从2000万提高）
     # 涨停判断阈值（涨幅 >= 9.5% 视为涨停）
     LIMIT_UP_THRESHOLD = 0.095
     # 跌停判断阈值（跌幅 >= 9.5% 视为跌停）
     LIMIT_DOWN_THRESHOLD = -0.095
     # ST/退市股关键字
     ST_KEYWORDS = ('ST', '*ST', '退', 'S', 'PT')
+    # 换手率过热熔断阈值（Z-Score > 2.5 视为极度过热，直接剔除）
+    TURNOVER_OVERHEAT_THRESHOLD = 2.5
     
     def filter_stocks(
         self,
@@ -1020,21 +1023,24 @@ class MultiFactorStrategy(BaseStrategy):
         date: pd.Timestamp
     ) -> pd.DataFrame:
         """
-        根据条件过滤股票（增强版：小资金实盘优化）
+        根据条件过滤股票（增强版：小资金实盘优化 + 风控熔断）
         
         针对激进型小市值策略的增强过滤，确保选出的股票：
         1. 可交易（非涨跌停、非ST）
         2. 有流动性（成交额足够）
         3. 价格适中（能买入足够手数）
         4. 上市足够久（非次新股）
+        5. 不过热（换手率Z分数不超标）
         
-        过滤条件：
+        过滤条件（硬性风控，直接剔除）：
         1. 剔除涨跌停股票 (无法买入/卖出)
         2. 剔除一字涨停股票 (High == Low 且涨幅 >= 9.5%)
-        3. 剔除流动性不足股票 (日成交额 < 2000万)
+        3. 剔除流动性不足股票 (日成交额 < 5000万)
         4. 剔除 ST/*ST/退市股票 (高风险标的)
         5. 剔除高价股 (> 100元)
         6. 剔除上市不满 6 个月的股票
+        7. 剔除创业板/科创板（可配置）
+        8. **剔除过热股票 (turnover_5d_zscore > 2.5)**
         
         Parameters
         ----------
@@ -1046,6 +1052,7 @@ class MultiFactorStrategy(BaseStrategy):
             - name 或 stock_name: 股票名称（用于ST过滤）
             - is_limit: 涨跌停标志
             - listing_days 或 list_date: 上市信息
+            - turnover_5d_zscore: 5日换手率Z分数（用于过热熔断）
         date : pd.Timestamp
             当前日期
         
@@ -1057,10 +1064,15 @@ class MultiFactorStrategy(BaseStrategy):
         Notes
         -----
         小资金实盘优化说明：
-        - 30万资金持有3只股票，每只约10万
-        - 日成交额 < 2000万的股票，10万资金可能产生剧烈滑点
+        - 30万资金持有5只股票，每只约6万
+        - 日成交额 < 5000万的股票，6万资金可能产生滑点（中证1000尾部）
         - 一字涨停股票实盘无法买入，必须剔除
         - ST股票风险极高，不适合激进策略
+        
+        过热熔断说明：
+        - turnover_5d_zscore > 2.5 表示换手率处于极端高位
+        - 这类股票短期投机过热，容易在高位接盘
+        - 直接剔除而非降低分数，属于硬性风控
         """
         # 获取当日数据
         if self.date_col in data.columns:
@@ -1122,19 +1134,40 @@ class MultiFactorStrategy(BaseStrategy):
                 filter_stats['一字涨停'] = before - len(day_data)
         
         # ==========================================
-        # 过滤条件 3: 剔除流动性黑洞（日成交额 < 2000万）
+        # 过滤条件 3: 剔除流动性黑洞（日成交额 < 5000万）
+        # 中证1000尾部股票流动性较差，5000万阈值避免滑点陷阱
         # ==========================================
         if 'amount' in day_data.columns:
             before = len(day_data)
             # 成交额可能是万元单位，统一转换
-            amount_col = day_data['amount']
+            amount_values = day_data['amount'].copy()
             # 判断单位：如果最大值 < 100万，可能是万元单位
-            if amount_col.max() < 1_000_000:
+            if amount_values.max() < 1_000_000:
                 # 万元单位，转换为元
-                low_liquidity_mask = amount_col * 10000 < self.MIN_DAILY_AMOUNT
+                amount_in_yuan = amount_values * 10000
             else:
                 # 元单位
-                low_liquidity_mask = amount_col < self.MIN_DAILY_AMOUNT
+                amount_in_yuan = amount_values
+            
+            low_liquidity_mask = amount_in_yuan < self.MIN_DAILY_AMOUNT
+            low_liquidity_stocks = day_data[low_liquidity_mask]
+            
+            if len(low_liquidity_stocks) > 0:
+                # 获取被剔除的股票代码和成交额
+                if stock_col in low_liquidity_stocks.columns:
+                    low_liq_codes = low_liquidity_stocks[stock_col].tolist()
+                elif isinstance(low_liquidity_stocks.index, pd.Index):
+                    low_liq_codes = low_liquidity_stocks.index.tolist()
+                else:
+                    low_liq_codes = []
+                
+                # 详细日志（显示成交额）
+                if len(low_liq_codes) <= 5:
+                    logger.debug(
+                        f"💧 流动性不足 {date.strftime('%Y-%m-%d')}: "
+                        f"剔除 {len(low_liq_codes)} 只 (成交额 < {self.MIN_DAILY_AMOUNT/1e8:.1f}亿): "
+                        f"{low_liq_codes}"
+                    )
             
             day_data = day_data[~low_liquidity_mask]
             filter_stats['流动性不足'] = before - len(day_data)
@@ -1229,6 +1262,51 @@ class MultiFactorStrategy(BaseStrategy):
                 star_mask = day_data.index.astype(str).str[:3] == '688'
                 day_data = day_data[~star_mask]
                 filter_stats['科创板'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 9: 过热熔断（Turnover Overheat Filter）
+        # 换手率 Z-Score > 2.5 直接剔除，不参与后续打分
+        # 
+        # 风控逻辑：
+        # - 极高换手率往往意味着短期投机过热
+        # - 这类股票波动剧烈，容易在高位接盘
+        # - 直接剔除比降低分数更安全（硬性风控）
+        # ==========================================
+        turnover_col = self.quality_col  # 默认 turnover_5d_zscore
+        if turnover_col in day_data.columns:
+            before = len(day_data)
+            overheat_mask = day_data[turnover_col] > self.TURNOVER_OVERHEAT_THRESHOLD
+            overheat_stocks = day_data[overheat_mask]
+            
+            if len(overheat_stocks) > 0:
+                # 获取被剔除的股票代码列表
+                if stock_col in overheat_stocks.columns:
+                    overheat_codes = overheat_stocks[stock_col].tolist()
+                elif isinstance(overheat_stocks.index, pd.Index):
+                    overheat_codes = overheat_stocks.index.tolist()
+                else:
+                    overheat_codes = []
+                
+                # 获取具体的 Z-Score 值用于日志
+                overheat_details = []
+                for idx, row in overheat_stocks.iterrows():
+                    code = row[stock_col] if stock_col in row.index else idx
+                    zscore = row[turnover_col]
+                    overheat_details.append(f"{code}({zscore:.2f})")
+                
+                # 剔除过热股票
+                day_data = day_data[~overheat_mask]
+                filter_stats['过热熔断'] = before - len(day_data)
+                
+                # 输出详细日志
+                logger.warning(
+                    f"🔥 过热熔断 {date.strftime('%Y-%m-%d')}: "
+                    f"剔除 {len(overheat_codes)} 只 (turnover_zscore > {self.TURNOVER_OVERHEAT_THRESHOLD}): "
+                    f"{overheat_details[:10]}"  # 最多显示10只
+                    + (f"... 等共 {len(overheat_codes)} 只" if len(overheat_codes) > 10 else "")
+                )
+        else:
+            logger.debug(f"数据中缺少 '{turnover_col}' 列，跳过过热熔断过滤")
         
         # ==========================================
         # 注意：情绪分析已移至 _apply_sentiment_filter 方法
@@ -2206,21 +2284,31 @@ class MultiFactorStrategy(BaseStrategy):
         
         Notes
         -----
-        再平衡缓冲区逻辑（适用于30万小资金账户）：
+        懒惰再平衡逻辑（Lazy Rebalance，适用于30万小资金账户）：
         
-        1. 基本规则：
-           - 若 |w_new - w_old| <= 缓冲阈值，保持旧权重不变
-           - 避免因微小调整触发"最低5元佣金"规则
-           - 例：30万资金，5%权重 = 1.5万，按万三计算佣金仅4.5元，不足最低5元
+        **背景**：最低5元佣金导致小资金账户的交易摩擦成本极高。
+        例如：30万资金，5%权重 = 1.5万，按万三计算佣金仅4.5元，不足最低5元。
         
-        2. 特殊情况（始终执行，不受缓冲区限制）：
-           - 新买入：w_old = 0 且 w_new > 0 → 必须执行买入
-           - 清仓卖出：w_old > 0 且 w_new = 0 → 必须执行卖出
+        **核心规则（只换股，不调仓）**：
         
-        3. 大盘风控规则（Market Risk Control）：
-           - 条件：(Close < MA20) AND (MA20_Slope < 0)
-           - 触发时：强制清空所有仓位，跳过选股逻辑
-           - 目的：规避系统性下跌风险
+        1. 继续持有：如果股票仍在选中列表中，**直接沿用当前权重**，不产生任何交易
+           - 效果：避免了因权重微调产生的无效买卖单
+        
+        2. 卖出：如果股票不再在选中列表中，权重设为0
+           - 释放的仓位用于买入新股票
+        
+        3. 买入：新进入选中列表的股票，用卖出释放的仓位进行等权分配
+           - 只有换股才会产生交易
+        
+        **效果示例（5只股票组合）**：
+        - 全部继续入选 → 本期零交易
+        - 换1只股票 → 仅1买1卖共2笔交易
+        - 换2只股票 → 仅2买2卖共4笔交易
+        
+        **大盘风控规则（Market Risk Control）**：
+        - 条件：(Close < MA60) AND (20日跌幅 < -5%)
+        - 触发时：强制清空所有仓位
+        - 目的：规避系统性下跌风险
         
         Examples
         --------
@@ -2417,79 +2505,112 @@ class MultiFactorStrategy(BaseStrategy):
                     )
                     
                     if selected_stocks:
-                        # 根据优化目标计算权重
-                        if objective == "equal_weight":
-                            # 等权重：对于小资金账户更稳健
-                            new_weights = self._equal_weights(selected_stocks)
+                        # =====================================================
+                        # 懒惰再平衡逻辑（Lazy Rebalance for Small Capital）
+                        # =====================================================
+                        # 
+                        # 背景：30万资金实盘，最低5元佣金导致摩擦成本极高
+                        # 目的：只做必要的换股（Swap），避免对持仓进行微小的权重调整（Rebalance）
+                        # 
+                        # 核心规则：
+                        # 1. 继续持有：股票仍在选中列表中 → 保持当前权重不变，不产生交易
+                        # 2. 卖出：股票不再在选中列表中 → 权重设为0，释放仓位
+                        # 3. 买入：新进入选中列表 → 用卖出释放的仓位进行等权分配
+                        # 
+                        # 效果：
+                        # - 如果5只股票全部继续入选，则本期零交易
+                        # - 如果换1只股票，则只产生1买1卖两笔交易
+                        # - 大幅降低交易频率和佣金成本
+                        # =====================================================
+                        
+                        current_holding_set = set(current_weights.keys()) if current_weights else set()
+                        selected_set = set(selected_stocks)
+                        
+                        # 分类股票：继续持有 / 卖出 / 买入
+                        continuing_stocks = current_holding_set & selected_set  # 交集：继续持有
+                        stocks_to_sell = current_holding_set - selected_set     # 差集：需要卖出
+                        stocks_to_buy = selected_set - current_holding_set      # 差集：需要买入
+                        
+                        if not current_holding_set:
+                            # ===== 首次建仓：全部等权分配 =====
+                            final_weights = self._equal_weights(selected_stocks)
+                            forced_executions += len(selected_stocks)
+                            logger.info(
+                                f"🚀 首次建仓 {date.strftime('%Y-%m-%d')}: "
+                                f"等权分配 {len(selected_stocks)} 只股票"
+                            )
                         else:
-                            # 使用优化权重
-                            price_end_idx = prices.index.get_indexer([date], method='ffill')[0]
-                            if price_end_idx >= 0:
-                                historical_prices = prices.iloc[:price_end_idx + 1]
+                            # ===== 懒惰再平衡：只换股，不调仓 =====
+                            final_weights: Dict[str, float] = {}
+                            
+                            # Step 1: 继续持有的股票 - 沿用当前权重，不产生任何交易
+                            for stock in continuing_stocks:
+                                final_weights[stock] = current_weights[stock]
+                                skipped_adjustments += 1  # 记录跳过的调整次数
+                            
+                            # Step 2: 计算卖出释放的仓位
+                            released_weight = sum(current_weights.get(s, 0.0) for s in stocks_to_sell)
+                            
+                            # 记录卖出
+                            if stocks_to_sell:
+                                forced_executions += len(stocks_to_sell)
+                                logger.debug(
+                                    f"📤 卖出 {len(stocks_to_sell)} 只: {list(stocks_to_sell)}, "
+                                    f"释放权重: {released_weight:.2%}"
+                                )
+                            
+                            # Step 3: 新买入的股票 - 分配释放的仓位
+                            if stocks_to_buy:
+                                forced_executions += len(stocks_to_buy)
                                 
-                                new_weights = self.optimize_weights(
-                                    historical_prices,
-                                    selected_stocks,
-                                    objective=objective,
-                                    risk_free_rate=risk_free_rate,
-                                    max_weight=max_weight
+                                if released_weight > 0:
+                                    # 有释放的仓位：等权分配给新股票
+                                    weight_per_new = released_weight / len(stocks_to_buy)
+                                    for stock in stocks_to_buy:
+                                        final_weights[stock] = weight_per_new
+                                    
+                                    logger.debug(
+                                        f"📥 买入 {len(stocks_to_buy)} 只: {list(stocks_to_buy)}, "
+                                        f"每只权重: {weight_per_new:.2%}"
+                                    )
+                                else:
+                                    # 极端情况：没有释放的仓位但有新股票要买入
+                                    # 这种情况说明 top_n 发生了变化，需要重新分配
+                                    # 策略：从现有持仓中按比例腾出空间（重新等权分配）
+                                    n_total = len(continuing_stocks) + len(stocks_to_buy)
+                                    target_weight = 1.0 / n_total
+                                    
+                                    # 重新分配所有股票权重
+                                    final_weights = {}
+                                    for stock in continuing_stocks:
+                                        final_weights[stock] = target_weight
+                                    for stock in stocks_to_buy:
+                                        final_weights[stock] = target_weight
+                                    
+                                    logger.warning(
+                                        f"⚠️ 无释放仓位但需买入新股票，重新等权分配 {n_total} 只"
+                                    )
+                            
+                            # Step 4: 归一化权重（确保总和为1）
+                            weight_sum = sum(final_weights.values())
+                            if weight_sum > 0 and abs(weight_sum - 1.0) > 1e-6:
+                                final_weights = {k: v / weight_sum for k, v in final_weights.items()}
+                            
+                            # 懒惰再平衡日志
+                            if stocks_to_sell or stocks_to_buy:
+                                logger.info(
+                                    f"🔄 懒惰再平衡 {date.strftime('%Y-%m-%d')}: "
+                                    f"继续持有 {len(continuing_stocks)} 只 (权重不变), "
+                                    f"卖出 {len(stocks_to_sell)} 只, "
+                                    f"买入 {len(stocks_to_buy)} 只"
                                 )
                             else:
-                                new_weights = self._equal_weights(selected_stocks)
-                        
-                        # ===== 再平衡缓冲区逻辑（增强版）=====
-                        # 
-                        # 规则：
-                        # 1. 新买入（w_old=0, w_new>0）：始终执行
-                        # 2. 清仓卖出（w_old>0, w_new=0）：始终执行
-                        # 3. 调整持仓（w_old>0, w_new>0）：仅当变化 > 阈值时执行
-                        
-                        final_weights: Dict[str, float] = {}
-                        
-                        # 获取所有涉及的股票（新选中 + 当前持有）
-                        all_involved_stocks = set(new_weights.keys()) | set(current_weights.keys())
-                        
-                        for stock in all_involved_stocks:
-                            new_w = new_weights.get(stock, 0.0)
-                            old_w = current_weights.get(stock, 0.0)
-                            weight_change = abs(new_w - old_w)
-                            
-                            # 判断交易类型
-                            is_new_buy = (old_w == 0.0 and new_w > 0.0)
-                            is_full_sell = (old_w > 0.0 and new_w == 0.0)
-                            is_rebalance = (old_w > 0.0 and new_w > 0.0)
-                            
-                            if is_new_buy:
-                                # 新买入：始终执行
-                                final_weights[stock] = new_w
-                                forced_executions += 1
-                            elif is_full_sell:
-                                # 清仓卖出：始终执行（不加入 final_weights）
-                                forced_executions += 1
-                                pass  # 不加入表示权重为0
-                            elif is_rebalance:
-                                # 调整持仓：应用缓冲区逻辑
-                                if weight_change > buffer_threshold:
-                                    # 变化超过阈值，执行调整
-                                    final_weights[stock] = new_w
-                                else:
-                                    # 变化未超过阈值，保持原权重
-                                    final_weights[stock] = old_w
-                                    skipped_adjustments += 1
-                        
-                        # 归一化权重（确保总和接近1）
-                        weight_sum = sum(final_weights.values())
-                        if weight_sum > 0:
-                            final_weights = {k: v / weight_sum for k, v in final_weights.items()}
+                                logger.debug(
+                                    f"✅ 无换股 {date.strftime('%Y-%m-%d')}: "
+                                    f"全部 {len(continuing_stocks)} 只股票继续持有，本期零交易"
+                                )
                         
                         current_weights = final_weights
-                        
-                        logger.debug(
-                            f"调仓日 {date.strftime('%Y-%m-%d')}: "
-                            f"选中 {len(selected_stocks)} 只, "
-                            f"最终持仓 {len(final_weights)} 只 "
-                            f"(跳过: {skipped_adjustments}, 强制执行: {forced_executions})"
-                        )
                 else:
                     logger.warning(f"调仓日 {date.strftime('%Y-%m-%d')}: 无可选股票")
                     current_weights = {}
