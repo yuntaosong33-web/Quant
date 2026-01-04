@@ -1,12 +1,15 @@
 # A股量化交易系统 - 策略配置文件
 # ===============================
-# 中证1000 强动量 + 情绪进攻策略 (Aggressive Momentum & Sentiment Strategy)
+# HS300 深度价值与龙头动量策略 (Deep Value & Quality Strategy)
 
 # 数据配置
 data:
+  # 数据源：tushare (推荐，稳定可靠) 或 akshare (免费但不稳定)
+  data_source: "tushare"
+  
   # 股票池: hs300(沪深300), zz500(中证500), zz1000(中证1000), all(全市场)
-  # [SWITCH] 切换到中证1000以配合激进动量策略
-  stock_pool: "zz1000"
+  # [核心修改] 切换到沪深300，聚焦大盘蓝筹龙头
+  stock_pool: "hs300"
   
   # 历史数据开始日期
   start_date: "2020-01-01"
@@ -18,54 +21,98 @@ data:
   raw_data_path: "data/raw"
   processed_data_path: "data/processed"
 
-# 策略配置 - 中证1000多因子策略
+# Tushare 配置
+# 获取 Token: https://tushare.pro/register
+# 也可通过环境变量 TUSHARE_TOKEN 设置
+tushare:
+  # API Token
+  api_token: "7de46c74cf5f993d70c5ff931bd1a0c420a950ca4d35671010d244ba"
+  
+  # 缓存目录
+  cache_dir: "data/tushare_cache"
+  
+  # 请求限流（每分钟最大请求数，免费用户约 200，付费用户约 500）
+  rate_limit: 200
+
+# ============================================================
+# 策略配置 - HS300 深度价值与龙头动量
+# ============================================================
+# 策略逻辑：
+#   1. 从沪深300龙头股中选择低估值+高盈利+稳健动量的优质标的
+#   2. 月度调仓，极度集中持仓（仅6只）
+#   3. 大盘风控：跌破MA60且20日跌幅>5%时清仓
+# ============================================================
 strategy:
   # 策略名称
-  name: "Balanced Multi-Factor"
+  name: "HS300 Deep Value & Quality"
   
-  # 因子权重配置 (平衡型 - 动量+小市值+低波)
-  # 注：价值因子因数据源限制(PE数据缺失)暂时禁用
-  value_weight: 0.0      # 价值因子 - 禁用（数据源不支持）
-  quality_weight: 0.2    # 低波因子 (IVOL) - 20%
-  momentum_weight: 0.45  # 动量因子 - 45%（+5%）
-  size_weight: 0.35      # 小市值因子 - 35%（+5%）
-  sentiment_weight: 0.0  # 禁用情绪因子
+  # ===== 因子权重配置 (深度价值风格) =====
+  # 核心逻辑：低估值 + 高ROE + 稳健动量
+  value_weight: 0.40      # 价值因子 - 40% (核心：低估值)
+  quality_weight: 0.30    # 质量因子 - 30% (核心：高ROE盈利能力)
+  momentum_weight: 0.30   # 动量因子 - 30% (辅助：60日夏普动量)
+  size_weight: 0.0        # 小市值因子 - 0% (移除，专注大盘股)
+  sentiment_weight: 0.0   # 情绪因子 - 0% (暂时关闭)
   
-  # 选股参数
-  top_n: 4              # 持仓4只，聚焦高质量
-  min_listing_days: 126 # 约6个月上市时间
+  # ===== 选股参数 =====
+  top_n: 6                # 极度集中持仓，仅选前6名
+  min_listing_days: 252   # 至少上市1年（约252个交易日）
   
-  # 风控熔断阈值
-  turnover_threshold: 10.0   # 禁用换手率熔断
-  volatility_threshold: 2.0  # 适中的波动率限制
+  # ===== 风控熔断阈值 =====
+  turnover_threshold: 20.0   # 放宽换手率限制（大盘股换手率较低）
+  volatility_threshold: 3.0  # 放宽波动率限制（给予更多容忍度）
   
-  # 板块过滤
-  exclude_chinext: false  # 启用创业板
-  exclude_star: false     # 启用科创板
+  # ===== 板块过滤 =====
+  exclude_chinext: false  # 不排除创业板（部分HS300成分股在创业板）
+  exclude_star: false     # 不排除科创板（部分HS300成分股在科创板）
   
-  # 因子列名配置
-  value_col: "value_zscore"
-  quality_col: "ivol_zscore"
-  momentum_col: "sharpe_60_zscore"   # 60日夏普动量（更稳定）
-  size_col: "small_cap_zscore"
+  # ===== 因子列名映射 =====
+  # 注意：需要在因子计算模块中实现对应的因子
+  value_col: "value_composite_zscore"   # 复合估值因子 (EP + BP + DP)
+  quality_col: "roe_zscore"             # ROE 盈利能力因子
+  momentum_col: "sharpe_60_zscore"      # 60日夏普动量（中期稳健）
+  size_col: "small_cap_zscore"          # 保留配置但权重为0
   
-  # 调仓频率
-  rebalance_frequency: "weekly"
+  # ===== 调仓配置 =====
+  rebalance_frequency: "monthly"  # 月度调仓（降低交易成本）
+  rebalance_buffer: 0.05          # 5% 缓冲区（允许小幅偏离）
   
-  # 再平衡缓冲区
-  rebalance_buffer: 0.30    # 30% 缓冲减少交易
-  
-  # 持股惯性加分
-  holding_bonus: 0.5        # 0.5 标准差（经验证的最优值）
+  # ===== 持股惯性 =====
+  holding_bonus: 0.3              # 持股惯性加分（降低换手）
 
-# 投资组合配置 - 激进型（集中持仓）
+# ============================================================
+# 风险控制配置 - 保守型参数
+# ============================================================
+risk:
+  # ===== 基础止损止盈 =====
+  stop_loss: 0.10         # 10% 止损（保守策略）
+  take_profit: 0.30       # 30% 止盈
+  
+  # ===== 组合风险限制 =====
+  max_daily_loss: 0.05    # 单日最大亏损 5%
+  max_drawdown: 0.20      # 最大回撤限制 20%（保守）
+  
+  # ===== ATR 动态止损配置 =====
+  use_atr_stop_loss: true       # 启用 ATR 止损
+  atr_period: 14                # ATR 计算周期（14日）
+  atr_multiplier: 2.5           # ATR 止损倍数（保守策略放宽至2.5）
+  atr_trailing: true            # 启用移动止损（跟踪盈利）
+  
+  # ===== 大盘风控参数 =====
+  # 规则：跌破60日均线 且 20日跌幅超过5% 时触发清仓
+  market_risk:
+    enabled: true         # 启用大盘风控
+    ma_period: 60         # 60日均线
+    drop_threshold: 0.05  # 5% 跌幅阈值
+    drop_lookback: 20     # 回溯20日计算跌幅
+
+# 投资组合配置 - 集中持仓型
 portfolio:
   # 总资金（元）
   total_capital: 300000
   
-  # 单只股票最大权重
-  # 对于10只股票的激进策略，单只上限25%
-  max_weight: 0.25
+  # 单只股票最大权重（6只股票，最大约17%）
+  max_weight: 0.20
   
   # 单只股票最小权重
   min_weight: 0.0
@@ -74,7 +121,7 @@ portfolio:
   risk_free_rate: 0.02
   
   # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率), equal_weight(等权重)
-  # 激进策略使用等权重，避免优化器在高波动股票上的不稳定
+  # 价值策略使用等权重分配
   optimization_objective: "equal_weight"
   
   # 协方差压缩方法: ledoit_wolf, oracle_approximating, exponential
@@ -86,41 +133,7 @@ portfolio:
   # 协方差计算回溯天数
   lookback_days: 252
 
-  # 风险控制配置 - 激进型参数（30万资金实盘优化）
-risk:
-  # 止损比例（放宽：避免频繁被洗）
-  stop_loss: 0.08
-  
-  # 止盈比例
-  take_profit: 0.30
-  
-  # 单日最大亏损比例
-  max_daily_loss: 0.05
-  
-  # 最大回撤限制（放宽：容忍更高波动以获取高收益）
-  max_drawdown: 0.25
-  
-  # ===== ATR 动态止损配置 =====
-  # ATR 止损根据市场波动率自动调整止损位，比固定比例止损更智能
-  use_atr_stop_loss: true       # 启用 ATR 止损
-  atr_period: 14                # ATR 计算周期（14日）
-  atr_multiplier: 1.5           # ATR 止损倍数（激进策略收紧至1.5，跑得快）
-  atr_trailing: true            # 是否启用移动止损（跟踪盈利）
-  
-  # 大盘风控参数
-  # 仅当大盘跌破60日均线且20日跌幅超过8%时才触发熔断
-  market_risk:
-    enabled: true         # 启用风控
-    ma_period: 60
-    drop_threshold: 0.08  # 8% 跌幅阈值
-    drop_lookback: 20
-
-# LLM 情绪分析配置（优化版）
-# 情绪进攻型策略：情绪分数作为 Alpha 因子加成，而非仅用于过滤
-# 采用两阶段选股模式：
-#   1. 技术面初筛 → Top N * buffer 候选股
-#   2. LLM 情绪分析 → 获取情绪分数
-#   3. Final_Score = Base_Score + Sentiment_Weight * Sentiment_Score → 最终排名
+# LLM 情绪分析配置
 llm:
   # 提供商: qwen (阿里云通义千问)
   provider: "qwen"
@@ -129,63 +142,35 @@ llm:
   model: "qwen-max"
   
   # 备用模型（主模型失败时自动降级）
-  # 推荐使用更便宜的模型作为 fallback，如 qwen-turbo 或 deepseek-chat
   fallback_model: "qwen-turbo"
   
   # API 端点 (阿里云 DashScope OpenAI 兼容模式)
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   
   # API Key (阿里云 DashScope)
-  # 建议通过环境变量 QWEN_API_KEY 配置，更安全
   api_key: "sk-a4eee1b50b9341c4a3f4f9abefe7460d"
   
   # 是否启用情绪分析
   enable_sentiment_filter: true
   
   # 情绪分数阈值（用于极端负面情况的安全过滤）
-  # 分数范围: -1.0 (极度负面) 到 1.0 (极度正面)
-  # 低于此阈值的股票仍会被禁止交易（黑天鹅风控）
   sentiment_threshold: -0.5
   
   # ===== 缓存配置 =====
-  
-  # 情绪缓存文件路径
   cache_path: "data/processed/sentiment_cache.json"
-  
-  # 缓存过期天数（超过此时间的缓存会被重新获取）
   cache_ttl_days: 7
   
   # ===== API 配置 =====
-  
-  # API 请求超时时间（秒）
   request_timeout: 30
-  
-  # API 最大重试次数
   max_retries: 3
-  
-  # 最大并发请求数（批量分析时的并发限制）
-  # 过高可能触发 API 限流，建议 3-10
   max_concurrent: 5
   
   # ===== 提示词配置 =====
-  
-  # 是否使用详细提示词（更多 Token 但分析更准确）
-  # true: 使用 CoT 思维链引导，输出更详细
-  # false: 使用简化提示词，节省 Token 成本
   detailed_prompts: true
   
   # ===== 熔断器与置信度配置 =====
-  
-  # 熔断器阈值：连续 API 调用失败次数
-  # 超过此阈值时，系统将抛出 LLMCircuitBreakerError 异常停止交易
   max_consecutive_failures: 5
-  
-  # 最低置信度阈值
-  # LLM 返回的置信度低于此值的分析结果将被忽略
   min_confidence: 0.7
-  
-  # 情绪分析缓冲区乘数
-  # 选取 top_n * buffer_multiplier 只股票进行情绪分析
   sentiment_buffer_multiplier: 5
 
 # 交易配置
@@ -224,8 +209,6 @@ report:
 # 消息推送配置
 notification:
   # PushPlus 微信推送 (http://www.pushplus.plus/)
-  # Token 获取方式：注册 PushPlus 账号后，在个人中心获取
-  # 也可通过环境变量 PUSHPLUS_TOKEN 配置（优先级更高）
   pushplus_token: "c71a6a03122e41e3b0b691693748c0ce"
   
   # 是否启用推送
@@ -254,8 +237,8 @@ backtest:
   initial_capital: 300000
   
   # 基准指数
-  # [SWITCH] 配合股票池切换，基准改为沪深300 (000300)
-  benchmark: "000300"  # 沪深300
+  # [配合股票池] 沪深300基准
+  benchmark: "000300"
 
-  # 回测最大股票数量（避免数据下载耗时过长，全市场回测请设为 5000）
-  max_stocks: 2000
+  # 回测最大股票数量
+  max_stocks: 300

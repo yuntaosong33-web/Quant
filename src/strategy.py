@@ -1006,12 +1006,13 @@ class MultiFactorStrategy(BaseStrategy):
     def calculate_total_score(
         self,
         data: pd.DataFrame,
-        sentiment_scores: Optional[pd.Series] = None
+        sentiment_scores: Optional[pd.Series] = None,
+        return_components: bool = False
     ) -> pd.Series:
         """
         计算综合因子得分
         
-        激进型小市值策略公式：
+        多因子策略公式：
         Total_Score = value_weight * Value_Z + quality_weight * Quality_Z 
                     + momentum_weight * Momentum_Z + size_weight * Size_Z
         
@@ -1019,7 +1020,7 @@ class MultiFactorStrategy(BaseStrategy):
         Final_Score = Base_Score + sentiment_weight * Sentiment_Score * 3.0
         
         特殊处理：
-        - 换手率因子引入"过热惩罚"：Z-Score > 2.0 时反向扣分
+        - 换手率因子引入"过热惩罚"：Z-Score > 2.0 时反向扣分（仅对 turnover 类因子）
         - 情绪因子量纲对齐：乘以 3.0 放大系数使其与技术因子匹配
         
         Parameters
@@ -1028,7 +1029,8 @@ class MultiFactorStrategy(BaseStrategy):
             包含因子 Z-Score 的数据框
         sentiment_scores : Optional[pd.Series]
             情绪分数序列（范围 -1 到 1），索引应为股票代码。
-            如果传入，将乘以 sentiment_weight 和放大系数 3.0 加到总分中。
+        return_components : bool
+            是否返回各因子的得分分量（用于 Debug）
         
         Returns
         -------
@@ -1039,50 +1041,75 @@ class MultiFactorStrategy(BaseStrategy):
         -----
         - 缺失的因子值会被视为 0
         - 使用向量化操作计算得分
-        - 激进型策略中，value_col 可映射到 small_cap_zscore
-        - quality_col 可映射到 turnover_5d_zscore
-        - sentiment_scores 权重归一化由用户配置保证
-        - 换手率过热惩罚阈值为 Z-Score = 2.0
+        - 过热惩罚仅适用于包含 "turnover" 的质量因子列名
         """
         total_score = pd.Series(0.0, index=data.index)
         
-        # 价值因子（激进策略中可用于放置小市值因子）
+        # 用于存储各因子分量（Debug 用）
+        score_components = {}
+        
+        # ===== 价值因子 =====
+        value_contribution = pd.Series(0.0, index=data.index)
         if self.value_col in data.columns and self.value_weight > 0:
-            total_score += self.value_weight * data[self.value_col].fillna(0)
+            value_contribution = self.value_weight * data[self.value_col].fillna(0)
+            total_score += value_contribution
+            score_components['value'] = data[self.value_col].fillna(0)
         elif self.value_weight > 0:
             logger.warning(f"未找到价值因子列: {self.value_col}")
         
-        # 质量因子（换手率因子）- 引入"过热惩罚"机制
-        # Z-Score > 2.0 表示极度活跃，过热反而扣分
-        # score = z_score if z_score <= 2.0 else 2.0 - (z_score - 2.0) * 2
+        # ===== 质量因子 =====
+        # 判断是否为换手率类因子（需要过热惩罚）
+        quality_contribution = pd.Series(0.0, index=data.index)
+        is_turnover_factor = 'turnover' in self.quality_col.lower()
+        
         if self.quality_col in data.columns and self.quality_weight > 0:
             raw_quality = data[self.quality_col].fillna(0)
-            # 向量化计算：过热惩罚
-            # 对于 z > 2.0: score = 2.0 - (z - 2.0) * 2 = 4.0 - 2*z
-            quality_score = np.where(
-                raw_quality > 2.0,
-                2.0 - (raw_quality - 2.0) * 2,  # 过热惩罚
-                raw_quality  # 正常情况保持原值
-            )
-            total_score += self.quality_weight * quality_score
-            # 记录过热股票数量
-            overheat_count = (raw_quality > 2.0).sum()
-            if overheat_count > 0:
-                logger.debug(f"换手率过热惩罚: {overheat_count} 只股票 Z-Score > 2.0")
+            
+            if is_turnover_factor:
+                # 换手率因子：引入"过热惩罚"机制
+                # Z-Score > 2.0 表示极度活跃，过热反而扣分
+                quality_score = np.where(
+                    raw_quality > 2.0,
+                    2.0 - (raw_quality - 2.0) * 2,  # 过热惩罚
+                    raw_quality  # 正常情况保持原值
+                )
+                overheat_count = (raw_quality > 2.0).sum()
+                if overheat_count > 0:
+                    logger.debug(f"换手率过热惩罚: {overheat_count} 只股票 Z-Score > 2.0")
+            else:
+                # 非换手率因子（如 ROE、IVOL）：直接使用原值
+                quality_score = raw_quality
+            
+            quality_contribution = self.quality_weight * quality_score
+            total_score += quality_contribution
+            score_components['quality'] = pd.Series(quality_score, index=data.index)
         elif self.quality_weight > 0:
             logger.warning(f"未找到质量因子列: {self.quality_col}")
         
-        # 动量因子
+        # ===== 动量因子 =====
+        momentum_contribution = pd.Series(0.0, index=data.index)
         if self.momentum_col in data.columns and self.momentum_weight > 0:
-            total_score += self.momentum_weight * data[self.momentum_col].fillna(0)
+            momentum_contribution = self.momentum_weight * data[self.momentum_col].fillna(0)
+            total_score += momentum_contribution
+            score_components['momentum'] = data[self.momentum_col].fillna(0)
         elif self.momentum_weight > 0:
             logger.warning(f"未找到动量因子列: {self.momentum_col}")
         
-        # 市值因子（独立权重，激进型小市值策略核心因子）
+        # ===== 市值因子 =====
+        size_contribution = pd.Series(0.0, index=data.index)
         if self.size_col in data.columns and self.size_weight > 0:
-            total_score += self.size_weight * data[self.size_col].fillna(0)
+            size_contribution = self.size_weight * data[self.size_col].fillna(0)
+            total_score += size_contribution
+            score_components['size'] = data[self.size_col].fillna(0)
         elif self.size_weight > 0:
             logger.warning(f"未找到市值因子列: {self.size_col}")
+        
+        # 存储分量供后续 Debug 使用
+        if return_components:
+            data['_value_score'] = value_contribution
+            data['_quality_score'] = quality_contribution
+            data['_momentum_score'] = momentum_contribution
+            data['_size_score'] = size_contribution
         
         # ===== 情绪进攻型策略：加入情绪分数 =====
         # 情绪因子量纲对齐：情绪分数范围 [-1, 1]，Z-Score 通常在 [-3, 3]
@@ -1768,7 +1795,8 @@ class MultiFactorStrategy(BaseStrategy):
         # ==========================================
         # 第一阶段：技术面初筛（基础得分）
         # ==========================================
-        data['base_score'] = self.calculate_total_score(data, sentiment_scores=None)
+        # 使用 return_components=True 获取各因子得分分量
+        data['base_score'] = self.calculate_total_score(data, sentiment_scores=None, return_components=True)
         
         # [NEW] 应用持股惯性加分 - 当前持仓股票获得额外得分
         if self.holding_bonus > 0 and 'is_holding' in data.columns:
@@ -1796,13 +1824,21 @@ class MultiFactorStrategy(BaseStrategy):
             # 纯技术面选股：直接返回 Top N
             if stock_col not in valid_data.columns:
                 if isinstance(valid_data.index, pd.MultiIndex):
-                    top_stocks = valid_data.nlargest(n, 'base_score').index.get_level_values(-1).tolist()
+                    top_df = valid_data.nlargest(n, 'base_score')
+                    top_stocks = top_df.index.get_level_values(-1).tolist()
                 else:
-                    top_stocks = valid_data.nlargest(n, 'base_score').index.tolist()
+                    top_df = valid_data.nlargest(n, 'base_score')
+                    top_stocks = top_df.index.tolist()
             else:
-                top_stocks = valid_data.nlargest(n, 'base_score')[stock_col].tolist()
+                top_df = valid_data.nlargest(n, 'base_score')
+                top_stocks = top_df[stock_col].tolist()
+            
             # 确保去重并保持顺序
             top_stocks = list(dict.fromkeys(top_stocks))[:n]
+            
+            # ===== 输出选中股票的详细得分构成 =====
+            self._log_selected_stocks_scores(top_df, stock_col, top_stocks)
+            
             return top_stocks
         
         # ==========================================
@@ -1953,6 +1989,86 @@ class MultiFactorStrategy(BaseStrategy):
         )
         
         return top_stocks
+    
+    def _log_selected_stocks_scores(
+        self,
+        top_df: pd.DataFrame,
+        stock_col: str,
+        top_stocks: List[str]
+    ) -> None:
+        """
+        输出选中股票的详细得分构成（用于人工复核）
+        
+        Parameters
+        ----------
+        top_df : pd.DataFrame
+            包含选中股票数据的 DataFrame
+        stock_col : str
+            股票代码列名
+        top_stocks : List[str]
+            选中的股票代码列表
+        """
+        # 定义因子列映射
+        factor_cols = {
+            'value': (self.value_col, self.value_weight),
+            'quality': (self.quality_col, self.quality_weight),
+            'momentum': (self.momentum_col, self.momentum_weight),
+            'size': (self.size_col, self.size_weight),
+        }
+        
+        logger.info("=" * 70)
+        logger.info(f"📊 选中股票详细得分构成 (Top {len(top_stocks)})")
+        logger.info("=" * 70)
+        logger.info(
+            f"因子权重: Value={self.value_weight:.2f}, Quality={self.quality_weight:.2f}, "
+            f"Momentum={self.momentum_weight:.2f}, Size={self.size_weight:.2f}"
+        )
+        logger.info("-" * 70)
+        
+        for rank, stock in enumerate(top_stocks, 1):
+            # 获取该股票的数据行
+            if stock_col in top_df.columns:
+                stock_row = top_df[top_df[stock_col] == stock]
+            else:
+                stock_row = top_df.loc[[stock]] if stock in top_df.index else pd.DataFrame()
+            
+            if stock_row.empty:
+                logger.info(f"  {rank}. {stock}: 数据缺失")
+                continue
+            
+            stock_row = stock_row.iloc[0]
+            
+            # 获取各因子原始 Z-Score 和贡献分
+            score_parts = []
+            total = stock_row.get('base_score', 0)
+            
+            for factor_name, (col_name, weight) in factor_cols.items():
+                if weight > 0 and col_name in top_df.columns:
+                    raw_z = stock_row.get(col_name, 0)
+                    contribution = weight * raw_z if pd.notna(raw_z) else 0
+                    score_parts.append(f"{factor_name.capitalize()}({raw_z:.2f}×{weight:.1f}={contribution:.2f})")
+                elif weight > 0:
+                    score_parts.append(f"{factor_name.capitalize()}(N/A)")
+            
+            # 检查是否有持股惯性加分
+            holding_bonus_str = ""
+            if '_value_score' in top_df.columns:
+                # 使用分解的得分
+                v_score = stock_row.get('_value_score', 0)
+                q_score = stock_row.get('_quality_score', 0)
+                m_score = stock_row.get('_momentum_score', 0)
+                s_score = stock_row.get('_size_score', 0)
+                component_total = v_score + q_score + m_score + s_score
+                if abs(total - component_total) > 0.01:
+                    # 有额外加分（如持股惯性）
+                    holding_bonus_str = f" +惯性={total - component_total:.2f}"
+            
+            logger.info(
+                f"  {rank}. {stock} | 总分={total:.3f}{holding_bonus_str} | "
+                f"{' + '.join(score_parts)}"
+            )
+        
+        logger.info("=" * 70)
     
     def generate_target_positions(
         self,

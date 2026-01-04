@@ -183,11 +183,38 @@ class DailyUpdateRunner:
     
     def _init_components(self) -> None:
         """初始化各组件"""
-        # 数据加载器
-        self.data_loader = AkshareDataLoader(self.config)
+        # 根据配置选择数据源
+        data_source = self.config.get("data", {}).get("data_source", "akshare")
+        
+        if data_source == "tushare":
+            # 使用 Tushare 数据源（推荐）
+            from src.tushare_loader import TushareDataLoader
+            tushare_config = self.config.get("tushare", {})
+            api_token = tushare_config.get("api_token") or os.environ.get("TUSHARE_TOKEN", "")
+            
+            if not api_token:
+                self.logger.error(
+                    "Tushare API Token 未配置！\n"
+                    "请在 config/strategy_config.yaml 中设置 tushare.api_token\n"
+                    "或通过环境变量 TUSHARE_TOKEN 设置"
+                )
+                raise ValueError("Tushare API Token 未配置")
+            
+            self.tushare_loader = TushareDataLoader(
+                api_token=api_token,
+                cache_dir=tushare_config.get("cache_dir", "data/tushare_cache")
+            )
+            self.data_source = "tushare"
+            self.logger.info("使用 Tushare 数据源")
+        else:
+            # 使用 AkShare 数据源（兼容旧代码）
+            self.data_loader = AkshareDataLoader(self.config)
+            self.data_source = "akshare"
+            self.logger.info("使用 AkShare 数据源")
+        
         self.data_cleaner = AShareDataCleaner()
         
-        # 增强版数据加载器（用于获取财务数据）
+        # 增强版数据加载器（用于获取财务数据，兼容旧代码）
         self.financial_loader = DataLoader(
             output_dir=str(DATA_RAW_PATH),
             max_workers=3,
@@ -349,6 +376,8 @@ class DailyUpdateRunner:
         """
         更新市场数据（带缓存检查）
         
+        支持 Tushare 和 AkShare 两种数据源。
+        
         Returns
         -------
         bool
@@ -371,71 +400,119 @@ class DailyUpdateRunner:
             data_config = self.config.get("data", {})
             stock_pool = data_config.get("stock_pool", "hs300")
             
-            # 获取股票列表（支持主要指数成分股）
-            # 使用指数成分股API比全市场API更稳定
-            stock_pool_to_index = {
-                "hs300": "000300",    # 沪深300
-                "zz500": "000905",    # 中证500
-                "zz1000": "000852",   # 中证1000
-                "sz50": "000016",     # 上证50
-                "cyb50": "399673",    # 创业板50
-            }
-            
-            if stock_pool in stock_pool_to_index:
-                index_code = stock_pool_to_index[stock_pool]
-                stock_list = self.data_loader.get_stock_list(index_code)
-            elif stock_pool == "all":
-                # 全市场需要使用stock_zh_a_spot_em，网络不稳定时可能失败
-                self.logger.warning("全市场模式网络依赖较高，建议使用指数成分股模式")
-                stock_list = self.data_loader.get_stock_list()
-            else:
-                self.logger.warning(f"未知的股票池 '{stock_pool}'，使用默认沪深300")
-                stock_list = self.data_loader.get_stock_list("000300")
-            
-            self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
-            
             # 确定日期范围
             end_date = self.today.strftime("%Y%m%d")
             update_days = data_config.get("update_days", 5)
             start_date = (self.today - timedelta(days=update_days * 2)).strftime("%Y%m%d")
             
-            # 下载OHLCV数据
-            ohlcv_list = []
-            total_stocks = len(stock_list)
-            for i, stock in enumerate(stock_list):
-                try:
-                    df = self.data_loader.fetch_daily_data(
-                        stock, start_date, end_date
-                    )
-                    if df is not None and not df.empty:
-                        # 重置索引，将 DatetimeIndex 转换为 'date' 列
-                        if isinstance(df.index, pd.DatetimeIndex):
-                            df = df.reset_index(names=['date'])
-                        df['stock_code'] = stock
-                        ohlcv_list.append(df)
-                except Exception as e:
-                    self.logger.debug(f"获取 {stock} 数据失败: {e}")
-                
-                if (i + 1) % 50 == 0 or (i + 1) == total_stocks:
-                    self.logger.info(f"已处理 {i + 1}/{total_stocks} 只股票")
-            
-            if ohlcv_list:
-                self.ohlcv_data = pd.concat(ohlcv_list, ignore_index=True)
-                self.logger.info(f"OHLCV 数据更新完成，共 {len(self.ohlcv_data)} 条记录")
+            # 根据数据源选择不同的获取方式
+            if self.data_source == "tushare":
+                return self._update_market_data_tushare(stock_pool, start_date, end_date)
             else:
-                self.logger.warning("未获取到任何 OHLCV 数据")
-                return False
-            
-            # 保存数据
-            ohlcv_path = DATA_RAW_PATH / f"ohlcv_{self.today.strftime('%Y%m%d')}.parquet"
-            self.ohlcv_data.to_parquet(ohlcv_path)
-            self.logger.info(f"OHLCV 数据已保存至 {ohlcv_path}")
-            
-            return True
+                return self._update_market_data_akshare(stock_pool, start_date, end_date)
             
         except Exception as e:
             self.logger.error(f"更新市场数据失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return False
+    
+    def _update_market_data_tushare(
+        self,
+        stock_pool: str,
+        start_date: str,
+        end_date: str
+    ) -> bool:
+        """使用 Tushare 更新市场数据"""
+        self.logger.info(f"使用 Tushare 获取 {stock_pool} 数据...")
+        
+        # 获取成分股列表
+        stock_list = self.tushare_loader.fetch_index_constituents(stock_pool)
+        if not stock_list:
+            self.logger.error(f"无法获取 {stock_pool} 成分股列表")
+            return False
+        
+        self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
+        
+        # 批量获取日线数据
+        self.ohlcv_data = self.tushare_loader.fetch_daily_data_batch(
+            stock_list, start_date, end_date
+        )
+        
+        if self.ohlcv_data is None or self.ohlcv_data.empty:
+            self.logger.error("未获取到任何 OHLCV 数据")
+            return False
+        
+        self.logger.info(f"OHLCV 数据更新完成，共 {len(self.ohlcv_data)} 条记录")
+        
+        # 保存数据
+        ohlcv_path = DATA_RAW_PATH / f"ohlcv_{self.today.strftime('%Y%m%d')}.parquet"
+        self.ohlcv_data.to_parquet(ohlcv_path)
+        self.logger.info(f"OHLCV 数据已保存至 {ohlcv_path}")
+        
+        # 保存成分股列表供后续使用
+        self._current_stock_list = stock_list
+        
+        return True
+    
+    def _update_market_data_akshare(
+        self,
+        stock_pool: str,
+        start_date: str,
+        end_date: str
+    ) -> bool:
+        """使用 AkShare 更新市场数据（兼容旧代码）"""
+        # 获取股票列表（支持主要指数成分股）
+        stock_pool_to_index = {
+            "hs300": "000300",
+            "zz500": "000905",
+            "zz1000": "000852",
+            "sz50": "000016",
+            "cyb50": "399673",
+        }
+        
+        if stock_pool in stock_pool_to_index:
+            index_code = stock_pool_to_index[stock_pool]
+            stock_list = self.data_loader.get_stock_list(index_code)
+        elif stock_pool == "all":
+            self.logger.warning("全市场模式网络依赖较高，建议使用指数成分股模式")
+            stock_list = self.data_loader.get_stock_list()
+        else:
+            self.logger.warning(f"未知的股票池 '{stock_pool}'，使用默认沪深300")
+            stock_list = self.data_loader.get_stock_list("000300")
+        
+        self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
+        
+        # 下载OHLCV数据
+        ohlcv_list = []
+        total_stocks = len(stock_list)
+        for i, stock in enumerate(stock_list):
+            try:
+                df = self.data_loader.fetch_daily_data(stock, start_date, end_date)
+                if df is not None and not df.empty:
+                    if isinstance(df.index, pd.DatetimeIndex):
+                        df = df.reset_index(names=['date'])
+                    df['stock_code'] = stock
+                    ohlcv_list.append(df)
+            except Exception as e:
+                self.logger.debug(f"获取 {stock} 数据失败: {e}")
+            
+            if (i + 1) % 50 == 0 or (i + 1) == total_stocks:
+                self.logger.info(f"已处理 {i + 1}/{total_stocks} 只股票")
+        
+        if ohlcv_list:
+            self.ohlcv_data = pd.concat(ohlcv_list, ignore_index=True)
+            self.logger.info(f"OHLCV 数据更新完成，共 {len(self.ohlcv_data)} 条记录")
+        else:
+            self.logger.warning("未获取到任何 OHLCV 数据")
+            return False
+        
+        # 保存数据
+        ohlcv_path = DATA_RAW_PATH / f"ohlcv_{self.today.strftime('%Y%m%d')}.parquet"
+        self.ohlcv_data.to_parquet(ohlcv_path)
+        self.logger.info(f"OHLCV 数据已保存至 {ohlcv_path}")
+        
+        return True
     
     def update_financial_data(self) -> bool:
         """
@@ -470,6 +547,90 @@ class DailyUpdateRunner:
             except Exception as e:
                 self.logger.warning(f"读取缓存失败: {e}，将重新下载")
         
+        # 根据数据源选择不同的获取方式
+        if self.data_source == "tushare":
+            return self._update_financial_data_tushare()
+        else:
+            return self._update_financial_data_akshare()
+    
+    def _update_financial_data_tushare(self) -> bool:
+        """使用 Tushare 更新财务数据"""
+        try:
+            if self.ohlcv_data is None:
+                self.logger.warning("OHLCV 数据为空，无法生成财务数据")
+                return False
+            
+            stocks = self.ohlcv_data['stock_code'].unique().tolist()
+            total_stocks = len(stocks)
+            self.logger.info(f"使用 Tushare 获取 {total_stocks} 只股票的财务数据...")
+            
+            # 方式1：使用 daily_basic 一次获取全市场估值数据（高效）
+            self.logger.info("获取每日基础指标 (PE, PB, 市值)...")
+            basic_df = self.tushare_loader.fetch_daily_basic(stock_list=stocks)
+            
+            if basic_df is not None and not basic_df.empty:
+                self.logger.info(f"每日基础指标获取成功: {len(basic_df)} 条")
+            else:
+                self.logger.warning("每日基础指标获取失败，将逐只获取")
+                basic_df = pd.DataFrame()
+            
+            # 方式2：批量获取财务指标（ROE 等）
+            self.logger.info("获取财务指标 (ROE, 毛利率等)...")
+            fina_df = self.tushare_loader.fetch_financial_batch(stocks, show_progress=True)
+            
+            # 合并数据
+            if not basic_df.empty:
+                if not fina_df.empty:
+                    # 合并 basic 和 fina
+                    merged_df = basic_df.merge(
+                        fina_df[['stock_code', 'roe', 'roe_dt', 'gross_margin', 'net_margin']],
+                        on='stock_code',
+                        how='left'
+                    )
+                else:
+                    merged_df = basic_df
+            elif not fina_df.empty:
+                merged_df = fina_df
+            else:
+                self.logger.error("无法获取任何财务数据")
+                return False
+            
+            # 标准化列名
+            if 'stock_code' not in merged_df.columns and 'ts_code' in merged_df.columns:
+                merged_df['stock_code'] = merged_df['ts_code'].str[:6]
+            
+            # 添加数据有效性标记
+            merged_df['data_valid'] = merged_df['circ_mv'].notna() | merged_df['total_mv'].notna()
+            
+            # 估算上市天数
+            merged_df['listing_days'] = merged_df['stock_code'].apply(self._estimate_listing_days)
+            
+            self.financial_data = merged_df
+            self._excluded_stocks = set()
+            
+            # 保存数据
+            financial_path = DATA_RAW_PATH / f"financial_{self.today.strftime('%Y%m%d')}.parquet"
+            self.financial_data.to_parquet(financial_path)
+            
+            valid_count = self.financial_data['data_valid'].sum()
+            self.logger.info(
+                f"✅ 财务数据更新完成 (Tushare):\n"
+                f"   总记录: {len(self.financial_data)}\n"
+                f"   有效数据: {valid_count}\n"
+                f"   PE有效: {self.financial_data['pe_ttm'].notna().sum()}\n"
+                f"   ROE有效: {self.financial_data['roe'].notna().sum() if 'roe' in self.financial_data.columns else 0}"
+            )
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Tushare 财务数据获取失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
+    
+    def _update_financial_data_akshare(self) -> bool:
+        """使用 AkShare 更新财务数据（兼容旧代码）"""
         # 失败率阈值（超过此比例将触发 Critical Error）
         FAILURE_THRESHOLD = 0.30  # 30%
         
@@ -1223,7 +1384,47 @@ class DailyUpdateRunner:
                 factor_data['turnover_5d'] = np.nan
                 self.logger.warning("未找到换手率列 (turn/turnover/turnover_rate)，换手率因子将为 NaN")
             
-            # 4. 传统价值因子 EP_TTM（保守型策略使用）
+            # ========== HS300 深度价值策略因子 ==========
+            # 使用 FactorCalculator 的方法计算复合因子
+            from src.features import FactorCalculator
+            
+            # 4.1 复合价值因子（EP + BP）
+            try:
+                # 创建临时 FactorCalculator 实例
+                temp_ohlcv = factor_data[['stock_code', 'close', 'open', 'high', 'low', 'volume']].copy()
+                if 'date' in factor_data.columns:
+                    temp_ohlcv['date'] = factor_data['date']
+                    temp_ohlcv = temp_ohlcv.set_index('date')
+                
+                temp_fin = factor_data[['stock_code', 'pe_ttm', 'pb', 'roe']].copy() if all(
+                    col in factor_data.columns for col in ['pe_ttm', 'pb']
+                ) else pd.DataFrame()
+                
+                if not temp_fin.empty:
+                    # 手动调用价值因子计算逻辑（不创建完整 FactorCalculator）
+                    # EP Ratio = 1 / PE_TTM
+                    pe_ttm = pd.to_numeric(factor_data['pe_ttm'], errors='coerce')
+                    pe_ttm = pe_ttm.replace(0, np.nan).where(pe_ttm > 0, np.nan)
+                    factor_data['ep_ratio'] = 1.0 / pe_ttm
+                    factor_data['ep_ratio'] = factor_data['ep_ratio'].replace([np.inf, -np.inf], np.nan)
+                    
+                    # BP Ratio = 1 / PB
+                    pb = pd.to_numeric(factor_data['pb'], errors='coerce')
+                    pb = pb.replace(0, np.nan).where(pb > 0, np.nan)
+                    factor_data['bp_ratio'] = 1.0 / pb
+                    factor_data['bp_ratio'] = factor_data['bp_ratio'].replace([np.inf, -np.inf], np.nan)
+                    
+                    self.logger.debug(f"价值因子计算完成: EP有效={factor_data['ep_ratio'].notna().mean():.1%}, BP有效={factor_data['bp_ratio'].notna().mean():.1%}")
+                else:
+                    factor_data['ep_ratio'] = np.nan
+                    factor_data['bp_ratio'] = np.nan
+                    self.logger.warning("财务数据缺少 pe_ttm/pb 列，价值因子将为 NaN")
+            except Exception as e:
+                self.logger.warning(f"复合价值因子计算失败: {e}")
+                factor_data['ep_ratio'] = np.nan
+                factor_data['bp_ratio'] = np.nan
+            
+            # 4.2 传统 EP_TTM
             if 'pe_ttm' in factor_data.columns:
                 factor_data['ep_ttm'] = 1.0 / factor_data['pe_ttm'].replace(0, np.nan)
                 factor_data['ep_ttm'] = factor_data['ep_ttm'].replace([np.inf, -np.inf], np.nan)
@@ -1245,11 +1446,17 @@ class DailyUpdateRunner:
                 self.logger.warning(f"手动计算 roc_20 失败 (calculate_factors): {e}")
                 factor_data['roc_20'] = np.nan
 
-            # 5. 传统质量因子 ROE_Stability（保守型策略使用）
+            # 5. 质量因子组（ROE 盈利能力）
+            # 5.1 ROE 因子（直接使用，越高越好）
             if 'roe' in factor_data.columns:
+                # ROE 已经存在，确保格式正确
+                factor_data['roe'] = pd.to_numeric(factor_data['roe'], errors='coerce')
                 factor_data['roe_stability'] = factor_data['roe']
+                self.logger.debug(f"ROE 因子就绪，有效率: {factor_data['roe'].notna().mean():.1%}")
             else:
+                factor_data['roe'] = np.nan
                 factor_data['roe_stability'] = np.nan
+                self.logger.warning("财务数据中未找到 ROE 列，质量因子将为 NaN")
             
             # 6. 特质波动率 IVOL（风险因子）
             factor_data['ivol'] = factor_data.groupby('stock_code')['close'].transform(
@@ -1282,8 +1489,10 @@ class DailyUpdateRunner:
             
             # 对所有计算的因子进行 Z-Score 标准化
             factor_cols_to_normalize = [
-                'rsi_20', 'roc_20', 'small_cap', 'turnover_5d', 'ep_ttm', 'roe_stability',
-                'ivol_20', 'sharpe_20', 'sharpe_60'  # 新增因子
+                'rsi_20', 'roc_20', 'small_cap', 'turnover_5d', 
+                'ep_ttm', 'ep_ratio', 'bp_ratio',          # 价值因子
+                'roe_stability', 'roe',                    # 质量因子
+                'ivol_20', 'sharpe_20', 'sharpe_60'        # 动量/风险因子
             ]
             # 只标准化存在且有效的因子列
             valid_factor_cols = [
@@ -1315,7 +1524,7 @@ class DailyUpdateRunner:
             
             # ==================== 因子别名映射 ====================
             # 将标准化后的因子映射到策略配置使用的列名
-            # 策略配置中可能使用 sharpe_60_zscore, ivol_zscore, value_zscore 等
+            # 支持多种策略配置：中证1000动量策略、HS300价值策略等
             factor_alias_mapping = {
                 # 动量因子别名
                 'sharpe_20_zscore': 'sharpe_20_zscore',
@@ -1324,12 +1533,42 @@ class DailyUpdateRunner:
                 # 质量因子别名
                 'ivol_zscore': 'ivol_20_zscore',  # 低波动质量因子
                 'quality_zscore': 'roe_stability_zscore',  # 默认质量因子
+                'roe_zscore': 'roe_zscore',  # ROE 质量因子（HS300价值策略）
                 'turnover_5d_zscore': 'turnover_5d_zscore',
                 # 价值因子别名
-                'value_zscore': 'ep_ttm_zscore',
+                'value_zscore': 'ep_ttm_zscore',  # 单一价值因子
+                'ep_zscore': 'ep_ratio_zscore',  # EP 价值因子
+                'bp_zscore': 'bp_ratio_zscore',  # BP 价值因子
                 # 小市值因子别名
                 'size_zscore': 'small_cap_zscore',
             }
+            
+            # 计算复合价值因子（EP + BP 的加权平均）
+            ep_col = 'ep_ratio_zscore' if 'ep_ratio_zscore' in factor_data.columns else None
+            bp_col = 'bp_ratio_zscore' if 'bp_ratio_zscore' in factor_data.columns else None
+            
+            if ep_col and bp_col:
+                ep_valid = factor_data[ep_col].notna() & (factor_data[ep_col] != 0)
+                bp_valid = factor_data[bp_col].notna() & (factor_data[bp_col] != 0)
+                
+                if ep_valid.any() and bp_valid.any():
+                    factor_data['value_composite_zscore'] = (
+                        0.5 * factor_data[ep_col].fillna(0) + 
+                        0.5 * factor_data[bp_col].fillna(0)
+                    )
+                    self.logger.debug("复合价值因子 value_composite_zscore 计算完成")
+                elif ep_valid.any():
+                    factor_data['value_composite_zscore'] = factor_data[ep_col].fillna(0)
+                    self.logger.debug("复合价值因子使用 EP 单因子")
+                elif bp_valid.any():
+                    factor_data['value_composite_zscore'] = factor_data[bp_col].fillna(0)
+                    self.logger.debug("复合价值因子使用 BP 单因子")
+                else:
+                    factor_data['value_composite_zscore'] = 0.0
+                    self.logger.warning("无法计算复合价值因子（EP/BP 数据均无效）")
+            else:
+                factor_data['value_composite_zscore'] = 0.0
+                self.logger.warning("缺少 ep_ratio_zscore/bp_ratio_zscore，复合价值因子为 0")
             
             for alias, source in factor_alias_mapping.items():
                 if source in factor_data.columns and alias not in factor_data.columns:

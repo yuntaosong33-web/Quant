@@ -1811,6 +1811,225 @@ class FactorCalculator:
     
     # ==================== 计算所有因子 ====================
     
+    # ==================== 复合因子计算方法（HS300深度价值策略）====================
+    
+    def calculate_value_factors(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算价值因子组（HS300深度价值策略核心）
+        
+        包含：EP Ratio, BP Ratio, 以及复合价值因子
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含 pe_ttm 和 pb 的数据框
+        
+        Returns
+        -------
+        pd.DataFrame
+            添加了价值因子的数据框，包括：
+            - ep_ratio: 盈利收益率 (1/PE)
+            - bp_ratio: 账面市值比 (1/PB)
+            - value_composite: 复合价值因子 (0.5*EP_zscore + 0.5*BP_zscore)
+            - value_composite_zscore: 标准化后的复合价值因子
+        
+        Notes
+        -----
+        - 负 PE/PB 会被设为 NaN
+        - Inf 值会被替换为 NaN，然后用 0 填充
+        - Z-Score 标准化按日期分组进行（横截面标准化）
+        """
+        result = data.copy()
+        
+        # 1. EP Ratio = 1 / PE_TTM
+        if 'pe_ttm' in result.columns:
+            pe_ttm = pd.to_numeric(result['pe_ttm'], errors='coerce')
+            pe_ttm = pe_ttm.replace(0, np.nan)
+            pe_ttm = pe_ttm.where(pe_ttm > 0, np.nan)  # 负 PE（亏损）设为 NaN
+            result['ep_ratio'] = 1.0 / pe_ttm
+            result['ep_ratio'] = result['ep_ratio'].replace([np.inf, -np.inf], np.nan)
+            logger.debug(f"EP_Ratio 计算完成，有效率: {result['ep_ratio'].notna().mean():.1%}")
+        else:
+            result['ep_ratio'] = np.nan
+            logger.warning("财务数据缺少 pe_ttm 列，EP_Ratio 将为 NaN")
+        
+        # 2. BP Ratio = 1 / PB
+        if 'pb' in result.columns:
+            pb = pd.to_numeric(result['pb'], errors='coerce')
+            pb = pb.replace(0, np.nan)
+            pb = pb.where(pb > 0, np.nan)  # 负 PB 设为 NaN
+            result['bp_ratio'] = 1.0 / pb
+            result['bp_ratio'] = result['bp_ratio'].replace([np.inf, -np.inf], np.nan)
+            logger.debug(f"BP_Ratio 计算完成，有效率: {result['bp_ratio'].notna().mean():.1%}")
+        else:
+            result['bp_ratio'] = np.nan
+            logger.warning("财务数据缺少 pb 列，BP_Ratio 将为 NaN")
+        
+        # 3. Z-Score 标准化（按日期横截面）
+        date_col = 'date' if 'date' in result.columns else 'trade_date'
+        
+        for col, zscore_col in [('ep_ratio', 'ep_zscore'), ('bp_ratio', 'bp_zscore')]:
+            if col in result.columns and result[col].notna().any():
+                if date_col in result.columns:
+                    # 按日期分组进行横截面标准化
+                    result[zscore_col] = result.groupby(date_col)[col].transform(
+                        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                    )
+                else:
+                    # 全局标准化
+                    result[zscore_col] = (result[col] - result[col].mean()) / (result[col].std() + 1e-8)
+                
+                # 处理异常值：用 0 填充 NaN
+                result[zscore_col] = result[zscore_col].fillna(0)
+            else:
+                result[zscore_col] = 0.0
+        
+        # 4. 复合价值因子 = 0.5 * EP_zscore + 0.5 * BP_zscore
+        result['value_composite'] = 0.5 * result['ep_zscore'] + 0.5 * result['bp_zscore']
+        
+        # 5. 对复合因子再次标准化
+        if date_col in result.columns:
+            result['value_composite_zscore'] = result.groupby(date_col)['value_composite'].transform(
+                lambda x: (x - x.mean()) / (x.std() + 1e-8) if x.std() > 0 else 0
+            )
+        else:
+            std_val = result['value_composite'].std()
+            if std_val > 0:
+                result['value_composite_zscore'] = (
+                    result['value_composite'] - result['value_composite'].mean()
+                ) / std_val
+            else:
+                result['value_composite_zscore'] = 0.0
+        
+        result['value_composite_zscore'] = result['value_composite_zscore'].fillna(0)
+        
+        logger.info(f"价值因子计算完成: EP有效={result['ep_ratio'].notna().mean():.1%}, BP有效={result['bp_ratio'].notna().mean():.1%}")
+        return result
+    
+    def calculate_quality_factors(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算质量因子组（HS300深度价值策略核心）
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含 roe 或 roe_ttm 的数据框
+        
+        Returns
+        -------
+        pd.DataFrame
+            添加了质量因子的数据框，包括：
+            - roe: ROE 盈利能力因子
+            - roe_zscore: 标准化后的 ROE 因子
+        
+        Notes
+        -----
+        - 优先使用 roe_ttm，其次使用 roe
+        - 负 ROE 保留（表示亏损，在排序中会被惩罚）
+        """
+        result = data.copy()
+        
+        # 1. 确定 ROE 来源
+        roe_col = None
+        if 'roe_ttm' in result.columns and result['roe_ttm'].notna().any():
+            roe_col = 'roe_ttm'
+        elif 'roe' in result.columns and result['roe'].notna().any():
+            roe_col = 'roe'
+        
+        if roe_col is not None:
+            result['roe'] = pd.to_numeric(result[roe_col], errors='coerce')
+            result['roe'] = result['roe'].replace([np.inf, -np.inf], np.nan)
+            logger.debug(f"使用 {roe_col} 作为 ROE 来源，有效率: {result['roe'].notna().mean():.1%}")
+        else:
+            result['roe'] = np.nan
+            logger.warning("财务数据缺少 roe 或 roe_ttm 列，ROE 因子将为 NaN")
+        
+        # 2. Z-Score 标准化（按日期横截面）
+        date_col = 'date' if 'date' in result.columns else 'trade_date'
+        
+        if result['roe'].notna().any():
+            if date_col in result.columns:
+                result['roe_zscore'] = result.groupby(date_col)['roe'].transform(
+                    lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                )
+            else:
+                result['roe_zscore'] = (result['roe'] - result['roe'].mean()) / (result['roe'].std() + 1e-8)
+            
+            result['roe_zscore'] = result['roe_zscore'].fillna(0)
+        else:
+            result['roe_zscore'] = 0.0
+        
+        logger.info(f"质量因子计算完成: ROE有效={result['roe'].notna().mean():.1%}")
+        return result
+    
+    def calculate_momentum_factors(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算动量因子组（HS300深度价值策略辅助）
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含 close 价格的数据框
+        
+        Returns
+        -------
+        pd.DataFrame
+            添加了动量因子的数据框，包括：
+            - sharpe_20: 20日滚动夏普比率
+            - sharpe_60: 60日滚动夏普比率（大盘股稳健趋势）
+            - sharpe_20_zscore: 标准化后的 20日夏普
+            - sharpe_60_zscore: 标准化后的 60日夏普
+        
+        Notes
+        -----
+        - Sharpe = 收益率均值 / 收益率标准差
+        - 60日夏普更适合大盘股的稳健趋势判断
+        """
+        result = data.copy()
+        
+        # 定义 Sharpe 计算辅助函数
+        def calc_rolling_sharpe(close_series: pd.Series, period: int) -> pd.Series:
+            """计算滚动夏普比率"""
+            returns = close_series.pct_change()
+            mean_ret = returns.rolling(period, min_periods=max(5, period // 2)).mean()
+            std_ret = returns.rolling(period, min_periods=max(5, period // 2)).std()
+            sharpe = mean_ret / (std_ret + 1e-8)
+            return sharpe
+        
+        # 1. 按股票分组计算 Sharpe
+        stock_col = 'stock_code' if 'stock_code' in result.columns else None
+        
+        for period, col_name in [(20, 'sharpe_20'), (60, 'sharpe_60')]:
+            if stock_col is not None:
+                result[col_name] = result.groupby(stock_col)['close'].transform(
+                    lambda x: calc_rolling_sharpe(x, period)
+                )
+            else:
+                result[col_name] = calc_rolling_sharpe(result['close'], period)
+            
+            result[col_name] = result[col_name].replace([np.inf, -np.inf], np.nan)
+            logger.debug(f"{col_name} 计算完成，有效率: {result[col_name].notna().mean():.1%}")
+        
+        # 2. Z-Score 标准化（按日期横截面）
+        date_col = 'date' if 'date' in result.columns else 'trade_date'
+        
+        for col in ['sharpe_20', 'sharpe_60']:
+            zscore_col = f'{col}_zscore'
+            if result[col].notna().any():
+                if date_col in result.columns:
+                    result[zscore_col] = result.groupby(date_col)[col].transform(
+                        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                    )
+                else:
+                    result[zscore_col] = (result[col] - result[col].mean()) / (result[col].std() + 1e-8)
+                
+                result[zscore_col] = result[zscore_col].fillna(0)
+            else:
+                result[zscore_col] = 0.0
+        
+        logger.info(f"动量因子计算完成: Sharpe20有效={result['sharpe_20'].notna().mean():.1%}, Sharpe60有效={result['sharpe_60'].notna().mean():.1%}")
+        return result
+    
     def calculate_all_factors(self) -> pd.DataFrame:
         """
         计算所有因子并返回合并后的 DataFrame
@@ -1819,10 +2038,15 @@ class FactorCalculator:
         -------
         pd.DataFrame
             包含所有因子的数据框，包括：
-            - ep_ttm: EP_TTM 价值因子
+            - ep_ttm / ep_ratio: EP 价值因子
+            - bp_ratio: BP 价值因子
+            - value_composite_zscore: 复合价值因子（EP+BP）
             - dividend_yield: 股息率价值因子
+            - roe / roe_zscore: ROE 质量因子
             - roe_stability: ROE 稳定性质量因子
             - rsi_20: 20日 RSI 动量因子
+            - sharpe_20 / sharpe_60: 夏普动量因子
+            - sharpe_20_zscore / sharpe_60_zscore: 标准化夏普因子
             - ivol: 特质波动率因子
             - small_cap: 小市值因子（激进型）
             - turnover_5d: 5日换手率因子（激进型）
@@ -1831,16 +2055,61 @@ class FactorCalculator:
         -----
         - 各因子计算失败不会影响其他因子
         - 失败的因子会记录警告日志
+        - 支持 HS300 深度价值策略和 ZZ1000 动量策略
         """
         result = self.ohlcv_data.copy()
         
+        # ========== 合并财务数据 ==========
+        if self.financial_data is not None and not self.financial_data.empty:
+            # 确定合并键
+            merge_keys = []
+            if 'stock_code' in result.columns and 'stock_code' in self.financial_data.columns:
+                merge_keys.append('stock_code')
+            
+            if merge_keys:
+                result = result.merge(
+                    self.financial_data,
+                    on=merge_keys,
+                    how='left',
+                    suffixes=('', '_fin')
+                )
+                logger.debug(f"财务数据已合并，使用键: {merge_keys}")
+        
+        # ========== HS300 深度价值策略因子 ==========
+        # 1. 复合价值因子（EP + BP）
+        try:
+            result = self.calculate_value_factors(result)
+            logger.info("复合价值因子计算完成 (value_composite_zscore)")
+        except Exception as e:
+            logger.warning(f"复合价值因子计算失败: {e}")
+            result['value_composite_zscore'] = 0.0
+        
+        # 2. ROE 质量因子
+        try:
+            result = self.calculate_quality_factors(result)
+            logger.info("ROE 质量因子计算完成 (roe_zscore)")
+        except Exception as e:
+            logger.warning(f"ROE 质量因子计算失败: {e}")
+            result['roe_zscore'] = 0.0
+        
+        # 3. Sharpe 动量因子（20日和60日）
+        try:
+            result = self.calculate_momentum_factors(result)
+            logger.info("Sharpe 动量因子计算完成 (sharpe_20_zscore, sharpe_60_zscore)")
+        except Exception as e:
+            logger.warning(f"Sharpe 动量因子计算失败: {e}")
+            result['sharpe_20_zscore'] = 0.0
+            result['sharpe_60_zscore'] = 0.0
+        
+        # ========== 传统因子（兼容旧策略）==========
         # 价值因子
         try:
             result['ep_ttm'] = self.calculate_ep_ttm()
             logger.info("EP_TTM 因子计算完成")
         except Exception as e:
             logger.warning(f"EP_TTM 因子计算失败: {e}")
-            result['ep_ttm'] = np.nan
+            if 'ep_ttm' not in result.columns:
+                result['ep_ttm'] = np.nan
         
         try:
             result['dividend_yield'] = self.calculate_dividend_yield()
@@ -1865,22 +2134,13 @@ class FactorCalculator:
             logger.warning(f"RSI_20 因子计算失败: {e}")
             result['rsi_20'] = np.nan
         
-        # 新增：ROC_20 动量因子
+        # ROC_20 动量因子
         try:
-            # 修正：FactorCalculator 没有 roc 方法，调用 TechnicalFeatures.roc 静态方法
             result['roc_20'] = TechnicalFeatures.roc(result['close'], period=20)
             logger.info("ROC_20 因子计算完成")
         except Exception as e:
             logger.warning(f"ROC_20 因子计算失败: {e}")
             result['roc_20'] = np.nan
-            
-        # [Added] 新增：Sharpe_20 夏普动量因子
-        try:
-            result['sharpe_20'] = TechnicalFeatures.rolling_sharpe(result['close'], period=20)
-            logger.info("Sharpe_20 因子计算完成")
-        except Exception as e:
-            logger.warning(f"Sharpe_20 因子计算失败: {e}")
-            result['sharpe_20'] = np.nan
         
         try:
             result['ivol'] = self.calculate_ivol(period=20)
