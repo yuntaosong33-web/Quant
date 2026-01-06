@@ -1979,11 +1979,16 @@ class FactorCalculator:
             - sharpe_60: 60日滚动夏普比率（大盘股稳健趋势）
             - sharpe_20_zscore: 标准化后的 20日夏普
             - sharpe_60_zscore: 标准化后的 60日夏普
+            - roc_20: 20日价格变动率
+            - roc_20_zscore: 标准化后的 20日 ROC
+            - momentum_composite_zscore: 合成动量因子 (0.6*ROC + 0.4*Sharpe)
         
         Notes
         -----
         - Sharpe = 收益率均值 / 收益率标准差
+        - ROC_20 = (close - close.shift(20)) / close.shift(20)
         - 60日夏普更适合大盘股的稳健趋势判断
+        - 合成动量因子综合价格动量和风险调整后动量
         """
         result = data.copy()
         
@@ -1995,6 +2000,13 @@ class FactorCalculator:
             std_ret = returns.rolling(period, min_periods=max(5, period // 2)).std()
             sharpe = mean_ret / (std_ret + 1e-8)
             return sharpe
+        
+        # 定义 ROC 计算辅助函数
+        def calc_roc(close_series: pd.Series, period: int) -> pd.Series:
+            """计算价格变动率 (Rate of Change)"""
+            shifted = close_series.shift(period)
+            roc = (close_series - shifted) / shifted
+            return roc
         
         # 1. 按股票分组计算 Sharpe
         stock_col = 'stock_code' if 'stock_code' in result.columns else None
@@ -2010,10 +2022,21 @@ class FactorCalculator:
             result[col_name] = result[col_name].replace([np.inf, -np.inf], np.nan)
             logger.debug(f"{col_name} 计算完成，有效率: {result[col_name].notna().mean():.1%}")
         
-        # 2. Z-Score 标准化（按日期横截面）
+        # 2. 计算 ROC_20（20日价格变动率）
+        if stock_col is not None:
+            result['roc_20'] = result.groupby(stock_col)['close'].transform(
+                lambda x: calc_roc(x, 20)
+            )
+        else:
+            result['roc_20'] = calc_roc(result['close'], 20)
+        
+        result['roc_20'] = result['roc_20'].replace([np.inf, -np.inf], np.nan)
+        logger.debug(f"roc_20 计算完成，有效率: {result['roc_20'].notna().mean():.1%}")
+        
+        # 3. Z-Score 标准化（按日期横截面）
         date_col = 'date' if 'date' in result.columns else 'trade_date'
         
-        for col in ['sharpe_20', 'sharpe_60']:
+        for col in ['sharpe_20', 'sharpe_60', 'roc_20']:
             zscore_col = f'{col}_zscore'
             if result[col].notna().any():
                 if date_col in result.columns:
@@ -2027,7 +2050,17 @@ class FactorCalculator:
             else:
                 result[zscore_col] = 0.0
         
-        logger.info(f"动量因子计算完成: Sharpe20有效={result['sharpe_20'].notna().mean():.1%}, Sharpe60有效={result['sharpe_60'].notna().mean():.1%}")
+        # 4. 创建合成动量因子: 0.6 * ROC_20 + 0.4 * Sharpe_20
+        result['momentum_composite_zscore'] = (
+            0.6 * result['roc_20_zscore'] + 0.4 * result['sharpe_20_zscore']
+        )
+        result['momentum_composite_zscore'] = result['momentum_composite_zscore'].fillna(0)
+        
+        logger.info(
+            f"动量因子计算完成: Sharpe20有效={result['sharpe_20'].notna().mean():.1%}, "
+            f"Sharpe60有效={result['sharpe_60'].notna().mean():.1%}, "
+            f"ROC20有效={result['roc_20'].notna().mean():.1%}"
+        )
         return result
     
     def calculate_all_factors(self) -> pd.DataFrame:

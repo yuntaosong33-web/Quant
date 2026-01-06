@@ -1509,22 +1509,54 @@ class MultiFactorStrategy(BaseStrategy):
 
         # ==========================================
         # 过滤条件 9: 过热熔断（Turnover Overheat Filter）
-        # 换手率 Z-Score > 2.5 直接剔除，不参与后续打分
+        # 换手率 Z-Score 超过阈值时剔除，不参与后续打分
         # 
         # 风控逻辑：
         # - 极高换手率往往意味着短期投机过热
         # - 这类股票波动剧烈，容易在高位接盘
         # - 直接剔除比降低分数更安全（硬性风控）
+        # 
+        # 情绪豁免逻辑（牛市进攻型）：
+        # - 如果情绪分数极高（> 0.8），说明是市场合力
+        # - 即使换手率超标也不熔断，保留热门股机会
         # ==========================================
         turnover_col = self.quality_col  # 默认 turnover_5d_zscore
         
         # 恢复过热熔断逻辑（尊重 Config 配置）
         check_col = turnover_col
         
+        # 情绪豁免阈值：情绪分数高于此值时豁免熔断
+        SENTIMENT_EXEMPT_THRESHOLD = 0.8
+        
         if check_col in day_data.columns:
             before = len(day_data)
-            # 使用配置中的阈值 (turnover_threshold) 而非写死的 2.5
-            overheat_mask = day_data[check_col] > self.turnover_threshold
+            
+            # 检查是否有情绪分数列（支持 score 或 sentiment_score）
+            sentiment_col = None
+            if 'score' in day_data.columns:
+                sentiment_col = 'score'
+            elif 'sentiment_score' in day_data.columns:
+                sentiment_col = 'sentiment_score'
+            
+            # 构建过热熔断 mask（使用配置中的阈值 turnover_threshold）
+            if sentiment_col is not None:
+                # 情绪豁免逻辑：换手率超标 且 情绪分不高时，才触发熔断
+                overheat_mask = (
+                    (day_data[check_col] > self.turnover_threshold) & 
+                    (day_data[sentiment_col].fillna(0) < SENTIMENT_EXEMPT_THRESHOLD)
+                )
+                # 统计被情绪豁免的股票数量
+                raw_overheat_count = (day_data[check_col] > self.turnover_threshold).sum()
+                exempt_count = raw_overheat_count - overheat_mask.sum()
+                if exempt_count > 0:
+                    logger.info(
+                        f"🛡️ 情绪豁免 {date.strftime('%Y-%m-%d')}: "
+                        f"{exempt_count} 只股票换手率超标但情绪分 >= {SENTIMENT_EXEMPT_THRESHOLD}，保留"
+                    )
+            else:
+                # 无情绪分数列，仅使用阈值判断
+                overheat_mask = day_data[check_col] > self.turnover_threshold
+            
             overheat_stocks = day_data[overheat_mask]
             
             if len(overheat_stocks) > 0:
@@ -1541,7 +1573,12 @@ class MultiFactorStrategy(BaseStrategy):
                 for idx, row in overheat_stocks.iterrows():
                     code = row[stock_col] if stock_col in row.index else idx
                     zscore = row[check_col]
-                    overheat_details.append(f"{code}({zscore:.2f})")
+                    # 如果有情绪分数，也显示出来
+                    if sentiment_col is not None and sentiment_col in row.index:
+                        sent_score = row[sentiment_col]
+                        overheat_details.append(f"{code}(turn={zscore:.2f},sent={sent_score:.2f})")
+                    else:
+                        overheat_details.append(f"{code}({zscore:.2f})")
                 
                 # 剔除过热股票
                 day_data = day_data[~overheat_mask]
