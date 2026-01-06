@@ -2199,6 +2199,7 @@ class FactorCalculator:
         
         # ========== Alpha 因子（量价配合类）==========
         # 牛市进攻型策略：激活 Alpha 因子捕捉量价背离和动量加速信号
+        alpha_enabled = False
         try:
             alpha_engine = AlphaFeatures()
             alpha_df = alpha_engine.calculate(result)
@@ -2209,6 +2210,7 @@ class FactorCalculator:
                 if col in alpha_df.columns:
                     result[col] = alpha_df[col]
             
+            alpha_enabled = True
             logger.info(f"Alpha 因子计算完成: {alpha_feature_names}")
         except Exception as e:
             logger.warning(f"Alpha 因子计算失败: {e}")
@@ -2216,6 +2218,46 @@ class FactorCalculator:
             result['alpha_001'] = np.nan
             result['alpha_002'] = np.nan
             result['alpha_003'] = np.nan
+        
+        # ========== 关键修复：将 Alpha 因子纳入动量组合 ==========
+        # Alpha 因子需要在 momentum_composite_zscore 计算之后才生成
+        # 因此必须在此处重新计算复合动量因子
+        if alpha_enabled and 'alpha_001' in result.columns and result['alpha_001'].notna().any():
+            try:
+                # 日期列用于横截面标准化
+                date_col = 'date' if 'date' in result.columns else 'trade_date'
+                
+                # 对 Alpha 因子进行 Z-Score 标准化（与 ROC/Sharpe 对齐量纲）
+                for alpha_col in ['alpha_001', 'alpha_002', 'alpha_003']:
+                    zscore_col = f'{alpha_col}_zscore'
+                    if alpha_col in result.columns and result[alpha_col].notna().any():
+                        if date_col in result.columns:
+                            result[zscore_col] = result.groupby(date_col)[alpha_col].transform(
+                                lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                            )
+                        else:
+                            result[zscore_col] = (
+                                result[alpha_col] - result[alpha_col].mean()
+                            ) / (result[alpha_col].std() + 1e-8)
+                        result[zscore_col] = result[zscore_col].fillna(0)
+                    else:
+                        result[zscore_col] = 0.0
+                
+                # 重新计算复合动量因子
+                # 新配方: 40% ROC (涨幅) + 30% Sharpe (稳健) + 30% Alpha001 (量价配合)
+                # Alpha001 = (Close - VWAP) / VWAP，正值表示收盘价高于均价，量价配合好
+                result['momentum_composite_zscore'] = (
+                    0.4 * result['roc_20_zscore'].fillna(0) + 
+                    0.3 * result['sharpe_20_zscore'].fillna(0) + 
+                    0.3 * result['alpha_001_zscore'].fillna(0)
+                )
+                result['momentum_composite_zscore'] = result['momentum_composite_zscore'].fillna(0)
+                
+                logger.info(
+                    "🚀 动量因子已升级: 40% ROC + 30% Sharpe + 30% Alpha001 (量价配合)"
+                )
+            except Exception as e:
+                logger.warning(f"Alpha 因子纳入动量组合失败: {e}，保持原有动量公式")
         
         logger.info("所有因子计算完成")
         return result
