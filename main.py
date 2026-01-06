@@ -426,11 +426,24 @@ class DailyUpdateRunner:
         """使用 Tushare 更新市场数据"""
         self.logger.info(f"使用 Tushare 获取 {stock_pool} 数据...")
         
-        # 获取成分股列表
-        stock_list = self.tushare_loader.fetch_index_constituents(stock_pool)
-        if not stock_list:
-            self.logger.error(f"无法获取 {stock_pool} 成分股列表")
-            return False
+        # 获取股票列表（根据 stock_pool 类型选择不同方法）
+        if stock_pool == "all":
+            # 全市场模式：获取所有上市股票
+            self.logger.info("全市场模式：获取所有上市股票...")
+            stock_list = self.tushare_loader.fetch_all_stocks()
+            if not stock_list:
+                self.logger.error("无法获取全市场股票列表")
+                return False
+            self.logger.warning(
+                f"⚠️ 全市场模式：共 {len(stock_list)} 只股票，"
+                f"数据下载和计算将耗时较长，请耐心等待"
+            )
+        else:
+            # 指数成分股模式
+            stock_list = self.tushare_loader.fetch_index_constituents(stock_pool)
+            if not stock_list:
+                self.logger.error(f"无法获取 {stock_pool} 成分股列表")
+                return False
         
         self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
         

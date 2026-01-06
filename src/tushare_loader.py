@@ -64,11 +64,12 @@ class TushareDataLoader:
     """
     
     # API 请求限流参数
-    # 普通用户限制: 200 次/分钟 = 3.33 次/秒，安全起见设为 0.35 秒间隔
-    REQUEST_INTERVAL = 0.35  # 每次请求间隔（秒）
+    # 普通用户限制: 200 次/分钟 = 3.33 次/秒
+    # 付费用户限制更高，可适当降低间隔
+    REQUEST_INTERVAL = 0.12  # 每次请求间隔（秒）- 激进模式
     MAX_RETRIES = 3
-    RETRY_DELAY = 2.0  # 重试延迟
-    RATE_LIMIT_DELAY = 60.0  # 触发频率限制后等待时间（秒）
+    RETRY_DELAY = 1.0  # 重试延迟（秒）
+    RATE_LIMIT_DELAY = 30.0  # 触发频率限制后等待时间（秒）
     
     # 股票池代码映射
     INDEX_CODE_MAPPING = {
@@ -260,6 +261,97 @@ class TushareDataLoader:
         logger.info(f"获取到 {len(stock_list)} 只成分股")
         return stock_list
     
+    def fetch_all_stocks(
+        self,
+        exchange: Optional[str] = None,
+        list_status: str = "L"
+    ) -> List[str]:
+        """
+        获取全市场股票列表
+        
+        使用 Tushare stock_basic 接口获取所有上市股票。
+        
+        Parameters
+        ----------
+        exchange : Optional[str]
+            交易所筛选：
+            - None: 全部（默认）
+            - "SSE": 上交所
+            - "SZSE": 深交所
+        list_status : str
+            上市状态：
+            - "L": 上市中（默认）
+            - "D": 退市
+            - "P": 暂停上市
+        
+        Returns
+        -------
+        List[str]
+            股票代码列表（6位代码）
+        
+        Notes
+        -----
+        - 默认只获取上市中的股票
+        - 会自动过滤 ST、退市风险警示股票
+        - 结果会缓存到本地（当日有效）
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> all_stocks = loader.fetch_all_stocks()
+        >>> print(f"全市场共 {len(all_stocks)} 只股票")
+        """
+        logger.info(f"获取全市场股票列表: exchange={exchange}, list_status={list_status}")
+        
+        # 尝试缓存
+        today = datetime.now().strftime("%Y%m%d")
+        cache_file = self.cache_dir / f"stock_basic_{today}.parquet"
+        
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                # 应用筛选条件
+                if exchange:
+                    df = df[df["exchange"] == exchange]
+                stock_list = df["ts_code"].str[:6].tolist()
+                logger.info(f"从缓存加载全市场股票列表: {len(stock_list)} 只")
+                return stock_list
+            except Exception as e:
+                logger.warning(f"读取缓存失败: {e}")
+        
+        # 调用 API 获取股票基础信息
+        df = self._fetch_with_retry(
+            self.pro.stock_basic,
+            exchange=exchange or "",
+            list_status=list_status,
+            fields="ts_code,symbol,name,area,industry,market,list_date,exchange"
+        )
+        
+        if df is None or df.empty:
+            logger.warning("无法获取全市场股票列表")
+            return []
+        
+        # 过滤 ST 和退市风险股票
+        if "name" in df.columns:
+            st_mask = df["name"].str.contains(r"ST|\*ST|退|S\s|PT", na=False, regex=True)
+            before_count = len(df)
+            df = df[~st_mask]
+            filtered_count = before_count - len(df)
+            if filtered_count > 0:
+                logger.info(f"过滤 ST/退市风险股票: {filtered_count} 只")
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+            logger.info(f"全市场股票列表已缓存: {cache_file}")
+        except Exception as e:
+            logger.warning(f"缓存保存失败: {e}")
+        
+        # 返回 6 位代码
+        stock_list = df["ts_code"].str[:6].tolist()
+        logger.info(f"获取全市场股票列表完成: {len(stock_list)} 只")
+        return stock_list
+    
     # ==================== 日线数据 ====================
     
     def fetch_daily_data(
@@ -350,8 +442,8 @@ class TushareDataLoader:
         end_date: str,
         adj: str = "qfq",
         show_progress: bool = True,
-        batch_size: int = 150,
-        batch_sleep: float = 20.0
+        batch_size: int = 200,
+        batch_sleep: float = 5.0
     ) -> pd.DataFrame:
         """
         批量获取日线数据（带限流保护）
@@ -555,8 +647,8 @@ class TushareDataLoader:
         self,
         stock_list: List[str],
         show_progress: bool = True,
-        batch_size: int = 100,
-        batch_sleep: float = 30.0
+        batch_size: int = 150,
+        batch_sleep: float = 8.0
     ) -> pd.DataFrame:
         """
         批量获取财务指标（带限流保护）
