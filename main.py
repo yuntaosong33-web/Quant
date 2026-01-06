@@ -1608,6 +1608,64 @@ class DailyUpdateRunner:
                 factor_data['value_composite_zscore'] = 0.0
                 self.logger.warning("缺少 ep_ratio_zscore/bp_ratio_zscore，复合价值因子为 0")
             
+            # ==================== 计算 Alpha 因子（量价配合）====================
+            # 牛市进攻型策略核心因子
+            alpha_enabled = False
+            try:
+                # Alpha_001: (Close - VWAP) / VWAP，正值表示收盘价高于均价
+                if 'amount' in factor_data.columns and 'volume' in factor_data.columns:
+                    vwap = factor_data['amount'] / factor_data['volume'].replace(0, np.nan)
+                    factor_data['alpha_001'] = (factor_data['close'] - vwap) / vwap.replace(0, np.nan)
+                    factor_data['alpha_001'] = factor_data['alpha_001'].replace([np.inf, -np.inf], np.nan)
+                    
+                    # 对 Alpha_001 进行 Z-Score 标准化（横截面）
+                    if 'date' in factor_data.columns:
+                        factor_data['alpha_001_zscore'] = factor_data.groupby('date')['alpha_001'].transform(
+                            lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                        ).fillna(0)
+                    else:
+                        factor_data['alpha_001_zscore'] = (
+                            (factor_data['alpha_001'] - factor_data['alpha_001'].mean()) / 
+                            (factor_data['alpha_001'].std() + 1e-8)
+                        ).fillna(0)
+                    
+                    alpha_enabled = True
+                    self.logger.info("Alpha_001 因子（量价配合）计算完成")
+                else:
+                    factor_data['alpha_001_zscore'] = 0.0
+                    self.logger.warning("缺少 amount/volume 列，Alpha_001 因子设为 0")
+            except Exception as e:
+                factor_data['alpha_001_zscore'] = 0.0
+                self.logger.warning(f"Alpha_001 因子计算失败: {e}")
+            
+            # ==================== 计算复合动量因子 momentum_composite_zscore ====================
+            # 牛市进攻型配方: 40% ROC (涨幅) + 30% Sharpe (稳健) + 30% Alpha001 (量价配合)
+            roc_col = 'roc_20_zscore' if 'roc_20_zscore' in factor_data.columns else None
+            sharpe_col = 'sharpe_20_zscore' if 'sharpe_20_zscore' in factor_data.columns else None
+            alpha_col = 'alpha_001_zscore' if alpha_enabled else None
+            
+            if roc_col and sharpe_col and alpha_col:
+                # 完整配方: 40% ROC + 30% Sharpe + 30% Alpha001
+                factor_data['momentum_composite_zscore'] = (
+                    0.4 * factor_data[roc_col].fillna(0) +
+                    0.3 * factor_data[sharpe_col].fillna(0) +
+                    0.3 * factor_data[alpha_col].fillna(0)
+                )
+                self.logger.info("🚀 复合动量因子计算完成: 40% ROC + 30% Sharpe + 30% Alpha001")
+            elif roc_col and sharpe_col:
+                # 备选配方: 60% ROC + 40% Sharpe
+                factor_data['momentum_composite_zscore'] = (
+                    0.6 * factor_data[roc_col].fillna(0) +
+                    0.4 * factor_data[sharpe_col].fillna(0)
+                )
+                self.logger.info("复合动量因子计算完成: 60% ROC + 40% Sharpe（无 Alpha）")
+            elif roc_col:
+                factor_data['momentum_composite_zscore'] = factor_data[roc_col].fillna(0)
+                self.logger.warning("复合动量因子使用 ROC 单因子")
+            else:
+                factor_data['momentum_composite_zscore'] = 0.0
+                self.logger.warning("无法计算复合动量因子（缺少必要因子）")
+            
             for alias, source in factor_alias_mapping.items():
                 if source in factor_data.columns and alias not in factor_data.columns:
                     factor_data[alias] = factor_data[source]
@@ -3250,6 +3308,71 @@ def _generate_backtest_factor_data(
     
     # 填充动量因子的 NaN
     factor_df['momentum_zscore'] = factor_df['momentum_zscore'].fillna(0.0)
+    
+    # ==================== 计算 Alpha 因子（量价配合）====================
+    # 用于回测的 Alpha_001 因子
+    # Alpha_001 = (Close - VWAP) / VWAP
+    alpha_enabled = False
+    alpha_records = []
+    
+    try:
+        for stock_code, stock_df in price_data_dict.items():
+            if 'amount' in stock_df.columns and 'volume' in stock_df.columns:
+                vwap = stock_df['amount'] / stock_df['volume'].replace(0, np.nan)
+                alpha_001 = (stock_df['close'] - vwap) / vwap.replace(0, np.nan)
+                alpha_001 = alpha_001.replace([np.inf, -np.inf], np.nan)
+                
+                for date in stock_df.index:
+                    if pd.notna(alpha_001.get(date)):
+                        alpha_records.append({
+                            'date': date,
+                            'stock_code': stock_code,
+                            'alpha_001': alpha_001[date]
+                        })
+        
+        if alpha_records:
+            alpha_df = pd.DataFrame(alpha_records)
+            factor_df = factor_df.merge(alpha_df, on=['date', 'stock_code'], how='left')
+            
+            # Z-Score 标准化
+            factor_df['alpha_001_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+                lambda g: zscore_by_date(g, 'alpha_001'), include_groups=False
+            ).reset_index(level=0, drop=True).fillna(0)
+            
+            alpha_enabled = True
+            logger.info("Alpha_001 因子（量价配合）计算完成")
+        else:
+            factor_df['alpha_001_zscore'] = 0.0
+            logger.warning("无法计算 Alpha_001 因子：缺少 amount/volume 数据")
+    except Exception as e:
+        factor_df['alpha_001_zscore'] = 0.0
+        logger.warning(f"Alpha_001 因子计算失败: {e}")
+    
+    # ==================== 计算复合动量因子 momentum_composite_zscore ====================
+    # 牛市进攻型配方: 40% ROC + 30% Sharpe + 30% Alpha001
+    roc_col = 'roc_20_zscore' if 'roc_20_zscore' in factor_df.columns else None
+    sharpe_col = 'sharpe_20_zscore' if 'sharpe_20_zscore' in factor_df.columns else None
+    alpha_col = 'alpha_001_zscore' if alpha_enabled else None
+    
+    if roc_col and sharpe_col and alpha_col:
+        factor_df['momentum_composite_zscore'] = (
+            0.4 * factor_df[roc_col].fillna(0) +
+            0.3 * factor_df[sharpe_col].fillna(0) +
+            0.3 * factor_df[alpha_col].fillna(0)
+        )
+        logger.info("🚀 复合动量因子计算完成: 40% ROC + 30% Sharpe + 30% Alpha001")
+    elif roc_col and sharpe_col:
+        factor_df['momentum_composite_zscore'] = (
+            0.6 * factor_df[roc_col].fillna(0) +
+            0.4 * factor_df[sharpe_col].fillna(0)
+        )
+        logger.info("复合动量因子计算完成: 60% ROC + 40% Sharpe（无 Alpha）")
+    elif roc_col:
+        factor_df['momentum_composite_zscore'] = factor_df[roc_col].fillna(0)
+        logger.warning("复合动量因子使用 ROC 单因子")
+    else:
+        factor_df['momentum_composite_zscore'] = factor_df['momentum_zscore'].fillna(0)
+        logger.warning("复合动量因子使用 RSI 作为后备")
     
     # 统计有效的小市值因子数量
     valid_small_cap = factor_df['small_cap_zscore'].notna().sum()
