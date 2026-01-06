@@ -58,8 +58,8 @@ strategy:
   sentiment_weight: 0.3   # 情绪因子 - 30% (故事驱动)
   
   # ===== 选股参数 =====
-  top_n: 8                # 持仓8只，分散风险
-  min_listing_days: 180   # 至少上市6个月（次新股风险较高）
+  top_n: 6                # 持仓6只，分散风险
+  min_listing_days: 252   # 至少上市一年（次新股风险较高）
   
   # ===== 风控熔断阈值 (牛市放宽版) =====
   # [关键修改] 大幅放宽换手率限制，避免卖飞龙头妖股
@@ -67,8 +67,8 @@ strategy:
   volatility_threshold: 5.0  # 波动率阈值: 5.0 (容忍高波动)
   
   # ===== 板块过滤 =====
-  exclude_chinext: false  # 不排除创业板（高弹性）
-  exclude_star: false     # 不排除科创板（科技龙头）
+  exclude_chinext: true   # 排除创业板（300开头，波动大）
+  exclude_star: true      # 排除科创板（688开头，门槛高/流动性差）
   
   # ===== 因子列名映射 =====
   # [牛市进攻] 使用合成动量因子 (0.6*ROC + 0.4*Sharpe)
