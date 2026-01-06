@@ -2592,6 +2592,601 @@ class TushareDataLoader:
         )
         
         return candidates
+    
+    # ==================== 融资融券与杠杆因子 ====================
+    
+    def fetch_margin_detail(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取个股融资融券明细数据
+        
+        使用 Tushare Pro margin_detail 接口获取个股融资融券交易明细，
+        包含融资买入、融资偿还、融券卖出等数据。
+        
+        Parameters
+        ----------
+        stock_code : str
+            股票代码（6位），如 "000001"
+        start_date : str
+            开始日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        end_date : str
+            结束日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            融资融券明细数据，包含：
+            - trade_date: 交易日期
+            - ts_code: 股票代码
+            - stock_code: 6位股票代码
+            - rzye: 融资余额（元）
+            - rzmre: 融资买入额（元）
+            - rzche: 融资偿还额（元）
+            - rqye: 融券余额（元）
+            - rqyl: 融券余量（股）
+            - rqmcl: 融券卖出量（股）
+            - rqchl: 融券偿还量（股）
+            失败返回 None
+        
+        Notes
+        -----
+        - Tushare Pro margin_detail 接口需要较高积分权限
+        - 融资数据是判断散户杠杆情绪的重要指标
+        - 当融资买入占比过高时，往往是阶段性顶部信号
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> margin = loader.fetch_margin_detail("000001", "20240101", "20240115")
+        >>> # 计算融资买入占比趋势
+        >>> print(margin[['trade_date', 'rzye', 'rzmre']].tail())
+        """
+        # 标准化股票代码
+        ts_code = self._to_ts_code(stock_code)
+        
+        # 标准化日期格式
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        logger.debug(f"获取融资融券数据: {stock_code}, {start_date} ~ {end_date}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"margin_{stock_code}_{start_date}_{end_date}.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.debug(f"从缓存加载融资融券数据: {stock_code}")
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.margin_detail,
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if df is None or df.empty:
+            logger.debug(f"获取融资融券数据失败: {stock_code}")
+            return None
+        
+        # 添加 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 日期标准化
+        if "trade_date" in df.columns:
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df = df.sort_values("trade_date")
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        logger.debug(f"获取融资融券数据成功: {stock_code}, {len(df)} 条")
+        return df
+    
+    def fetch_margin(
+        self,
+        trade_date: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取全市场融资融券汇总数据
+        
+        使用 Tushare Pro margin 接口获取全市场融资融券汇总，
+        是快速获取市场杠杆情绪的高效方式。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            全市场融资融券汇总数据，包含：
+            - trade_date: 交易日期
+            - ts_code: 股票代码
+            - stock_code: 6位股票代码
+            - rzye: 融资余额（元）
+            - rzmre: 融资买入额（元）
+            - rzche: 融资偿还额（元）
+            - rqye: 融券余额（元）
+            - rqmcl: 融券卖出量（股）
+            - rzrqye: 融资融券余额（元）
+            失败返回 None
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> margin = loader.fetch_margin("20240115")
+        >>> # 筛选融资余额最高的股票
+        >>> top_margin = margin.nlargest(20, 'rzye')
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        logger.debug(f"获取全市场融资融券数据: {trade_date}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"margin_{trade_date}.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.debug(f"从缓存加载融资融券数据: {trade_date}, {len(df)} 条")
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.margin,
+            trade_date=trade_date
+        )
+        
+        if df is None or df.empty:
+            logger.debug(f"获取融资融券数据失败: {trade_date}")
+            return None
+        
+        # 添加 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        logger.debug(f"获取融资融券数据成功: {trade_date}, {len(df)} 条")
+        return df
+    
+    def fetch_margin_batch(
+        self,
+        stock_list: List[str],
+        start_date: str,
+        end_date: str,
+        show_progress: bool = True,
+        batch_size: int = 150,
+        batch_sleep: float = 8.0
+    ) -> pd.DataFrame:
+        """
+        批量获取融资融券数据
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        show_progress : bool
+            是否显示进度条
+        batch_size : int
+            每批次处理的股票数量
+        batch_sleep : float
+            每批次之间的休息时间（秒）
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的融资融券数据
+        """
+        all_data = []
+        total = len(stock_list)
+        success_count = 0
+        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    enumerate(stock_list),
+                    total=total,
+                    desc="📊 获取融资融券",
+                    unit="只",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = enumerate(stock_list)
+                logger.info(f"开始获取融资融券数据: {total} 只股票...")
+        else:
+            iterator = enumerate(stock_list)
+        
+        for i, stock in iterator:
+            df = self.fetch_margin_detail(stock, start_date, end_date)
+            if df is not None and not df.empty:
+                all_data.append(df)
+                success_count += 1
+            
+            if show_progress and hasattr(iterator, 'set_postfix'):
+                iterator.set_postfix({"成功": success_count, "当前": stock})
+            
+            # 批次休息
+            if (i + 1) % batch_size == 0 and (i + 1) < total:
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description(f"📊 休息{batch_sleep}s")
+                time.sleep(batch_sleep)
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description("📊 获取融资融券")
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(all_data, ignore_index=True)
+        logger.info(f"批量获取融资融券完成: {success_count}/{total} 只, {len(result)} 条记录")
+        return result
+    
+    def calculate_leverage_risk(
+        self,
+        stock_list: List[str],
+        trade_date: str,
+        lookback_days: int = 20
+    ) -> pd.DataFrame:
+        """
+        计算杠杆过热因子 (Leverage Overheat Factor)
+        
+        典型的反向指标：当散户疯狂融资买入时，往往是阶段性顶部。
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表（6位代码）
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        lookback_days : int
+            计算历史均值和标准差的回溯天数，默认 20 天
+        
+        Returns
+        -------
+        pd.DataFrame
+            杠杆过热因子数据，包含：
+            - stock_code: 股票代码
+            - rzye: 融资余额（元）
+            - rzmre: 融资买入额（元）
+            - margin_buy_ratio: 融资买入占比（融资买入额/成交额）
+            - margin_balance_ratio: 融资余额市值比（融资余额/总市值）
+            - leverage_heat: 杠杆过热因子（标准化后，值越大风险越高）
+            - leverage_risk_score: 风险得分 (0-1，越高越危险)
+        
+        Notes
+        -----
+        计算逻辑：
+        1. 融资买入占比 = 融资买入额 / 当日成交额（交易拥挤度）
+        2. 融资余额市值比 = 融资余额 / 总市值（存量杠杆压力）
+        3. 过热因子 = (当日融资买入占比 - 20日均值) / 20日标准差
+        
+        风险警示：
+        - leverage_heat > 2: 极度过热，高风险
+        - leverage_heat > 1: 偏热，需警惕
+        - leverage_heat < -1: 偏冷，可能是买入机会
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> stocks = ["000001", "000002", "600000"]
+        >>> risk = loader.calculate_leverage_risk(stocks, "20240115")
+        >>> # 筛选过热股票（可能见顶）
+        >>> overheated = risk[risk['leverage_heat'] > 2]
+        """
+        trade_date = trade_date.replace("-", "")
+        start_date = (
+            datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=lookback_days + 10)
+        ).strftime("%Y%m%d")
+        
+        logger.info(f"🔥 计算杠杆过热因子: {len(stock_list)} 只股票, {trade_date}")
+        
+        # 1. 获取融资融券数据
+        margin_df = self.fetch_margin_batch(
+            stock_list=stock_list,
+            start_date=start_date,
+            end_date=trade_date,
+            show_progress=True
+        )
+        
+        # 2. 获取成交额和市值数据
+        daily_basic = self.fetch_daily_basic(trade_date, stock_list)
+        
+        # 3. 获取日线成交额
+        daily_data = self.fetch_daily_data_batch(
+            stock_list=stock_list,
+            start_date=start_date,
+            end_date=trade_date,
+            show_progress=False
+        )
+        
+        if margin_df.empty:
+            logger.warning("无融资融券数据，返回空结果")
+            return pd.DataFrame({"stock_code": stock_list, "leverage_heat": 0, "leverage_risk_score": 0.5})
+        
+        # 4. 计算融资买入占比（需要合并成交额）
+        if not daily_data.empty and "amount" in daily_data.columns:
+            # 按股票和日期合并
+            if "trade_date" in margin_df.columns:
+                margin_df["trade_date"] = pd.to_datetime(margin_df["trade_date"])
+            if "date" in daily_data.columns:
+                daily_data = daily_data.rename(columns={"date": "trade_date"})
+            
+            margin_df = margin_df.merge(
+                daily_data[["stock_code", "trade_date", "amount"]],
+                on=["stock_code", "trade_date"],
+                how="left"
+            )
+        
+        # 5. 计算融资买入占比
+        if "rzmre" in margin_df.columns and "amount" in margin_df.columns:
+            margin_df["margin_buy_ratio"] = (
+                margin_df["rzmre"] / margin_df["amount"].replace(0, np.nan)
+            )
+        else:
+            margin_df["margin_buy_ratio"] = np.nan
+        
+        # 6. 计算历史均值和标准差
+        result_list = []
+        for stock in stock_list:
+            stock_margin = margin_df[margin_df["stock_code"] == stock].copy()
+            
+            if stock_margin.empty:
+                result_list.append({
+                    "stock_code": stock,
+                    "rzye": np.nan,
+                    "rzmre": np.nan,
+                    "margin_buy_ratio": np.nan,
+                    "margin_balance_ratio": np.nan,
+                    "leverage_heat": 0,
+                    "leverage_risk_score": 0.5
+                })
+                continue
+            
+            # 按日期排序
+            stock_margin = stock_margin.sort_values("trade_date")
+            
+            # 计算滚动统计
+            stock_margin["ratio_mean"] = stock_margin["margin_buy_ratio"].rolling(
+                window=lookback_days, min_periods=5
+            ).mean()
+            stock_margin["ratio_std"] = stock_margin["margin_buy_ratio"].rolling(
+                window=lookback_days, min_periods=5
+            ).std()
+            
+            # 取最新一天的数据
+            latest = stock_margin.iloc[-1]
+            
+            # 计算过热因子（Z-score）
+            if pd.notna(latest.get("ratio_std")) and latest["ratio_std"] > 0:
+                leverage_heat = (
+                    (latest["margin_buy_ratio"] - latest["ratio_mean"]) / latest["ratio_std"]
+                )
+            else:
+                leverage_heat = 0
+            
+            # 计算融资余额市值比
+            margin_balance_ratio = np.nan
+            if daily_basic is not None and not daily_basic.empty:
+                stock_basic = daily_basic[daily_basic["stock_code"] == stock]
+                if not stock_basic.empty and "rzye" in latest:
+                    total_mv = stock_basic["total_mv"].iloc[0]
+                    if pd.notna(total_mv) and total_mv > 0:
+                        margin_balance_ratio = latest.get("rzye", 0) / total_mv
+            
+            result_list.append({
+                "stock_code": stock,
+                "rzye": latest.get("rzye", np.nan),
+                "rzmre": latest.get("rzmre", np.nan),
+                "margin_buy_ratio": latest.get("margin_buy_ratio", np.nan),
+                "margin_balance_ratio": margin_balance_ratio,
+                "leverage_heat": leverage_heat,
+            })
+        
+        result = pd.DataFrame(result_list)
+        
+        # 7. 计算风险得分（使用排名分位数）
+        valid_mask = result["leverage_heat"].notna() & (result["leverage_heat"] != 0)
+        if valid_mask.sum() > 0:
+            result.loc[valid_mask, "leverage_risk_score"] = (
+                result.loc[valid_mask, "leverage_heat"].rank(pct=True)
+            )
+        else:
+            result["leverage_risk_score"] = 0.5
+        
+        result["leverage_risk_score"] = result["leverage_risk_score"].fillna(0.5)
+        
+        # 统计信息
+        overheated_count = (result["leverage_heat"] > 2).sum()
+        cold_count = (result["leverage_heat"] < -1).sum()
+        
+        logger.info(
+            f"✅ 杠杆过热因子计算完成: "
+            f"{len(result)} 只, 过热={overheated_count}, 偏冷={cold_count}"
+        )
+        
+        return result
+    
+    def calculate_market_leverage_sentiment(
+        self,
+        trade_date: str,
+        index_code: str = "hs300"
+    ) -> Dict[str, Any]:
+        """
+        计算市场整体杠杆情绪
+        
+        获取指定指数成分股的杠杆情绪汇总，用于判断市场整体风险水平。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期
+        index_code : str
+            指数代码，如 "hs300", "zz500"
+        
+        Returns
+        -------
+        Dict[str, Any]
+            市场杠杆情绪指标：
+            - avg_leverage_heat: 平均过热因子
+            - overheated_ratio: 过热股票占比
+            - cold_ratio: 偏冷股票占比
+            - market_risk_level: 市场风险等级（low/medium/high/extreme）
+            - signal: 信号建议（buy/hold/sell）
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> sentiment = loader.calculate_market_leverage_sentiment("20240115")
+        >>> print(f"市场风险等级: {sentiment['market_risk_level']}")
+        >>> print(f"建议操作: {sentiment['signal']}")
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        logger.info(f"📈 计算市场整体杠杆情绪: {index_code}, {trade_date}")
+        
+        # 获取成分股
+        stock_list = self.fetch_index_constituents(index_code)
+        
+        if not stock_list:
+            return {
+                "avg_leverage_heat": 0,
+                "overheated_ratio": 0,
+                "cold_ratio": 0,
+                "market_risk_level": "unknown",
+                "signal": "hold"
+            }
+        
+        # 采样（避免请求过多）
+        sample_size = min(100, len(stock_list))
+        sampled_stocks = stock_list[:sample_size]
+        
+        # 计算杠杆因子
+        leverage_df = self.calculate_leverage_risk(
+            stock_list=sampled_stocks,
+            trade_date=trade_date
+        )
+        
+        if leverage_df.empty:
+            return {
+                "avg_leverage_heat": 0,
+                "overheated_ratio": 0,
+                "cold_ratio": 0,
+                "market_risk_level": "unknown",
+                "signal": "hold"
+            }
+        
+        # 统计指标
+        valid_heat = leverage_df["leverage_heat"].dropna()
+        avg_heat = valid_heat.mean() if len(valid_heat) > 0 else 0
+        overheated_ratio = (valid_heat > 2).sum() / len(valid_heat) if len(valid_heat) > 0 else 0
+        cold_ratio = (valid_heat < -1).sum() / len(valid_heat) if len(valid_heat) > 0 else 0
+        
+        # 判断风险等级
+        if avg_heat > 2 or overheated_ratio > 0.3:
+            risk_level = "extreme"
+            signal = "sell"
+        elif avg_heat > 1 or overheated_ratio > 0.2:
+            risk_level = "high"
+            signal = "reduce"
+        elif avg_heat > 0.5:
+            risk_level = "medium"
+            signal = "hold"
+        elif avg_heat < -1 and cold_ratio > 0.3:
+            risk_level = "low"
+            signal = "buy"
+        else:
+            risk_level = "normal"
+            signal = "hold"
+        
+        result = {
+            "trade_date": trade_date,
+            "index_code": index_code,
+            "sample_size": len(sampled_stocks),
+            "avg_leverage_heat": round(avg_heat, 3),
+            "overheated_ratio": round(overheated_ratio, 3),
+            "cold_ratio": round(cold_ratio, 3),
+            "market_risk_level": risk_level,
+            "signal": signal
+        }
+        
+        logger.info(
+            f"✅ 市场杠杆情绪: 风险={risk_level}, "
+            f"过热={avg_heat:.2f}, 过热比={overheated_ratio:.1%}"
+        )
+        
+        return result
+    
+    def get_leverage_warning_stocks(
+        self,
+        stock_list: List[str],
+        trade_date: str,
+        heat_threshold: float = 2.0
+    ) -> pd.DataFrame:
+        """
+        获取杠杆过热预警股票
+        
+        筛选出融资过热的股票，提示潜在的回调风险。
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表
+        trade_date : str
+            交易日期
+        heat_threshold : float
+            过热阈值，默认 2.0（2倍标准差）
+        
+        Returns
+        -------
+        pd.DataFrame
+            过热预警股票列表
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> stocks = loader.fetch_index_constituents("hs300")
+        >>> warnings = loader.get_leverage_warning_stocks(stocks, "20240115")
+        >>> print(f"发现 {len(warnings)} 只过热股票")
+        """
+        leverage_df = self.calculate_leverage_risk(stock_list, trade_date)
+        
+        if leverage_df.empty:
+            return pd.DataFrame()
+        
+        # 筛选过热股票
+        warnings = leverage_df[leverage_df["leverage_heat"] >= heat_threshold].copy()
+        warnings = warnings.sort_values("leverage_heat", ascending=False)
+        
+        if len(warnings) > 0:
+            logger.warning(
+                f"⚠️ 发现 {len(warnings)} 只杠杆过热股票 "
+                f"(heat >= {heat_threshold})"
+            )
+        
+        return warnings
 
 
 # ==================== 便捷函数 ====================
