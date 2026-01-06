@@ -69,8 +69,13 @@ notebook = [
     "seaborn>=0.13.0",
     "plotly>=5.17.0",
 ]
+# Ray 分布式计算 (拥挤因子计算模块)
+distributed = [
+    "ray[default]>=2.9.0",
+    "dask[complete]>=2024.1.0",
+]
 all = [
-    "ashare-quant-system[dev,notebook]",
+    "ashare-quant-system[dev,notebook,distributed]",
 ]
 
 [project.urls]
