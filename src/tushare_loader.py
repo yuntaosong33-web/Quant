@@ -1510,6 +1510,1088 @@ class TushareDataLoader:
         # 降级到普通行业分类
         logger.info("使用普通行业分类替代申万分类")
         return self.fetch_industry_mapping()
+    
+    # ==================== 资金流向与北向资金 ====================
+    
+    def fetch_moneyflow(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取个股资金流向数据（大单/超大单）
+        
+        使用 Tushare Pro moneyflow 接口获取个股资金流向明细数据，
+        包含大单、超大单、中单、小单的买入卖出金额。
+        
+        Parameters
+        ----------
+        stock_code : str
+            股票代码（6位），如 "000001"
+        start_date : str
+            开始日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        end_date : str
+            结束日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            资金流向数据，包含：
+            - trade_date: 交易日期
+            - buy_elg_vol: 特大单买入量（手）
+            - buy_elg_amount: 特大单买入额（万元）
+            - sell_elg_vol: 特大单卖出量（手）
+            - sell_elg_amount: 特大单卖出额（万元）
+            - buy_lg_vol: 大单买入量（手）
+            - buy_lg_amount: 大单买入额（万元）
+            - sell_lg_vol: 大单卖出量（手）
+            - sell_lg_amount: 大单卖出额（万元）
+            - net_mf_vol: 净流入量（手）
+            - net_mf_amount: 净流入额（万元）
+            失败返回 None
+        
+        Notes
+        -----
+        - Tushare Pro moneyflow 接口需要较高积分权限（约 2000 积分）
+        - 如无权限可考虑使用 moneyflow_hsgt 替代部分功能
+        - 大单定义：50万-100万为大单，100万以上为特大单
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> flow = loader.fetch_moneyflow("000001", "20240101", "20240115")
+        >>> # 计算主力净流入（大单+超大单）
+        >>> main_net = flow['buy_elg_amount'] - flow['sell_elg_amount'] + \\
+        ...            flow['buy_lg_amount'] - flow['sell_lg_amount']
+        """
+        # 标准化股票代码
+        ts_code = self._to_ts_code(stock_code)
+        
+        # 标准化日期格式
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        logger.debug(f"获取资金流向: {stock_code}, {start_date} ~ {end_date}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"moneyflow_{stock_code}_{start_date}_{end_date}.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.debug(f"从缓存加载资金流向: {stock_code}")
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.moneyflow,
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if df is None or df.empty:
+            logger.debug(f"获取资金流向失败: {stock_code}")
+            return None
+        
+        # 添加 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 日期标准化
+        if "trade_date" in df.columns:
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df = df.sort_values("trade_date")
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        logger.debug(f"获取资金流向成功: {stock_code}, {len(df)} 条")
+        return df
+    
+    def fetch_moneyflow_batch(
+        self,
+        stock_list: List[str],
+        start_date: str,
+        end_date: str,
+        show_progress: bool = True,
+        batch_size: int = 150,
+        batch_sleep: float = 8.0
+    ) -> pd.DataFrame:
+        """
+        批量获取资金流向数据
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        show_progress : bool
+            是否显示进度条
+        batch_size : int
+            每批次处理的股票数量
+        batch_sleep : float
+            每批次之间的休息时间（秒）
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的资金流向数据
+        """
+        all_data = []
+        total = len(stock_list)
+        success_count = 0
+        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    enumerate(stock_list),
+                    total=total,
+                    desc="💰 获取资金流向",
+                    unit="只",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = enumerate(stock_list)
+                logger.info(f"开始获取资金流向: {total} 只股票...")
+        else:
+            iterator = enumerate(stock_list)
+        
+        for i, stock in iterator:
+            df = self.fetch_moneyflow(stock, start_date, end_date)
+            if df is not None and not df.empty:
+                all_data.append(df)
+                success_count += 1
+            
+            if show_progress and hasattr(iterator, 'set_postfix'):
+                iterator.set_postfix({"成功": success_count, "当前": stock})
+            
+            # 批次休息
+            if (i + 1) % batch_size == 0 and (i + 1) < total:
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description(f"💰 休息{batch_sleep}s")
+                time.sleep(batch_sleep)
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description("💰 获取资金流向")
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(all_data, ignore_index=True)
+        logger.info(f"批量获取资金流向完成: {success_count}/{total} 只, {len(result)} 条记录")
+        return result
+    
+    def fetch_hk_hold(
+        self,
+        trade_date: str,
+        stock_code: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取沪深港通持股数据（北向资金持仓）
+        
+        使用 Tushare Pro hk_hold 接口获取北向资金（沪股通/深股通）
+        在 A 股的持股明细数据，是追踪"真外资"的核心数据。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        stock_code : Optional[str]
+            股票代码（6位），如果提供则只返回该股票的数据
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            北向持仓数据，包含：
+            - trade_date: 交易日期
+            - ts_code: 股票代码
+            - stock_code: 6位股票代码
+            - name: 股票名称
+            - vol: 持股数量（股）
+            - ratio: 持股占比（%）
+            - exchange: 交易所（SH/SZ）
+            失败返回 None
+        
+        Notes
+        -----
+        - 数据为 T+1 披露，即当日持仓需次日获取
+        - 该数据极其精准，能有效过滤盘中的假外资
+        - 建议关注持仓占比的环比变化（hk_hold_ratio_change）
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> # 获取全市场北向持仓
+        >>> hk_data = loader.fetch_hk_hold("20240115")
+        >>> # 计算持仓占比变化
+        >>> today = loader.fetch_hk_hold("20240115")
+        >>> yesterday = loader.fetch_hk_hold("20240114")
+        >>> merged = today.merge(yesterday, on='stock_code', suffixes=('', '_prev'))
+        >>> merged['ratio_change'] = merged['ratio'] - merged['ratio_prev']
+        """
+        # 标准化日期格式
+        trade_date = trade_date.replace("-", "")
+        
+        logger.debug(f"获取北向持仓: {trade_date}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"hk_hold_{trade_date}.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.debug(f"从缓存加载北向持仓: {trade_date}, {len(df)} 条")
+                    if stock_code:
+                        df = df[df["stock_code"] == stock_code[:6]]
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取（获取全市场数据）
+        df = self._fetch_with_retry(
+            self.pro.hk_hold,
+            trade_date=trade_date
+        )
+        
+        if df is None or df.empty:
+            logger.debug(f"获取北向持仓失败: {trade_date}")
+            return None
+        
+        # 添加 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 保存缓存（全量数据）
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        logger.debug(f"获取北向持仓成功: {trade_date}, {len(df)} 条")
+        
+        # 如果指定了股票代码，过滤
+        if stock_code:
+            df = df[df["stock_code"] == stock_code[:6]]
+        
+        return df
+    
+    def fetch_hk_hold_change(
+        self,
+        stock_list: List[str],
+        current_date: str,
+        days_back: int = 5
+    ) -> pd.DataFrame:
+        """
+        计算北向资金持仓占比变化
+        
+        获取指定股票列表的北向资金持仓变化数据，
+        用于构建 SmartMoney 因子中的北向穿透因子。
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表（6位代码）
+        current_date : str
+            当前日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        days_back : int
+            回溯天数，用于计算环比变化，默认 5 天
+        
+        Returns
+        -------
+        pd.DataFrame
+            包含以下列：
+            - stock_code: 股票代码
+            - hk_ratio: 当前北向持仓占比
+            - hk_ratio_prev: 前期北向持仓占比
+            - hk_ratio_change: 持仓占比变化（百分点）
+            - hk_hold_score: 标准化后的北向穿透得分 (0-1)
+        
+        Notes
+        -----
+        - 如果某股票无北向持仓数据，其得分默认为 0.5（中性）
+        - hk_hold_score 使用排名分位数标准化，避免极端值影响
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> stocks = ["000001", "000002", "600000"]
+        >>> hk_change = loader.fetch_hk_hold_change(stocks, "20240115")
+        >>> # 筛选北向加仓明显的股票
+        >>> bullish = hk_change[hk_change['hk_ratio_change'] > 0.1]
+        """
+        current_date = current_date.replace("-", "")
+        
+        # 获取交易日历
+        start_date = (
+            datetime.strptime(current_date, "%Y%m%d") - timedelta(days=days_back + 10)
+        ).strftime("%Y%m%d")
+        
+        calendar = self.fetch_trade_calendar(start_date, current_date)
+        
+        if len(calendar) < 2:
+            logger.warning("交易日不足，无法计算北向持仓变化")
+            return pd.DataFrame()
+        
+        # 获取最近两个交易日的数据
+        current_trade_date = calendar[-1].strftime("%Y%m%d")
+        prev_trade_date = calendar[max(0, len(calendar) - days_back - 1)].strftime("%Y%m%d")
+        
+        logger.info(f"计算北向持仓变化: {prev_trade_date} -> {current_trade_date}")
+        
+        # 获取两日的北向持仓数据
+        current_hold = self.fetch_hk_hold(current_trade_date)
+        prev_hold = self.fetch_hk_hold(prev_trade_date)
+        
+        # 初始化结果 DataFrame
+        result = pd.DataFrame({"stock_code": stock_list})
+        result["hk_ratio"] = np.nan
+        result["hk_ratio_prev"] = np.nan
+        result["hk_ratio_change"] = 0.0
+        
+        # 合并当前持仓数据
+        if current_hold is not None and not current_hold.empty:
+            current_hold_subset = current_hold[["stock_code", "ratio"]].rename(
+                columns={"ratio": "hk_ratio"}
+            )
+            result = result.merge(
+                current_hold_subset, on="stock_code", how="left", suffixes=("_drop", "")
+            )
+            if "hk_ratio_drop" in result.columns:
+                result["hk_ratio"] = result["hk_ratio"].fillna(result["hk_ratio_drop"])
+                result = result.drop(columns=["hk_ratio_drop"])
+        
+        # 合并前期持仓数据
+        if prev_hold is not None and not prev_hold.empty:
+            prev_hold_subset = prev_hold[["stock_code", "ratio"]].rename(
+                columns={"ratio": "hk_ratio_prev"}
+            )
+            result = result.merge(
+                prev_hold_subset, on="stock_code", how="left", suffixes=("_drop", "")
+            )
+            if "hk_ratio_prev_drop" in result.columns:
+                result["hk_ratio_prev"] = result["hk_ratio_prev"].fillna(
+                    result["hk_ratio_prev_drop"]
+                )
+                result = result.drop(columns=["hk_ratio_prev_drop"])
+        
+        # 计算变化
+        result["hk_ratio_change"] = (
+            result["hk_ratio"].fillna(0) - result["hk_ratio_prev"].fillna(0)
+        )
+        
+        # 计算标准化得分（使用排名分位数）
+        valid_mask = result["hk_ratio_change"].notna()
+        if valid_mask.sum() > 0:
+            result.loc[valid_mask, "hk_hold_score"] = (
+                result.loc[valid_mask, "hk_ratio_change"].rank(pct=True)
+            )
+        else:
+            result["hk_hold_score"] = 0.5
+        
+        # 填充缺失值
+        result["hk_hold_score"] = result["hk_hold_score"].fillna(0.5)
+        
+        logger.info(f"北向持仓变化计算完成: {len(result)} 只股票")
+        return result
+    
+    def calculate_smart_money_score(
+        self,
+        stock_list: List[str],
+        start_date: str,
+        end_date: str,
+        north_weight: float = 0.6,
+        large_order_weight: float = 0.4
+    ) -> pd.DataFrame:
+        """
+        计算全息主力资金因子 (Holographic Smart Money Score)
+        
+        综合北向资金穿透因子和内资大单流向因子，构建复合主力资金得分。
+        在火热行情中，该因子可有效跟踪"聪明钱"的流向。
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表（6位代码）
+        start_date : str
+            开始日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        end_date : str
+            结束日期（用于计算北向持仓变化的参考日）
+        north_weight : float
+            北向资金因子权重，默认 0.6
+        large_order_weight : float
+            大单流向因子权重，默认 0.4
+        
+        Returns
+        -------
+        pd.DataFrame
+            包含以下列：
+            - stock_code: 股票代码
+            - north_score: 北向资金得分 (0-1)
+            - large_order_score: 大单流向得分 (0-1)
+            - smart_money_score: 综合主力资金得分 (0-1)
+            - main_net_inflow: 主力净流入额（万元）
+            - hk_ratio_change: 北向持仓占比变化
+        
+        Notes
+        -----
+        SmartMoney_Score = north_weight * North_Score + large_order_weight * Large_Order_Score
+        
+        因子逻辑：
+        1. 北向穿透（真外资）：看北向资金持仓占比的环比变化，T+1 数据但极其精准
+        2. 内资主力（大单）：大单/超大单的净流入率
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> stocks = loader.fetch_index_constituents("hs300")
+        >>> smart_money = loader.calculate_smart_money_score(
+        ...     stocks, "20240101", "20240115"
+        ... )
+        >>> # 筛选主力资金流入强势的股票
+        >>> bullish = smart_money[smart_money['smart_money_score'] > 0.7]
+        """
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        logger.info(f"📊 计算全息主力资金因子: {len(stock_list)} 只股票")
+        
+        # 1. 获取北向资金变化得分
+        hk_change = self.fetch_hk_hold_change(
+            stock_list=stock_list,
+            current_date=end_date,
+            days_back=5
+        )
+        
+        # 2. 获取资金流向数据
+        moneyflow_df = self.fetch_moneyflow_batch(
+            stock_list=stock_list,
+            start_date=start_date,
+            end_date=end_date,
+            show_progress=True
+        )
+        
+        # 3. 计算大单流向得分
+        if not moneyflow_df.empty:
+            # 计算主力净流入 = (特大单买入 - 特大单卖出) + (大单买入 - 大单卖出)
+            flow_cols = ["buy_elg_amount", "sell_elg_amount", "buy_lg_amount", "sell_lg_amount"]
+            if all(col in moneyflow_df.columns for col in flow_cols):
+                moneyflow_df["main_net_inflow"] = (
+                    moneyflow_df["buy_elg_amount"] - moneyflow_df["sell_elg_amount"] +
+                    moneyflow_df["buy_lg_amount"] - moneyflow_df["sell_lg_amount"]
+                )
+            elif "net_mf_amount" in moneyflow_df.columns:
+                # 使用净流入额字段
+                moneyflow_df["main_net_inflow"] = moneyflow_df["net_mf_amount"]
+            else:
+                moneyflow_df["main_net_inflow"] = 0
+            
+            # 按股票汇总最近的主力净流入
+            flow_summary = moneyflow_df.groupby("stock_code").agg({
+                "main_net_inflow": "sum"
+            }).reset_index()
+            
+            # 标准化大单流向得分（排名分位数）
+            if len(flow_summary) > 0:
+                flow_summary["large_order_score"] = flow_summary["main_net_inflow"].rank(pct=True)
+            else:
+                flow_summary["large_order_score"] = 0.5
+        else:
+            flow_summary = pd.DataFrame({
+                "stock_code": stock_list,
+                "main_net_inflow": 0,
+                "large_order_score": 0.5
+            })
+        
+        # 4. 合并结果
+        result = pd.DataFrame({"stock_code": stock_list})
+        
+        # 合并北向得分
+        if not hk_change.empty:
+            result = result.merge(
+                hk_change[["stock_code", "hk_hold_score", "hk_ratio_change"]],
+                on="stock_code",
+                how="left"
+            )
+            result["north_score"] = result["hk_hold_score"].fillna(0.5)
+        else:
+            result["north_score"] = 0.5
+            result["hk_ratio_change"] = 0.0
+        
+        # 合并大单得分
+        result = result.merge(
+            flow_summary[["stock_code", "large_order_score", "main_net_inflow"]],
+            on="stock_code",
+            how="left"
+        )
+        result["large_order_score"] = result["large_order_score"].fillna(0.5)
+        result["main_net_inflow"] = result["main_net_inflow"].fillna(0)
+        
+        # 5. 计算综合得分
+        result["smart_money_score"] = (
+            north_weight * result["north_score"] +
+            large_order_weight * result["large_order_score"]
+        )
+        
+        # 清理中间列
+        if "hk_hold_score" in result.columns:
+            result = result.drop(columns=["hk_hold_score"])
+        
+        logger.info(
+            f"✅ 主力资金因子计算完成: "
+            f"均值={result['smart_money_score'].mean():.3f}, "
+            f"top10均值={result.nlargest(10, 'smart_money_score')['smart_money_score'].mean():.3f}"
+        )
+        
+        return result
+    
+    # ==================== 涨停板与龙头因子 ====================
+    
+    def fetch_limit_list(
+        self,
+        trade_date: str,
+        limit_type: str = "U"
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取每日涨跌停股票列表
+        
+        使用 Tushare Pro limit_list 接口获取每日涨停/跌停股票明细，
+        包含封单金额、封单比例、振幅、炸板次数等微观结构数据。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        limit_type : str
+            涨跌停类型：
+            - "U": 涨停（默认）
+            - "D": 跌停
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            涨跌停明细数据，包含：
+            - trade_date: 交易日期
+            - ts_code: 股票代码
+            - stock_code: 6位股票代码
+            - name: 股票名称
+            - close: 收盘价
+            - pct_chg: 涨跌幅
+            - amp: 振幅(%)
+            - fc_ratio: 封成比(%)（封单金额/成交额）
+            - fl_ratio: 封流比(%)（封单手数/流通股本）
+            - fd_amount: 封单金额（万元）
+            - first_time: 首次涨停时间
+            - last_time: 最后涨停时间
+            - open_times: 打开次数
+            - strth: 涨停强度（0-100）
+            - limit: 涨跌停价格
+            失败返回 None
+        
+        Notes
+        -----
+        - Tushare Pro limit_list 接口需要较高积分权限（约 2000 积分）
+        - 涨停强度(strth)：综合考虑封单、振幅、炸板次数的强度评分
+        - fc_ratio 封成比越大，说明买盘越坚决，次日高开概率大
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> limits = loader.fetch_limit_list("20240115")
+        >>> # 筛选强势涨停（未炸板、封成比>10%）
+        >>> strong = limits[(limits['open_times'] == 0) & (limits['fc_ratio'] > 10)]
+        """
+        # 标准化日期格式
+        trade_date = trade_date.replace("-", "")
+        
+        logger.debug(f"获取涨跌停列表: {trade_date}, 类型={limit_type}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"limit_list_{trade_date}_{limit_type}.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.debug(f"从缓存加载涨跌停列表: {trade_date}, {len(df)} 条")
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.limit_list,
+            trade_date=trade_date,
+            limit_type=limit_type
+        )
+        
+        if df is None or df.empty:
+            logger.debug(f"获取涨跌停列表失败: {trade_date}")
+            return None
+        
+        # 添加 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 重命名部分字段以统一
+        rename_map = {
+            "open_times": "open_num",  # 炸板次数
+        }
+        df = df.rename(columns=rename_map)
+        
+        # 确保关键字段存在
+        if "open_num" not in df.columns:
+            df["open_num"] = 0
+        if "fc_ratio" not in df.columns and "fd_amount" in df.columns and "amount" in df.columns:
+            # 计算封成比
+            df["fc_ratio"] = df["fd_amount"] / df["amount"].replace(0, np.nan) * 100
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        logger.debug(f"获取涨跌停列表成功: {trade_date}, {len(df)} 条")
+        return df
+    
+    def fetch_limit_list_batch(
+        self,
+        start_date: str,
+        end_date: str,
+        limit_type: str = "U",
+        show_progress: bool = True
+    ) -> pd.DataFrame:
+        """
+        批量获取多日涨跌停列表
+        
+        Parameters
+        ----------
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        limit_type : str
+            涨跌停类型："U"(涨停) 或 "D"(跌停)
+        show_progress : bool
+            是否显示进度条
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的涨跌停数据
+        """
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        # 获取交易日历
+        calendar = self.fetch_trade_calendar(start_date, end_date)
+        
+        all_data = []
+        total = len(calendar)
+        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    calendar,
+                    desc="🔥 获取涨停数据",
+                    unit="天",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = calendar
+                logger.info(f"开始获取涨停数据: {total} 个交易日...")
+        else:
+            iterator = calendar
+        
+        for date in iterator:
+            date_str = date.strftime("%Y%m%d")
+            df = self.fetch_limit_list(date_str, limit_type)
+            if df is not None and not df.empty:
+                all_data.append(df)
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(all_data, ignore_index=True)
+        logger.info(f"批量获取涨停数据完成: {len(calendar)} 天, {len(result)} 条记录")
+        return result
+    
+    def calculate_consecutive_limits(
+        self,
+        stock_code: str,
+        end_date: str,
+        days_back: int = 30
+    ) -> int:
+        """
+        计算股票的连板天数
+        
+        Parameters
+        ----------
+        stock_code : str
+            股票代码（6位）
+        end_date : str
+            截止日期
+        days_back : int
+            回溯天数，默认 30 天
+        
+        Returns
+        -------
+        int
+            连续涨停天数（0 表示非涨停或已中断）
+        
+        Notes
+        -----
+        只统计到 end_date 为止的连续涨停天数，
+        如果 end_date 当天未涨停，返回 0。
+        """
+        end_date = end_date.replace("-", "")
+        start_date = (
+            datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days_back)
+        ).strftime("%Y%m%d")
+        
+        # 获取交易日历
+        calendar = self.fetch_trade_calendar(start_date, end_date)
+        if len(calendar) == 0:
+            return 0
+        
+        # 从最近的交易日向前回溯
+        consecutive_count = 0
+        
+        for date in reversed(calendar):
+            date_str = date.strftime("%Y%m%d")
+            limit_df = self.fetch_limit_list(date_str, limit_type="U")
+            
+            if limit_df is None or limit_df.empty:
+                if consecutive_count == 0:
+                    continue  # 可能是非交易日数据缺失
+                else:
+                    break  # 连板中断
+            
+            # 检查该股票是否在涨停列表中
+            if stock_code in limit_df["stock_code"].values:
+                consecutive_count += 1
+            else:
+                if consecutive_count > 0:
+                    break  # 连板中断
+                # 如果从未涨停，继续向前检查（可能end_date当天未涨停）
+                # 但如果已经回溯超过5天还没涨停，直接返回0
+                if consecutive_count == 0:
+                    date_diff = (datetime.strptime(end_date, "%Y%m%d") - date).days
+                    if date_diff > 5:
+                        return 0
+        
+        return consecutive_count
+    
+    def calculate_limit_strength(
+        self,
+        trade_date: str,
+        min_fl_ratio: float = 1.0
+    ) -> pd.DataFrame:
+        """
+        计算涨停封板强度因子（龙头信仰因子）
+        
+        针对"连板"和"涨停"股票的微观结构分析，
+        用于捕捉强势股的溢价预期。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        min_fl_ratio : float
+            最低封流比阈值（%），默认 1.0
+        
+        Returns
+        -------
+        pd.DataFrame
+            涨停强度因子数据，包含：
+            - stock_code: 股票代码
+            - name: 股票名称
+            - close: 收盘价
+            - pct_chg: 涨跌幅
+            - fd_amount: 封单金额（万元）
+            - bid_strength: 封成比（封单金额/成交额）
+            - fl_ratio: 封流比（封单/流通股本）
+            - open_num: 炸板次数
+            - is_strong_limit: 是否强势涨停
+            - dragon_score: 龙头信仰得分 (0-1)
+        
+        Notes
+        -----
+        计算逻辑：
+        1. 筛选涨停：只分析收盘涨停的股票
+        2. 封板强度：封单金额 / 日成交额，比值越大买盘越坚决
+        3. 质量过滤：封流比 > 1% 且炸板次数 == 0 为强势板
+        4. 弱势降权：非强势板得分减半
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> dragon = loader.calculate_limit_strength("20240115")
+        >>> # 筛选高龙头得分的股票
+        >>> top_dragons = dragon[dragon['dragon_score'] > 0.8]
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        logger.info(f"🐉 计算龙头信仰因子: {trade_date}")
+        
+        # 获取涨停列表
+        limit_df = self.fetch_limit_list(trade_date, limit_type="U")
+        
+        if limit_df is None or limit_df.empty:
+            logger.warning(f"无涨停数据: {trade_date}")
+            return pd.DataFrame()
+        
+        result = limit_df.copy()
+        
+        # 1. 计算封成比 (封单金额 / 当日成交额)
+        # 反映市场惜售程度和抢筹意愿
+        if "fd_amount" in result.columns and "amount" in result.columns:
+            result["bid_strength"] = (
+                result["fd_amount"] / result["amount"].replace(0, np.nan)
+            )
+        elif "fc_ratio" in result.columns:
+            # 如果已有封成比字段，转换为小数
+            result["bid_strength"] = result["fc_ratio"] / 100
+        else:
+            result["bid_strength"] = 0.5  # 默认值
+        
+        # 2. 识别强势涨停
+        # 条件：封流比 > min_fl_ratio% 且 炸板次数 == 0
+        if "fl_ratio" not in result.columns:
+            result["fl_ratio"] = 0
+        if "open_num" not in result.columns:
+            result["open_num"] = 0
+        
+        result["is_strong_limit"] = (
+            (result["fl_ratio"] >= min_fl_ratio) & 
+            (result["open_num"] == 0)
+        )
+        
+        # 3. 计算龙头得分
+        # 基础得分 = 封成比的标准化
+        result["dragon_score"] = result["bid_strength"].rank(pct=True)
+        
+        # 对弱势板（炸板或封单弱）降权 50%
+        result.loc[~result["is_strong_limit"], "dragon_score"] *= 0.5
+        
+        # 确保得分在 [0, 1] 范围内
+        result["dragon_score"] = result["dragon_score"].clip(0, 1)
+        
+        # 填充缺失值
+        result["dragon_score"] = result["dragon_score"].fillna(0)
+        
+        # 选择输出列
+        output_cols = [
+            "stock_code", "ts_code", "name", "close", "pct_chg",
+            "fd_amount", "amount", "bid_strength", "fl_ratio", 
+            "open_num", "is_strong_limit", "dragon_score"
+        ]
+        output_cols = [c for c in output_cols if c in result.columns]
+        
+        result = result[output_cols].copy()
+        
+        # 按龙头得分排序
+        result = result.sort_values("dragon_score", ascending=False)
+        
+        strong_count = result["is_strong_limit"].sum()
+        logger.info(
+            f"✅ 龙头因子计算完成: {len(result)} 只涨停, "
+            f"{strong_count} 只强势板, "
+            f"top5得分={result['dragon_score'].head(5).mean():.3f}"
+        )
+        
+        return result
+    
+    def calculate_dragon_head_factor(
+        self,
+        trade_date: str,
+        days_back: int = 5,
+        consecutive_weight: float = 0.3,
+        strength_weight: float = 0.7
+    ) -> pd.DataFrame:
+        """
+        计算完整龙头信仰因子（含连板溢价）
+        
+        综合封板强度和连板天数，构建完整的龙头信仰因子。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期
+        days_back : int
+            计算连板天数时的回溯天数，默认 5 天
+        consecutive_weight : float
+            连板溢价权重，默认 0.3
+        strength_weight : float
+            封板强度权重，默认 0.7
+        
+        Returns
+        -------
+        pd.DataFrame
+            龙头信仰因子数据，包含：
+            - stock_code: 股票代码
+            - dragon_score: 封板强度得分
+            - consecutive_days: 连板天数
+            - consecutive_score: 连板溢价得分
+            - dragon_head_factor: 综合龙头因子
+        
+        Notes
+        -----
+        综合因子计算：
+        Dragon_Head_Factor = strength_weight * dragon_score + 
+                             consecutive_weight * consecutive_score
+        
+        连板溢价逻辑：
+        - 1连板（首板）: 1.0
+        - 2连板: 1.5
+        - 3连板: 2.0
+        - 4连板及以上: 2.5 + 0.2 * (n - 4)
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> dragon = loader.calculate_dragon_head_factor("20240115")
+        >>> # 获取高位龙头（连板+强封单）
+        >>> high_dragons = dragon[
+        ...     (dragon['consecutive_days'] >= 2) & 
+        ...     (dragon['dragon_head_factor'] > 0.8)
+        ... ]
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        logger.info(f"🐲 计算完整龙头信仰因子: {trade_date}")
+        
+        # 1. 获取封板强度因子
+        strength_df = self.calculate_limit_strength(trade_date)
+        
+        if strength_df.empty:
+            return pd.DataFrame()
+        
+        result = strength_df.copy()
+        
+        # 2. 计算连板天数
+        logger.info(f"计算连板天数: {len(result)} 只股票...")
+        
+        consecutive_days_list = []
+        for stock in result["stock_code"]:
+            cons_days = self.calculate_consecutive_limits(
+                stock, trade_date, days_back=days_back
+            )
+            consecutive_days_list.append(cons_days)
+        
+        result["consecutive_days"] = consecutive_days_list
+        
+        # 3. 计算连板溢价得分
+        # 连板越多，溢价预期越高
+        def calc_consecutive_score(days: int) -> float:
+            """连板溢价函数"""
+            if days <= 0:
+                return 0.0
+            elif days == 1:
+                return 1.0
+            elif days == 2:
+                return 1.5
+            elif days == 3:
+                return 2.0
+            else:
+                return 2.5 + 0.2 * (days - 4)
+        
+        result["consecutive_premium"] = result["consecutive_days"].apply(calc_consecutive_score)
+        
+        # 标准化连板得分到 [0, 1]
+        max_premium = result["consecutive_premium"].max()
+        if max_premium > 0:
+            result["consecutive_score"] = result["consecutive_premium"] / max_premium
+        else:
+            result["consecutive_score"] = 0
+        
+        # 4. 计算综合龙头因子
+        result["dragon_head_factor"] = (
+            strength_weight * result["dragon_score"] +
+            consecutive_weight * result["consecutive_score"]
+        )
+        
+        # 确保因子在 [0, 1] 范围
+        result["dragon_head_factor"] = result["dragon_head_factor"].clip(0, 1)
+        
+        # 按综合因子排序
+        result = result.sort_values("dragon_head_factor", ascending=False)
+        
+        # 统计信息
+        multi_limit = (result["consecutive_days"] >= 2).sum()
+        logger.info(
+            f"✅ 龙头因子计算完成: "
+            f"{len(result)} 只涨停, {multi_limit} 只连板, "
+            f"最高连板={result['consecutive_days'].max()}天"
+        )
+        
+        return result
+    
+    def get_dragon_candidates(
+        self,
+        trade_date: str,
+        min_consecutive: int = 1,
+        min_factor: float = 0.6,
+        top_n: int = 20
+    ) -> pd.DataFrame:
+        """
+        获取龙头候选股
+        
+        筛选满足条件的高质量龙头股，用于短线交易参考。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期
+        min_consecutive : int
+            最低连板天数，默认 1（首板）
+        min_factor : float
+            最低龙头因子得分，默认 0.6
+        top_n : int
+            返回股票数量上限，默认 20
+        
+        Returns
+        -------
+        pd.DataFrame
+            筛选后的龙头候选股列表
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> candidates = loader.get_dragon_candidates(
+        ...     "20240115",
+        ...     min_consecutive=2,  # 至少2连板
+        ...     min_factor=0.7
+        ... )
+        >>> print(candidates[['stock_code', 'name', 'consecutive_days', 'dragon_head_factor']])
+        """
+        dragon_df = self.calculate_dragon_head_factor(trade_date)
+        
+        if dragon_df.empty:
+            return pd.DataFrame()
+        
+        # 筛选条件
+        mask = (
+            (dragon_df["consecutive_days"] >= min_consecutive) &
+            (dragon_df["dragon_head_factor"] >= min_factor) &
+            (dragon_df["is_strong_limit"] == True)
+        )
+        
+        candidates = dragon_df[mask].head(top_n).copy()
+        
+        logger.info(
+            f"🎯 龙头候选股筛选完成: "
+            f"{len(candidates)} 只 (条件: 连板>={min_consecutive}, 因子>={min_factor})"
+        )
+        
+        return candidates
 
 
 # ==================== 便捷函数 ====================

@@ -2180,7 +2180,8 @@ def _format_orders_for_push(
     sell_orders: Dict[str, float],
     target_positions: Dict[str, float],
     report_date: str,
-    market_risk_triggered: bool = False
+    market_risk_triggered: bool = False,
+    stock_prices: Optional[Dict[str, float]] = None
 ) -> str:
     """
     将交易订单格式化为 PushPlus 推送内容（HTML格式）
@@ -2197,12 +2198,16 @@ def _format_orders_for_push(
         报告日期
     market_risk_triggered : bool
         大盘风控是否触发
+    stock_prices : Optional[Dict[str, float]]
+        股票价格 {股票代码: 价格}，用于计算预估股数
     
     Returns
     -------
     str
         HTML 格式的推送内容
     """
+    if stock_prices is None:
+        stock_prices = {}
     lines = []
     
     # 样式
@@ -2251,12 +2256,14 @@ def _format_orders_for_push(
             lines.append(f'<div class="section-title buy">📈 明日需买入 ({len(buy_orders)}只)</div>')
             
             for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
-                shares = int(amount / 10 / 100) * 100  # 估算股数
+                # 使用实际价格计算股数，默认假设10元
+                price = stock_prices.get(stock, 10.0)
+                shares = int(amount / price / 100) * 100  # 按100股整手计算
                 lines.append(f'''
                 <div class="item">
                     <span>{stock}</span>
                     <span class="amount buy">¥{amount:,.0f}</span>
-                    <span style="color:#888; font-size:12px;"> (~{shares}股)</span>
+                    <span style="color:#888; font-size:12px;"> (~{shares}股 @{price:.2f})</span>
                 </div>
                 ''')
             
@@ -2270,12 +2277,14 @@ def _format_orders_for_push(
             lines.append(f'<div class="section-title sell">📉 明日需卖出 ({len(sell_orders)}只)</div>')
             
             for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
-                shares = int(amount / 10 / 100) * 100
+                # 使用实际价格计算股数
+                price = stock_prices.get(stock, 10.0)
+                shares = int(amount / price / 100) * 100
                 lines.append(f'''
                 <div class="item">
                     <span>{stock}</span>
                     <span class="amount sell">¥{amount:,.0f}</span>
-                    <span style="color:#888; font-size:12px;"> (~{shares}股)</span>
+                    <span style="color:#888; font-size:12px;"> (~{shares}股 @{price:.2f})</span>
                 </div>
                 ''')
             
@@ -2347,6 +2356,9 @@ def _send_daily_notification(
         except Exception:
             pass
     
+    # 获取最新价格用于计算股数
+    stock_prices = runner._get_latest_prices() if hasattr(runner, '_get_latest_prices') else {}
+    
     # 格式化推送内容
     report_date = runner.today.strftime('%Y-%m-%d')
     content = _format_orders_for_push(
@@ -2354,7 +2366,8 @@ def _send_daily_notification(
         sell_orders=sell_orders,
         target_positions=runner.target_positions,
         report_date=report_date,
-        market_risk_triggered=market_risk_triggered
+        market_risk_triggered=market_risk_triggered,
+        stock_prices=stock_prices
     )
     
     # 构建标题
