@@ -1557,7 +1557,7 @@ class MultiFactorStrategy(BaseStrategy):
                 # 无情绪分数列，仅使用阈值判断
                 overheat_mask = day_data[check_col] > self.turnover_threshold
             
-            overheat_stocks = day_data[overheat_mask]
+                overheat_stocks = day_data[overheat_mask]
             
             if len(overheat_stocks) > 0:
                 # 获取被剔除的股票代码列表

@@ -2078,18 +2078,12 @@ class DailyUpdateRunner:
         
         if buy_orders:
             lines.extend([
-                f"| 股票代码 | 买入金额 | 预估股数 |",
-                f"|----------|----------|----------|",
+                f"| 股票代码 | 买入金额 |",
+                f"|----------|----------|",
             ])
             
             for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
-                # 获取最新价格，默认为10元
-                price = latest_prices.get(stock, 10.0)
-                if price <= 0: price = 10.0
-                
-                # 估算股数
-                estimated_shares = int(amount / price / 100) * 100  # 整百股
-                lines.append(f"| {stock} | ¥{amount:,.0f} | {estimated_shares} |")
+                lines.append(f"| {stock} | ¥{amount:,.0f} |")
             
             lines.append(f"")
             lines.append(f"**买入总金额**: ¥{sum(buy_orders.values()):,.0f}")
@@ -2106,15 +2100,12 @@ class DailyUpdateRunner:
         
         if sell_orders:
             lines.extend([
-                f"| 股票代码 | 卖出金额 | 预估股数 |",
-                f"|----------|----------|----------|",
+                f"| 股票代码 | 卖出金额 |",
+                f"|----------|----------|",
             ])
             
             for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
-                price = latest_prices.get(stock, 10.0)
-                if price <= 0: price = 10.0
-                estimated_shares = int(amount / price / 100) * 100
-                lines.append(f"| {stock} | ¥{amount:,.0f} | {estimated_shares} |")
+                lines.append(f"| {stock} | ¥{amount:,.0f} |")
             
             lines.append(f"")
             lines.append(f"**卖出总金额**: ¥{sum(sell_orders.values()):,.0f}")
@@ -2159,28 +2150,20 @@ class DailyUpdateRunner:
         # 买入表格行
         buy_rows = ""
         for stock, amount in sorted(buy_orders.items(), key=lambda x: -x[1]):
-            price = latest_prices.get(stock, 10.0)
-            if price <= 0: price = 10.0
-            estimated_shares = int(amount / price / 100) * 100
             buy_rows += f"""
                 <tr>
                     <td>{stock}</td>
                     <td>¥{amount:,.0f}</td>
-                    <td>{estimated_shares}</td>
                 </tr>
             """
         
         # 卖出表格行
         sell_rows = ""
         for stock, amount in sorted(sell_orders.items(), key=lambda x: -x[1]):
-            price = latest_prices.get(stock, 10.0)
-            if price <= 0: price = 10.0
-            estimated_shares = int(amount / price / 100) * 100
             sell_rows += f"""
                 <tr>
                     <td>{stock}</td>
                     <td>¥{amount:,.0f}</td>
-                    <td>{estimated_shares}</td>
                 </tr>
             """
         
@@ -2348,7 +2331,6 @@ class DailyUpdateRunner:
                     <tr>
                         <th>股票代码</th>
                         <th>买入金额</th>
-                        <th>预估股数</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -2367,7 +2349,6 @@ class DailyUpdateRunner:
                     <tr>
                         <th>股票代码</th>
                         <th>卖出金额</th>
-                        <th>预估股数</th>
                     </tr>
                 </thead>
                 <tbody>
