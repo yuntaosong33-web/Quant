@@ -27,13 +27,17 @@ data:
 # 也可通过环境变量 TUSHARE_TOKEN 设置
 tushare:
   # API Token
-  api_token: "7de46c74cf5f993d70c5ff931bd1a0c420a950ca4d35671010d244ba"
+  api_token: "ff84a15bbffab89a99667b3e99fce8aa915077e3b735a5c0b57ff454"
   
   # 缓存目录
   cache_dir: "data/tushare_cache"
   
   # 请求限流（每分钟最大请求数，免费用户约 200，付费用户约 500）
   rate_limit: 200
+  
+  # 跳过新闻获取（新闻接口有严格限制：每小时2次）
+  # 设为 true 时情绪分析会基于股票名称/行业进行，不获取实时新闻
+  skip_news: true
 
 # ============================================================
 # 策略配置 - 牛市进攻型策略 (Bull Market Offensive)

@@ -31,6 +31,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# 全局变量：追踪新闻 API 最后调用时间（跨实例共享）
+_GLOBAL_NEWS_API_LAST_CALL = 0.0
+_GLOBAL_NEWS_RATE_LIMIT_COUNT = 0
+
 
 class TushareDataLoader:
     """
@@ -68,8 +72,12 @@ class TushareDataLoader:
     # 付费用户限制更高，可适当降低间隔
     REQUEST_INTERVAL = 0.12  # 每次请求间隔（秒）- 激进模式
     MAX_RETRIES = 3
-    RETRY_DELAY = 1.0  # 重试延迟（秒）
+    RETRY_DELAY = 2.0  # 重试延迟（秒）
     RATE_LIMIT_DELAY = 30.0  # 触发频率限制后等待时间（秒）
+    HTTP_TIMEOUT = 60  # HTTP 请求超时（秒）
+    
+    # 新闻接口特殊限制：每分钟最多 1 次
+    NEWS_API_INTERVAL = 61.0  # 新闻接口调用间隔（秒）
     
     # 股票池代码映射
     INDEX_CODE_MAPPING = {
@@ -95,8 +103,31 @@ class TushareDataLoader:
         cache_dir : str
             缓存目录
         """
-        # 获取 API Token
+        # 获取 API Token (优先级: 参数 > 环境变量 > 配置文件)
         self.api_token = api_token or os.environ.get("TUSHARE_TOKEN", "")
+        
+        # 尝试从配置文件读取
+        self._skip_news = False  # 默认不跳过新闻
+        try:
+            import yaml
+            config_path = Path("config/strategy_config.yaml")
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                tushare_config = config.get("tushare", {})
+                
+                # 读取 Token（如果还没有）
+                if not self.api_token:
+                    self.api_token = tushare_config.get("api_token", "")
+                    if self.api_token:
+                        logger.info("从配置文件加载 Tushare Token")
+                
+                # 读取 skip_news 配置
+                self._skip_news = tushare_config.get("skip_news", False)
+                if self._skip_news:
+                    logger.info("📰 新闻获取已禁用 (tushare.skip_news=true)")
+        except Exception as e:
+            logger.debug(f"从配置文件读取配置失败: {e}")
         
         if not self.api_token:
             raise ValueError(
@@ -111,8 +142,22 @@ class TushareDataLoader:
         # 初始化 Tushare Pro API
         try:
             import tushare as ts
-            self.pro = ts.pro_api(self.api_token)
-            logger.info("Tushare Pro API 初始化成功")
+            
+            # 设置 Token 并初始化 API
+            ts.set_token(self.api_token)
+            self.pro = ts.pro_api()
+            
+            # 配置更长的 HTTP 超时（通过修改底层 DataApi）
+            try:
+                if hasattr(self.pro, '_DataApi__http'):
+                    # 新版 Tushare 使用 __http 属性
+                    self.pro._DataApi__http.timeout = self.HTTP_TIMEOUT
+                elif hasattr(self.pro, 'timeout'):
+                    self.pro.timeout = self.HTTP_TIMEOUT
+                logger.info(f"Tushare Pro API 初始化成功 (timeout={self.HTTP_TIMEOUT}s)")
+            except Exception:
+                logger.info("Tushare Pro API 初始化成功")
+                
         except ImportError:
             raise ImportError("请安装 tushare: pip install tushare")
         except Exception as e:
@@ -159,12 +204,35 @@ class TushareDataLoader:
                 result = func(*args, **kwargs)
                 if result is not None and not result.empty:
                     return result
+                # 空结果也算成功，不需要重试
+                if result is not None:
+                    return result
             except Exception as e:
                 error_msg = str(e)
-                # 检查是否触发频率限制
-                if "每分钟最多访问" in error_msg or "抱歉" in error_msg:
-                    logger.warning(f"触发 API 频率限制，等待 {self.RATE_LIMIT_DELAY} 秒后重试...")
+                error_msg_lower = error_msg.lower()
+                # 检查是否触发频率限制（多种错误格式）
+                rate_limit_keywords = ["每分钟最多访问", "抱歉", "频率", "rate limit", "too many", "限制"]
+                if any(kw in error_msg or kw in error_msg_lower for kw in rate_limit_keywords):
+                    logger.warning(f"触发 API 频率限制，等待 {self.RATE_LIMIT_DELAY} 秒后重试... 错误: {error_msg[:100]}")
                     time.sleep(self.RATE_LIMIT_DELAY)
+                # 网络超时：使用指数退避
+                elif "timeout" in error_msg_lower or "timed out" in error_msg_lower:
+                    wait_time = self.RETRY_DELAY * (2 ** attempt)  # 指数退避: 2, 4, 8 秒
+                    logger.warning(
+                        f"网络超时 (尝试 {attempt + 1}/{self.MAX_RETRIES}), "
+                        f"等待 {wait_time:.1f}s 后重试..."
+                    )
+                    if attempt < self.MAX_RETRIES - 1:
+                        time.sleep(wait_time)
+                # 连接错误：可能是网络问题
+                elif "connection" in error_msg_lower or "connect" in error_msg_lower:
+                    wait_time = self.RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"连接失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}, "
+                        f"等待 {wait_time:.1f}s 后重试..."
+                    )
+                    if attempt < self.MAX_RETRIES - 1:
+                        time.sleep(wait_time)
                 else:
                     logger.warning(f"API 请求失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
                     if attempt < self.MAX_RETRIES - 1:
@@ -301,9 +369,9 @@ class TushareDataLoader:
         >>> all_stocks = loader.fetch_all_stocks()
         >>> print(f"全市场共 {len(all_stocks)} 只股票")
         """
-        logger.info(f"获取全市场股票列表: exchange={exchange}, list_status={list_status}")
+        logger.info(f"🔍 获取全市场股票列表: exchange={exchange}, list_status={list_status}")
         
-        # 尝试缓存
+        # 尝试今日缓存
         today = datetime.now().strftime("%Y%m%d")
         cache_file = self.cache_dir / f"stock_basic_{today}.parquet"
         
@@ -328,7 +396,26 @@ class TushareDataLoader:
         )
         
         if df is None or df.empty:
-            logger.warning("无法获取全市场股票列表")
+            # 网络失败时，尝试使用最近的缓存文件
+            logger.warning("API 请求失败，尝试使用历史缓存...")
+            cache_files = sorted(
+                self.cache_dir.glob("stock_basic_*.parquet"),
+                reverse=True
+            )
+            for old_cache in cache_files[:5]:  # 最多检查最近5个缓存
+                try:
+                    df = pd.read_parquet(old_cache)
+                    if not df.empty:
+                        if exchange:
+                            df = df[df["exchange"] == exchange]
+                        stock_list = df["ts_code"].str[:6].tolist()
+                        logger.info(
+                            f"使用历史缓存 {old_cache.name}: {len(stock_list)} 只股票"
+                        )
+                        return stock_list
+                except Exception:
+                    continue
+            logger.warning("无可用缓存，无法获取全市场股票列表")
             return []
         
         # 过滤 ST 和退市风险股票
@@ -472,27 +559,49 @@ class TushareDataLoader:
         """
         all_data = []
         total = len(stock_list)
+        success_count = 0
         
-        for i, stock in enumerate(stock_list):
+        # 使用 tqdm 进度条
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    enumerate(stock_list), 
+                    total=total, 
+                    desc="📊 获取日线数据",
+                    unit="只",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = enumerate(stock_list)
+                logger.info(f"开始获取日线数据: {total} 只股票...")
+        else:
+            iterator = enumerate(stock_list)
+        
+        for i, stock in iterator:
             df = self.fetch_daily_data(stock, start_date, end_date, adj)
             if df is not None and not df.empty:
                 df["stock_code"] = stock
                 all_data.append(df)
+                success_count += 1
             
-            # 进度日志
-            if show_progress and (i + 1) % 50 == 0:
-                logger.info(f"日线数据进度: {i + 1}/{total}")
+            # 更新进度条后缀
+            if show_progress and hasattr(iterator, 'set_postfix'):
+                iterator.set_postfix({"成功": success_count, "当前": stock})
             
             # 批次休息（避免触发频率限制）
             if (i + 1) % batch_size == 0 and (i + 1) < total:
-                logger.info(f"已处理 {i + 1} 只，休息 {batch_sleep} 秒避免触发频率限制...")
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description(f"📊 休息{batch_sleep}s")
                 time.sleep(batch_sleep)
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description("📊 获取日线数据")
         
         if not all_data:
             return pd.DataFrame()
         
         result = pd.concat(all_data, ignore_index=True)
-        logger.info(f"批量获取日线数据完成: {len(stock_list)} 只股票, {len(result)} 条记录")
+        logger.info(f"批量获取日线数据完成: {success_count}/{total} 只股票成功, {len(result)} 条记录")
         return result
     
     # ==================== 财务指标 ====================
@@ -671,23 +780,45 @@ class TushareDataLoader:
         """
         all_data = []
         total = len(stock_list)
+        success_count = 0
         
-        for i, stock in enumerate(stock_list):
+        # 使用 tqdm 进度条
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    enumerate(stock_list), 
+                    total=total, 
+                    desc="📈 获取财务指标",
+                    unit="只",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = enumerate(stock_list)
+                logger.info(f"开始获取财务指标: {total} 只股票...")
+        else:
+            iterator = enumerate(stock_list)
+        
+        for i, stock in iterator:
             df = self.fetch_financial_indicator(stock)
             if df is not None and not df.empty:
                 # 只取最新一期
                 df = df.sort_values("end_date", ascending=False).head(1)
                 df["stock_code"] = stock
                 all_data.append(df)
+                success_count += 1
             
-            # 进度日志
-            if show_progress and (i + 1) % 50 == 0:
-                logger.info(f"财务指标进度: {i + 1}/{total}")
+            # 更新进度条后缀
+            if show_progress and hasattr(iterator, 'set_postfix'):
+                iterator.set_postfix({"成功": success_count, "当前": stock})
             
             # 批次休息（避免触发频率限制）
             if (i + 1) % batch_size == 0 and (i + 1) < total:
-                logger.info(f"已处理 {i + 1} 只，休息 {batch_sleep} 秒避免触发频率限制...")
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description(f"📈 休息{batch_sleep}s")
                 time.sleep(batch_sleep)
+                if show_progress and hasattr(iterator, 'set_description'):
+                    iterator.set_description("📈 获取财务指标")
         
         if not all_data:
             return pd.DataFrame()
@@ -698,7 +829,7 @@ class TushareDataLoader:
             return pd.DataFrame()
         
         result = pd.concat(valid_data, ignore_index=True)
-        logger.info(f"批量获取财务指标完成: {len(stock_list)} 只股票, {len(result)} 条记录")
+        logger.info(f"批量获取财务指标完成: {success_count}/{total} 只股票成功, {len(result)} 条记录")
         return result
     
     # ==================== 指数日线 ====================
@@ -922,15 +1053,58 @@ class TushareDataLoader:
         if end_date:
             end_date = end_date.replace("-", "")
         
+        global _GLOBAL_NEWS_API_LAST_CALL, _GLOBAL_NEWS_RATE_LIMIT_COUNT
+        
+        # 检查是否在配置中跳过新闻获取
+        if getattr(self, '_skip_news', False):
+            logger.debug("新闻获取已在配置中禁用 (tushare.skip_news=true)")
+            return pd.DataFrame()
+        
+        # 检查是否应该跳过新闻获取（频率限制保护）
+        if _GLOBAL_NEWS_RATE_LIMIT_COUNT >= 3:
+            logger.warning("新闻接口频繁触发限制，本次跳过（需要更高积分权限）")
+            return pd.DataFrame()
+        
+        # 尝试缓存（新闻按日期和来源缓存）
+        cache_key = f"news_{src}_{start_date}_{end_date}"
+        if stock_code:
+            cache_key += f"_{stock_code.replace('.', '')[:6]}"
+        cache_file = self.cache_dir / f"{cache_key}.parquet"
+        
+        if cache_file.exists():
+            try:
+                # 检查缓存是否在24小时内
+                cache_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+                if (datetime.now() - cache_mtime).total_seconds() < 86400:  # 24小时
+                    df = pd.read_parquet(cache_file)
+                    if not df.empty:
+                        logger.info(f"从缓存加载新闻: {len(df)} 条")
+                        return df
+            except Exception:
+                pass
+        
+        # 新闻接口特殊限流：每分钟最多 1 次（使用全局变量跨实例共享）
+        elapsed = time.time() - _GLOBAL_NEWS_API_LAST_CALL
+        if elapsed < self.NEWS_API_INTERVAL:
+            wait_time = self.NEWS_API_INTERVAL - elapsed
+            logger.info(f"⏳ 新闻接口限流（每分钟1次），等待 {wait_time:.0f} 秒...")
+            time.sleep(wait_time)
+        
         logger.info(f"获取新闻资讯: src={src}, {start_date} ~ {end_date}")
         
         try:
+            # 更新全局最后调用时间
+            _GLOBAL_NEWS_API_LAST_CALL = time.time()
+            
             df = self._fetch_with_retry(
                 self.pro.news,
                 src=src,
                 start_date=start_date,
                 end_date=end_date
             )
+            
+            # 成功则重置全局计数器
+            _GLOBAL_NEWS_RATE_LIMIT_COUNT = 0
             
             if df is None or df.empty:
                 logger.debug("无新闻数据")
@@ -946,12 +1120,81 @@ class TushareDataLoader:
                 )
                 df = df[mask]
             
+            # 保存缓存
+            if not df.empty:
+                try:
+                    df.to_parquet(cache_file, index=False)
+                    logger.debug(f"新闻已缓存: {cache_file.name}")
+                except Exception:
+                    pass
+            
             logger.info(f"获取新闻成功: {len(df)} 条")
             return df
             
         except Exception as e:
-            logger.warning(f"获取新闻失败: {e}")
+            error_msg = str(e)
+            # 记录频率限制（使用全局变量）
+            if "每小时" in error_msg:
+                # 每小时限制 - 本次会话内不再尝试
+                _GLOBAL_NEWS_RATE_LIMIT_COUNT = 10  # 设置高值直接跳过
+                logger.warning(f"⚠️ 新闻接口每小时限制已达上限，本次跳过新闻获取")
+                logger.warning(f"   提示：可在配置中设置 llm.enable_sentiment_filter: false 暂时禁用情绪分析")
+            elif "每分钟" in error_msg or "频率" in error_msg.lower() or "抱歉" in error_msg:
+                _GLOBAL_NEWS_RATE_LIMIT_COUNT += 1
+                logger.warning(f"新闻接口频率限制 ({_GLOBAL_NEWS_RATE_LIMIT_COUNT}/3): {e}")
+            else:
+                logger.warning(f"获取新闻失败: {e}")
             return pd.DataFrame()
+    
+    def fetch_all_news_once(
+        self,
+        days_back: int = 7,
+        src: str = "sina"
+    ) -> pd.DataFrame:
+        """
+        一次性获取所有新闻（优化：避免多次 API 调用）
+        
+        获取最近几天的所有新闻，缓存后供多只股票使用。
+        新闻接口每分钟只能调用1次，因此一次获取全部数据更高效。
+        
+        Parameters
+        ----------
+        days_back : int
+            回溯天数，默认 7 天
+        src : str
+            新闻源，默认 sina
+        
+        Returns
+        -------
+        pd.DataFrame
+            所有新闻数据
+        """
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+        
+        # 使用实例变量缓存，避免重复调用
+        cache_key = f"_cached_all_news_{src}_{start_date}_{end_date}"
+        if hasattr(self, cache_key):
+            cached = getattr(self, cache_key)
+            if cached is not None:
+                logger.debug(f"使用内存缓存的新闻数据: {len(cached)} 条")
+                return cached
+        
+        # 获取所有新闻（不带股票代码过滤）
+        df = self.fetch_news(
+            stock_code=None,  # 不过滤，获取全部
+            start_date=start_date,
+            end_date=end_date,
+            src=src
+        )
+        
+        # 缓存到实例变量
+        setattr(self, cache_key, df if df is not None else pd.DataFrame())
+        
+        if df is not None and not df.empty:
+            logger.info(f"📰 一次性获取新闻完成: {len(df)} 条，可供所有股票使用")
+        
+        return df if df is not None else pd.DataFrame()
     
     def fetch_stock_news(
         self,
@@ -961,7 +1204,8 @@ class TushareDataLoader:
         """
         获取单只股票相关新闻（用于情感分析）
         
-        获取指定股票最近几天的相关新闻，合并为文本返回。
+        从缓存的全量新闻中筛选与指定股票相关的新闻。
+        优化：只调用一次 API 获取全量新闻，然后本地筛选。
         
         Parameters
         ----------
@@ -975,45 +1219,41 @@ class TushareDataLoader:
         str
             合并的新闻文本，用于情感分析
             无新闻时返回空字符串
-        
-        Examples
-        --------
-        >>> loader = TushareDataLoader()
-        >>> news_text = loader.fetch_stock_news("000001")
-        >>> print(news_text[:100])
         """
-        from datetime import datetime, timedelta
+        # 先获取全量新闻（会自动缓存，只调用一次 API）
+        all_news_df = self.fetch_all_news_once(days_back=days_back)
         
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+        if all_news_df.empty:
+            logger.debug(f"无新闻数据可用")
+            return ""
         
-        # 尝试多个新闻源
-        sources = ["sina", "eastmoney", "10jqka"]
+        # 从全量新闻中筛选与该股票相关的
+        stock_code_clean = stock_code.replace(".", "")[:6]
+        
+        # 在标题或内容中搜索股票代码
+        mask = pd.Series([False] * len(all_news_df))
+        if "title" in all_news_df.columns:
+            mask = mask | all_news_df["title"].str.contains(stock_code_clean, na=False)
+        if "content" in all_news_df.columns:
+            mask = mask | all_news_df["content"].str.contains(stock_code_clean, na=False)
+        
+        filtered_df = all_news_df[mask]
+        
+        if filtered_df.empty:
+            logger.debug(f"股票 {stock_code} 无相关新闻")
+            return ""
+        
+        # 提取标题和内容
         all_news = []
-        
-        for src in sources:
-            df = self.fetch_news(
-                stock_code=stock_code,
-                start_date=start_date,
-                end_date=end_date,
-                src=src
-            )
-            
-            if df is not None and not df.empty:
-                # 提取标题和内容
-                for _, row in df.head(5).iterrows():
-                    title = row.get("title", "")
-                    content = row.get("content", "")
-                    if title:
-                        all_news.append(title)
-                    if content and len(content) < 500:
-                        all_news.append(content[:200])
-                
-                if len(all_news) >= 5:
-                    break
+        for _, row in filtered_df.head(5).iterrows():
+            title = row.get("title", "")
+            content = row.get("content", "")
+            if title:
+                all_news.append(str(title))
+            if content and len(str(content)) < 500:
+                all_news.append(str(content)[:200])
         
         if not all_news:
-            logger.debug(f"股票 {stock_code} 无相关新闻")
             return ""
         
         # 合并新闻文本
