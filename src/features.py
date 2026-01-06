@@ -2197,6 +2197,26 @@ class FactorCalculator:
             logger.warning(f"Turnover_5d 因子计算失败: {e}")
             result['turnover_5d'] = np.nan
         
+        # ========== Alpha 因子（量价配合类）==========
+        # 牛市进攻型策略：激活 Alpha 因子捕捉量价背离和动量加速信号
+        try:
+            alpha_engine = AlphaFeatures()
+            alpha_df = alpha_engine.calculate(result)
+            
+            # 合并 Alpha 因子列
+            alpha_feature_names = alpha_engine.get_feature_names()
+            for col in alpha_feature_names:
+                if col in alpha_df.columns:
+                    result[col] = alpha_df[col]
+            
+            logger.info(f"Alpha 因子计算完成: {alpha_feature_names}")
+        except Exception as e:
+            logger.warning(f"Alpha 因子计算失败: {e}")
+            # 设置默认值
+            result['alpha_001'] = np.nan
+            result['alpha_002'] = np.nan
+            result['alpha_003'] = np.nan
+        
         logger.info("所有因子计算完成")
         return result
     

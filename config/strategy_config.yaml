@@ -1,6 +1,7 @@
 # A股量化交易系统 - 策略配置文件
 # ===============================
-# HS300 深度价值与龙头动量策略 (Deep Value & Quality Strategy)
+# 牛市进攻型策略 (Bull Market Offensive Strategy)
+# 核心逻辑：动量为王，情绪加速，小市值博弹性
 
 # 数据配置
 data:
@@ -8,7 +9,7 @@ data:
   data_source: "tushare"
   
   # 股票池: hs300(沪深300), zz500(中证500), zz1000(中证1000), all(全市场)
-  # [核心修改] 全市场选股，捕捉中小盘和热门股机会
+  # [牛市进攻] 全市场选股，捕捉中小盘和热门股机会
   stock_pool: "all"
   
   # 历史数据开始日期
@@ -35,77 +36,86 @@ tushare:
   rate_limit: 200
 
 # ============================================================
-# 策略配置 - HS300 均衡增长策略
+# 策略配置 - 牛市进攻型策略 (Bull Market Offensive)
 # ============================================================
-# 策略逻辑：
-#   1. 动量为王：优先选择趋势向上的股票
-#   2. 质量辅助：ROE 筛选高盈利公司
-#   3. 价值兜底：避免买入极度高估的股票
-#   4. 月度调仓，集中持仓（6只）
+# 核心策略逻辑：
+#   1. 动量为核心驱动 (40%)：趋势向上+风险调整收益
+#   2. 情绪因子加速 (30%)：LLM分析市场热度，捕捉故事驱动行情
+#   3. 小市值博弹性 (20%)：牛市中小盘弹性远大于大盘
+#   4. 流动性正向 (10%)：高换手=高人气，而非过热
+#   5. 价值因子暂弃 (0%)：牛市不看估值，追逐趋势
 # ============================================================
 strategy:
   # 策略名称
-  name: "HS300 Balanced Growth"
+  name: "Bull Market Offensive"
   
   # ===== 因子权重配置 (牛市进攻型) =====
-  # 核心逻辑：动量为核心驱动，小市值+情绪因子增强
-  # 牛市不看估值，追逐趋势与热点
+  # 核心公式: Score = 0.4*Momentum + 0.3*Sentiment + 0.2*SmallCap + 0.1*Turnover
   value_weight: 0.0       # 价值因子 - 0% (牛市不看估值)
-  quality_weight: 0.1     # 质量因子 - 10% (降低质量权重)
-  momentum_weight: 0.5    # 动量因子 - 50% (核心驱动)
-  size_weight: 0.2        # 小市值因子 - 20% (捕捉小盘股弹性)
-  sentiment_weight: 0.2   # 情绪因子 - 20% (提升情绪因子权重)
+  quality_weight: 0.1     # 流动性因子 - 10% (高换手=高人气)
+  momentum_weight: 0.4    # 动量因子 - 40% (核心驱动)
+  size_weight: 0.2        # 小市值因子 - 20% (弹性来源)
+  sentiment_weight: 0.3   # 情绪因子 - 30% (故事驱动)
   
   # ===== 选股参数 =====
-  top_n: 8                # 增加持仓分散度
-  min_listing_days: 252   # 至少上市1年（约252个交易日）
+  top_n: 8                # 持仓8只，分散风险
+  min_listing_days: 180   # 至少上市6个月（次新股风险较高）
   
-  # ===== 风控熔断阈值 =====
-  turnover_threshold: 50.0   # 大幅放宽换手率限制（容纳高换手热门股）
-  volatility_threshold: 5.0  # 容忍高波动（牛市进攻型）
+  # ===== 风控熔断阈值 (牛市放宽版) =====
+  # [关键修改] 大幅放宽换手率限制，避免卖飞龙头妖股
+  turnover_threshold: 50.0   # 换手率Z-Score阈值: 50.0 (基本禁用熔断)
+  volatility_threshold: 5.0  # 波动率阈值: 5.0 (容忍高波动)
   
   # ===== 板块过滤 =====
-  exclude_chinext: false  # 不排除创业板（部分HS300成分股在创业板）
-  exclude_star: false     # 不排除科创板（部分HS300成分股在科创板）
+  exclude_chinext: false  # 不排除创业板（高弹性）
+  exclude_star: false     # 不排除科创板（科技龙头）
   
   # ===== 因子列名映射 =====
-  # 注意：需要在因子计算模块中实现对应的因子
-  value_col: "value_composite_zscore"   # 复合估值因子 (EP + BP + DP)
-  quality_col: "roe_zscore"             # ROE 盈利能力因子
-  momentum_col: "sharpe_60_zscore"      # 60日夏普动量（中期稳健）
-  size_col: "small_cap_zscore"          # 保留配置但权重为0
+  # [牛市进攻] 使用合成动量因子 (0.6*ROC + 0.4*Sharpe)
+  value_col: "value_composite_zscore"     # 复合估值因子（权重为0，实际不使用）
+  quality_col: "turnover_5d_zscore"       # 换手率作为正向因子（高人气）
+  momentum_col: "momentum_composite_zscore"  # 合成动量因子 (0.6*ROC + 0.4*Sharpe)
+  size_col: "small_cap_zscore"            # 小市值因子
   
   # ===== 调仓配置 =====
-  rebalance_frequency: "weekly"  # 周度调仓
-  rebalance_buffer: 0.05          # 5% 缓冲区（允许小幅偏离）
+  rebalance_frequency: "weekly"  # 周度调仓（牛市轮动快）
+  rebalance_buffer: 0.05         # 5% 缓冲区（减少不必要换手）
   
   # ===== 持股惯性 =====
-  holding_bonus: 0.3              # 持股惯性加分（降低换手）
+  holding_bonus: 0.2              # 降低持股惯性加分（牛市积极调仓）
+
+  # ===== Alpha因子开关 (新增) =====
+  enable_alpha_factors: true      # 启用 Alpha 因子 (量价配合等)
+  
+  # ===== 拥挤度轮动开关 (新增) =====
+  enable_crowding_rotation: true   # 启用拥挤度板块轮动
+  crowding_exit_threshold: 0.95    # 行业拥挤度 > 95% 时分批止盈
+  crowding_entry_threshold: 0.50   # 行业拥挤度回落到 50% 以下时可切入
 
 # ============================================================
 # 风险控制配置 - 牛市进攻型参数
 # ============================================================
 risk:
   # ===== 基础止损止盈 =====
-  stop_loss: 0.15         # 15% 止损（放宽止损）
-  take_profit: 0.80       # 80% 止盈（极高止盈，让利润奔跑）
+  stop_loss: 0.15         # 15% 止损（放宽止损，让趋势发展）
+  take_profit: 0.80       # 80% 止盈（让利润奔跑）
   
   # ===== 组合风险限制 =====
-  max_daily_loss: 0.05    # 单日最大亏损 5%
-  max_drawdown: 0.20      # 最大回撤限制 20%（保守）
+  max_daily_loss: 0.06    # 单日最大亏损 6%（牛市波动大）
+  max_drawdown: 0.25      # 最大回撤限制 25%（容忍更大回撤）
   
   # ===== ATR 动态止损配置 =====
   use_atr_stop_loss: true       # 启用 ATR 止损
   atr_period: 14                # ATR 计算周期（14日）
-  atr_multiplier: 3.5           # ATR 止损倍数（放宽ATR波动空间）
+  atr_multiplier: 4.0           # ATR 止损倍数（放宽到4倍）
   atr_trailing: true            # 启用移动止损（跟踪盈利）
   
   # ===== 大盘风控参数 =====
-  # 规则：跌破60日均线 且 20日跌幅超过8% 时触发清仓
+  # 规则：跌破60日均线 且 20日跌幅超过10% 时触发清仓
   market_risk:
     enabled: true         # 启用大盘风控
     ma_period: 60         # 60日均线
-    drop_threshold: 0.08  # 8% 跌幅阈值（提高对大盘回撤的容忍度）
+    drop_threshold: 0.10  # 10% 跌幅阈值（牛市容忍度更高）
     drop_lookback: 20     # 回溯20日计算跌幅
 
 # 投资组合配置 - 集中持仓型
@@ -113,8 +123,8 @@ portfolio:
   # 总资金（元）
   total_capital: 300000
   
-  # 单只股票最大权重（6只股票，最大约17%）
-  max_weight: 0.20
+  # 单只股票最大权重（8只股票，最大约15%）
+  max_weight: 0.18
   
   # 单只股票最小权重
   min_weight: 0.0
@@ -123,7 +133,7 @@ portfolio:
   risk_free_rate: 0.02
   
   # 优化目标: max_sharpe(最大夏普比率), min_volatility(最小波动率), equal_weight(等权重)
-  # 价值策略使用等权重分配
+  # 牛市使用等权重分配，降低优化复杂度
   optimization_objective: "equal_weight"
   
   # 协方差压缩方法: ledoit_wolf, oracle_approximating, exponential
@@ -156,7 +166,8 @@ llm:
   enable_sentiment_filter: true
   
   # 情绪分数阈值（用于极端负面情况的安全过滤）
-  sentiment_threshold: -0.5
+  # [牛市进攻] 降低阈值，仅过滤极端负面
+  sentiment_threshold: -0.7
   
   # ===== 缓存配置 =====
   cache_path: "data/processed/sentiment_cache.json"
@@ -172,7 +183,7 @@ llm:
   
   # ===== 熔断器与置信度配置 =====
   max_consecutive_failures: 5
-  min_confidence: 0.7
+  min_confidence: 0.6       # 降低置信度要求
   sentiment_buffer_multiplier: 5
 
 # 交易配置
@@ -239,8 +250,8 @@ backtest:
   initial_capital: 300000
   
   # 基准指数
-  # [配合股票池] 沪深300基准
-  benchmark: "000300"
+  # [牛市进攻] 使用中证1000作为基准（小盘股基准）
+  benchmark: "000852"
 
   # 回测最大股票数量
-  max_stocks: 300
+  max_stocks: 500

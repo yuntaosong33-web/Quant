@@ -966,13 +966,23 @@ class MultiFactorStrategy(BaseStrategy):
         self._sentiment_engine = None
         
         # 过热熔断阈值（换手率 Z-Score）
-        # 换手率过高通常意味着短期见顶风险
-        # 适当放宽以适应小盘股的高波动特性 (2.5 -> 3.5)
-        self.turnover_threshold: float = self.config.get("turnover_threshold", 3.5)
+        # [牛市进攻型] 大幅放宽：50.0 基本禁用熔断
+        self.turnover_threshold: float = self.config.get("turnover_threshold", 50.0)
         
         # 波动率熔断阈值（年化波动率）
-        # 剔除波动率极高的妖股 (新增)
-        self.volatility_threshold: float = self.config.get("volatility_threshold", 1.5)  # 150% 年化波动率
+        # [牛市进攻型] 放宽波动率限制
+        self.volatility_threshold: float = self.config.get("volatility_threshold", 5.0)  # 500% 年化波动率
+        
+        # ===== [NEW] 拥挤度板块轮动配置 =====
+        # 利用 CrowdingFactorCalculator 计算行业拥挤度，实现板块轮动
+        self._enable_crowding_rotation: bool = self.config.get("enable_crowding_rotation", False)
+        self._crowding_exit_threshold: float = self.config.get("crowding_exit_threshold", 0.95)
+        self._crowding_entry_threshold: float = self.config.get("crowding_entry_threshold", 0.50)
+        self._crowding_calculator = None
+        self._crowding_cache: Dict[str, pd.DataFrame] = {}
+        
+        # ===== [NEW] Alpha 因子开关 =====
+        self._enable_alpha_factors: bool = self.config.get("enable_alpha_factors", True)
         
         # 初始化情绪分析引擎（如果启用）
         if self._enable_sentiment_filter:
@@ -1066,16 +1076,19 @@ class MultiFactorStrategy(BaseStrategy):
             raw_quality = data[self.quality_col].fillna(0)
             
             if is_turnover_factor:
-                # 换手率因子：引入"过热惩罚"机制
-                # Z-Score > 2.0 表示极度活跃，过热反而扣分
+                # 换手率因子：牛市进攻型配置
+                # [关键修改] 将换手率视为正向因子（高人气）
+                # Z-Score > 3.5 时才轻微惩罚，保留大部分高换手股
+                # 牛市核心逻辑：高换手 = 高人气 = 趋势延续
+                TURNOVER_PENALTY_THRESHOLD = 3.5  # 惩罚阈值放宽
                 quality_score = np.where(
-                    raw_quality > 2.0,
-                    2.0 - (raw_quality - 2.0) * 2,  # 过热惩罚
-                    raw_quality  # 正常情况保持原值
+                    raw_quality > TURNOVER_PENALTY_THRESHOLD,
+                    TURNOVER_PENALTY_THRESHOLD - (raw_quality - TURNOVER_PENALTY_THRESHOLD) * 0.5,  # 轻微惩罚
+                    raw_quality  # 正常情况保持原值（正向加分）
                 )
-                overheat_count = (raw_quality > 2.0).sum()
+                overheat_count = (raw_quality > TURNOVER_PENALTY_THRESHOLD).sum()
                 if overheat_count > 0:
-                    logger.debug(f"换手率过热惩罚: {overheat_count} 只股票 Z-Score > 2.0")
+                    logger.debug(f"换手率过热惩罚: {overheat_count} 只股票 Z-Score > {TURNOVER_PENALTY_THRESHOLD}")
             else:
                 # 非换手率因子（如 ROE、IVOL）：直接使用原值
                 quality_score = raw_quality
@@ -1245,8 +1258,10 @@ class MultiFactorStrategy(BaseStrategy):
     LIMIT_DOWN_THRESHOLD = -0.095
     # ST/退市股关键字
     ST_KEYWORDS = ('ST', '*ST', '退', 'S', 'PT')
-    # 换手率过热熔断阈值（Z-Score > 2.5 视为极度过热，直接剔除）
-    TURNOVER_OVERHEAT_THRESHOLD = 2.5
+    # 换手率过热熔断阈值
+    # [牛市进攻型] 大幅放宽：Z-Score > 5.0 才视为极度过热
+    # 牛市龙头股换手率通常很高，过于敏感会卖飞妖股
+    TURNOVER_OVERHEAT_THRESHOLD = 5.0
     
     def filter_stocks(
         self,
@@ -1613,6 +1628,190 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 无股票被过滤, 剩余 {len(day_data)}")
         
         return day_data
+    
+    # ==================== 拥挤度板块轮动方法 ====================
+    
+    def calculate_sector_crowding(
+        self,
+        price_data: pd.DataFrame,
+        stock_sector_map: Dict[str, str],
+        window: int = 20
+    ) -> pd.DataFrame:
+        """
+        计算行业拥挤度因子（用于板块轮动决策）
+        
+        拥挤度 = 行业内股票收益率的平均相关系数
+        高拥挤度表示行业抱团严重，有拥挤风险
+        
+        Parameters
+        ----------
+        price_data : pd.DataFrame
+            价格数据，index=date, columns=stock_codes
+        stock_sector_map : Dict[str, str]
+            股票代码到行业的映射
+        window : int
+            滚动窗口大小，默认 20
+        
+        Returns
+        -------
+        pd.DataFrame
+            行业拥挤度数据，index=date, columns=sector_names
+        
+        Notes
+        -----
+        - 拥挤度 > 95% 分位数时，建议分批止盈
+        - 拥挤度 < 50% 分位数且动量起爆时，可切入
+        """
+        if not self._enable_crowding_rotation:
+            logger.debug("拥挤度轮动未启用，跳过计算")
+            return pd.DataFrame()
+        
+        try:
+            from src.crowding_factor import CrowdingFactorCalculator
+        except ImportError:
+            try:
+                from crowding_factor import CrowdingFactorCalculator
+            except ImportError:
+                logger.warning("无法导入 CrowdingFactorCalculator，拥挤度轮动不可用")
+                return pd.DataFrame()
+        
+        # 初始化计算器（懒加载）
+        if self._crowding_calculator is None:
+            self._crowding_calculator = CrowdingFactorCalculator(
+                window=window,
+                min_periods=10,
+                use_dask=False
+            )
+        
+        try:
+            crowding_df = self._crowding_calculator.calculate(
+                price_data,
+                stock_sector_map
+            )
+            logger.info(f"行业拥挤度计算完成: {crowding_df.shape}")
+            return crowding_df
+        except Exception as e:
+            logger.warning(f"行业拥挤度计算失败: {e}")
+            return pd.DataFrame()
+    
+    def apply_crowding_rotation(
+        self,
+        candidates: List[str],
+        crowding_data: pd.DataFrame,
+        stock_sector_map: Dict[str, str],
+        date: pd.Timestamp,
+        current_holdings: Optional[List[str]] = None
+    ) -> List[str]:
+        """
+        应用拥挤度轮动策略调整候选股票
+        
+        策略逻辑：
+        1. 当持仓股票所属行业拥挤度 > exit_threshold 时，从候选中移除
+        2. 当行业拥挤度回落到 entry_threshold 以下且动量起爆时，优先选入
+        
+        Parameters
+        ----------
+        candidates : List[str]
+            候选股票代码列表
+        crowding_data : pd.DataFrame
+            行业拥挤度数据
+        stock_sector_map : Dict[str, str]
+            股票代码到行业的映射
+        date : pd.Timestamp
+            当前日期
+        current_holdings : Optional[List[str]]
+            当前持仓股票列表
+        
+        Returns
+        -------
+        List[str]
+            调整后的候选股票列表
+        
+        Notes
+        -----
+        - 拥挤度使用百分位排名，0-1 范围
+        - exit_threshold: 0.95 表示 95% 分位以上触发止盈
+        - entry_threshold: 0.50 表示 50% 分位以下可切入
+        """
+        if not self._enable_crowding_rotation:
+            return candidates
+        
+        if crowding_data.empty or date not in crowding_data.index:
+            logger.debug(f"日期 {date} 无拥挤度数据，跳过轮动")
+            return candidates
+        
+        # 获取当日各行业拥挤度
+        day_crowding = crowding_data.loc[date]
+        
+        # 计算拥挤度百分位（0-1）
+        crowding_percentile = day_crowding.rank(pct=True)
+        
+        adjusted_candidates = []
+        removed_by_crowding = []
+        
+        for stock in candidates:
+            sector = stock_sector_map.get(stock, None)
+            if sector is None:
+                # 无行业信息，保留
+                adjusted_candidates.append(stock)
+                continue
+            
+            sector_percentile = crowding_percentile.get(sector, 0.5)
+            
+            # 拥挤度过高的行业：剔除（分批止盈逻辑）
+            if sector_percentile > self._crowding_exit_threshold:
+                removed_by_crowding.append(f"{stock}({sector}:{sector_percentile:.0%})")
+            else:
+                adjusted_candidates.append(stock)
+        
+        if removed_by_crowding:
+            logger.info(
+                f"📊 拥挤度轮动 {date.strftime('%Y-%m-%d')}: "
+                f"因行业过热剔除 {len(removed_by_crowding)} 只: "
+                f"{removed_by_crowding[:5]}"
+                + (f"... 共{len(removed_by_crowding)}只" if len(removed_by_crowding) > 5 else "")
+            )
+        
+        return adjusted_candidates
+    
+    def get_low_crowding_sectors(
+        self,
+        crowding_data: pd.DataFrame,
+        date: pd.Timestamp
+    ) -> List[str]:
+        """
+        获取低拥挤度的行业列表（用于寻找切入机会）
+        
+        Parameters
+        ----------
+        crowding_data : pd.DataFrame
+            行业拥挤度数据
+        date : pd.Timestamp
+            当前日期
+        
+        Returns
+        -------
+        List[str]
+            低拥挤度行业名称列表
+        """
+        if crowding_data.empty or date not in crowding_data.index:
+            return []
+        
+        day_crowding = crowding_data.loc[date]
+        crowding_percentile = day_crowding.rank(pct=True)
+        
+        # 筛选低于入场阈值的行业
+        low_crowding_sectors = crowding_percentile[
+            crowding_percentile < self._crowding_entry_threshold
+        ].index.tolist()
+        
+        if low_crowding_sectors:
+            logger.debug(
+                f"低拥挤度行业 ({date.strftime('%Y-%m-%d')}): "
+                f"{low_crowding_sectors}"
+            )
+        
+        return low_crowding_sectors
     
     def _apply_sentiment_filter(
         self,
