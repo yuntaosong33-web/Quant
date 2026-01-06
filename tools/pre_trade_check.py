@@ -4,7 +4,7 @@
 交易前检查工具
 
 在每天运行 main.py 之前执行此脚本，确保：
-1. 数据源（AkShare）可正常访问
+1. 数据源（Tushare Pro）可正常访问
 2. 系统持仓记录与券商APP实际持仓一致
 3. 今天是交易日
 
@@ -68,7 +68,7 @@ def check_data_source() -> Tuple[bool, str]:
     """
     检查数据源是否可访问
     
-    尝试从 AkShare 获取沪深300指数数据，验证网络和接口可用性。
+    尝试从 Tushare Pro 获取沪深300指数数据，验证网络和接口可用性。
     
     Returns
     -------
@@ -78,31 +78,44 @@ def check_data_source() -> Tuple[bool, str]:
     print_header("数据源检查")
     
     try:
-        import akshare as ak
-        print("正在连接 AkShare 获取沪深300指数数据...")
+        # 添加项目根目录到路径
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from src.tushare_loader import TushareDataLoader
+        
+        print("正在连接 Tushare Pro 获取沪深300指数数据...")
+        
+        loader = TushareDataLoader()
         
         # 获取近5天的指数数据
-        df = ak.stock_zh_index_daily(symbol="sh000300")
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - pd.Timedelta(days=10)).strftime("%Y%m%d")
+        
+        df = loader.pro.index_daily(
+            ts_code="000300.SH",
+            start_date=start_date,
+            end_date=end_date
+        )
         
         if df is None or df.empty:
-            return False, "AkShare 返回空数据"
+            return False, "Tushare 返回空数据"
         
         # 获取最新一条数据
+        df = df.sort_values('trade_date', ascending=True)
         latest = df.tail(1).iloc[0]
-        latest_date = pd.to_datetime(latest['date']).strftime('%Y-%m-%d')
+        latest_date = latest['trade_date']
         latest_close = latest['close']
         
-        msg = f"AkShare 连接正常 | 沪深300最新: {latest_date} 收盘 {latest_close:.2f}"
+        msg = f"Tushare Pro 连接正常 | 沪深300最新: {latest_date} 收盘 {latest_close:.2f}"
         print_result(True, msg)
         return True, msg
         
-    except ImportError:
-        msg = "未安装 akshare，请运行: pip install akshare"
+    except ImportError as e:
+        msg = f"未安装 tushare 或导入失败: {e}"
         print_result(False, msg)
         return False, msg
         
     except Exception as e:
-        msg = f"AkShare 连接失败: {e}"
+        msg = f"Tushare Pro 连接失败: {e}"
         print_result(False, msg)
         return False, msg
 
@@ -131,16 +144,15 @@ def check_trading_day() -> Tuple[bool, str]:
         print_result(False, msg)
         return False, msg
     
-    # 尝试从 AkShare 获取交易日历
+    # 尝试从 Tushare 获取交易日历
     try:
-        import akshare as ak
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from src.tushare_loader import TushareDataLoader
+        
         print("正在获取交易日历...")
         
-        df = ak.tool_trade_date_hist_sina()
-        trade_dates = pd.to_datetime(df['trade_date'])
-        today_dt = pd.to_datetime(today.date())
-        
-        is_trade_day = today_dt in trade_dates.values
+        loader = TushareDataLoader()
+        is_trade_day = loader.is_trade_day(today_str.replace("-", ""))
         
         if is_trade_day:
             msg = f"{today_str} 是交易日"

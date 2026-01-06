@@ -13,9 +13,8 @@ lake:
 
 # 数据源配置
 data_source:
-  provider: "akshare"  # 数据提供商（兼容旧配置）
+  provider: "tushare"  # 数据提供商
   primary: "tushare"   # 主数据源
-  fallback: "akshare"  # 备用数据源
   retry_times: 5       # 重试次数（网络不稳定时建议增加）
   retry_delay: 3       # 基础重试间隔（秒），实际使用指数退避
   timeout: 60          # 超时时间（秒）
@@ -24,11 +23,11 @@ data_source:
 
 # 股票池配置
 universe:
-  # 指数成分股
+  # 指数成分股 (Tushare 使用简化代码)
   index_codes:
-    - "000300"  # 沪深300
-    - "000905"  # 中证500
-    - "000852"  # 中证1000
+    - "hs300"   # 沪深300
+    - "zz500"   # 中证500
+    - "zz1000"  # 中证1000
   
   # 行业板块
   sectors:

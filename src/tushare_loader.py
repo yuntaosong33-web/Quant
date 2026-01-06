@@ -871,6 +871,405 @@ class TushareDataLoader:
             df["stock_code"] = df["ts_code"].str[:6]
         
         return df
+    
+    # ==================== 新闻资讯 ====================
+    
+    def fetch_news(
+        self,
+        stock_code: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        src: str = "sina"
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取新闻资讯数据
+        
+        使用 Tushare Pro news 接口获取财经新闻。
+        
+        Parameters
+        ----------
+        stock_code : Optional[str]
+            股票代码（6位），如果提供则过滤相关新闻
+        start_date : Optional[str]
+            开始日期，格式 YYYYMMDD
+        end_date : Optional[str]
+            结束日期，格式 YYYYMMDD
+        src : str
+            新闻来源，可选：sina(新浪), wallstreetcn(华尔街见闻), 
+            10jqka(同花顺), eastmoney(东方财富), yuncaijing(云财经)
+            默认 sina
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            新闻数据，包含 datetime, title, content, channels 等字段
+            失败返回 None
+        
+        Notes
+        -----
+        - Tushare Pro 新闻接口需要较高积分权限
+        - 如果接口不可用，会返回空 DataFrame
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> news = loader.fetch_news(start_date="20240101", end_date="20240115")
+        >>> print(news[['datetime', 'title']].head())
+        """
+        # 标准化日期格式
+        if start_date:
+            start_date = start_date.replace("-", "")
+        if end_date:
+            end_date = end_date.replace("-", "")
+        
+        logger.info(f"获取新闻资讯: src={src}, {start_date} ~ {end_date}")
+        
+        try:
+            df = self._fetch_with_retry(
+                self.pro.news,
+                src=src,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if df is None or df.empty:
+                logger.debug("无新闻数据")
+                return pd.DataFrame()
+            
+            # 如果指定了股票代码，尝试过滤相关新闻
+            if stock_code:
+                # 在标题或内容中搜索股票代码或名称
+                stock_code_clean = stock_code.replace(".", "")[:6]
+                mask = (
+                    df["title"].str.contains(stock_code_clean, na=False) |
+                    df["content"].str.contains(stock_code_clean, na=False)
+                )
+                df = df[mask]
+            
+            logger.info(f"获取新闻成功: {len(df)} 条")
+            return df
+            
+        except Exception as e:
+            logger.warning(f"获取新闻失败: {e}")
+            return pd.DataFrame()
+    
+    def fetch_stock_news(
+        self,
+        stock_code: str,
+        days_back: int = 7
+    ) -> str:
+        """
+        获取单只股票相关新闻（用于情感分析）
+        
+        获取指定股票最近几天的相关新闻，合并为文本返回。
+        
+        Parameters
+        ----------
+        stock_code : str
+            股票代码（6位）
+        days_back : int
+            回溯天数，默认 7 天
+        
+        Returns
+        -------
+        str
+            合并的新闻文本，用于情感分析
+            无新闻时返回空字符串
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> news_text = loader.fetch_stock_news("000001")
+        >>> print(news_text[:100])
+        """
+        from datetime import datetime, timedelta
+        
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+        
+        # 尝试多个新闻源
+        sources = ["sina", "eastmoney", "10jqka"]
+        all_news = []
+        
+        for src in sources:
+            df = self.fetch_news(
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                src=src
+            )
+            
+            if df is not None and not df.empty:
+                # 提取标题和内容
+                for _, row in df.head(5).iterrows():
+                    title = row.get("title", "")
+                    content = row.get("content", "")
+                    if title:
+                        all_news.append(title)
+                    if content and len(content) < 500:
+                        all_news.append(content[:200])
+                
+                if len(all_news) >= 5:
+                    break
+        
+        if not all_news:
+            logger.debug(f"股票 {stock_code} 无相关新闻")
+            return ""
+        
+        # 合并新闻文本
+        combined = " | ".join(all_news)
+        
+        # 截断
+        if len(combined) > 1500:
+            combined = combined[:1500] + "..."
+        
+        logger.debug(f"获取股票新闻成功: {stock_code}, {len(all_news)} 条")
+        return combined
+    
+    # ==================== 交易日历 ====================
+    
+    def fetch_trade_calendar(
+        self,
+        start_date: str,
+        end_date: str,
+        exchange: str = "SSE"
+    ) -> pd.DatetimeIndex:
+        """
+        获取交易日历
+        
+        Parameters
+        ----------
+        start_date : str
+            开始日期，格式 YYYY-MM-DD 或 YYYYMMDD
+        end_date : str
+            结束日期，格式 YYYY-MM-DD 或 YYYYMMDD
+        exchange : str
+            交易所，SSE(上交所，默认) 或 SZSE(深交所)
+        
+        Returns
+        -------
+        pd.DatetimeIndex
+            交易日期索引
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> calendar = loader.fetch_trade_calendar("2024-01-01", "2024-12-31")
+        >>> print(f"2024年共 {len(calendar)} 个交易日")
+        """
+        # 标准化日期格式
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        logger.info(f"获取交易日历: {start_date} ~ {end_date}")
+        
+        # 尝试缓存
+        cache_file = self.cache_dir / f"trade_cal_{start_date[:4]}.parquet"
+        
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                # 过滤日期范围
+                df = df[
+                    (df["cal_date"] >= start_date) & 
+                    (df["cal_date"] <= end_date) &
+                    (df["is_open"] == 1)
+                ]
+                if not df.empty:
+                    calendar = pd.to_datetime(df["cal_date"])
+                    logger.debug(f"从缓存加载交易日历: {len(calendar)} 天")
+                    return pd.DatetimeIndex(sorted(calendar))
+            except Exception:
+                pass
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.trade_cal,
+            exchange=exchange,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if df is None or df.empty:
+            logger.warning("无法获取交易日历，使用工作日近似")
+            return pd.bdate_range(start=start_date, end=end_date)
+        
+        # 保存缓存（整年数据）
+        try:
+            full_year_df = self._fetch_with_retry(
+                self.pro.trade_cal,
+                exchange=exchange,
+                start_date=f"{start_date[:4]}0101",
+                end_date=f"{start_date[:4]}1231"
+            )
+            if full_year_df is not None and not full_year_df.empty:
+                full_year_df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+        
+        # 过滤交易日
+        trade_days = df[df["is_open"] == 1]["cal_date"]
+        calendar = pd.to_datetime(trade_days)
+        calendar = pd.DatetimeIndex(sorted(calendar))
+        calendar.name = "date"
+        
+        logger.info(f"获取交易日历成功: {len(calendar)} 个交易日")
+        return calendar
+    
+    def is_trade_day(self, date: Optional[str] = None) -> bool:
+        """
+        判断指定日期是否为交易日
+        
+        Parameters
+        ----------
+        date : Optional[str]
+            日期，格式 YYYY-MM-DD 或 YYYYMMDD，默认今天
+        
+        Returns
+        -------
+        bool
+            是否为交易日
+        """
+        from datetime import datetime
+        
+        if date is None:
+            date = datetime.now().strftime("%Y%m%d")
+        else:
+            date = date.replace("-", "")
+        
+        calendar = self.fetch_trade_calendar(date, date)
+        return len(calendar) > 0
+    
+    # ==================== 行业分类 ====================
+    
+    def fetch_industry_mapping(
+        self,
+        use_cache: bool = True
+    ) -> Dict[str, str]:
+        """
+        获取股票行业分类映射
+        
+        返回股票代码到行业名称的映射字典。
+        
+        Parameters
+        ----------
+        use_cache : bool
+            是否使用缓存，默认 True
+        
+        Returns
+        -------
+        Dict[str, str]
+            股票代码（6位）到行业名称的映射
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> industry_map = loader.fetch_industry_mapping()
+        >>> print(industry_map.get("000001"))  # 银行
+        """
+        logger.info("获取股票行业分类映射")
+        
+        # 尝试缓存
+        today = datetime.now().strftime("%Y%m%d")
+        cache_file = self.cache_dir / f"industry_mapping_{today[:6]}.parquet"
+        
+        if use_cache and cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                mapping = dict(zip(df["stock_code"], df["industry"]))
+                logger.info(f"从缓存加载行业映射: {len(mapping)} 只股票")
+                return mapping
+            except Exception as e:
+                logger.warning(f"缓存读取失败: {e}")
+        
+        # API 获取
+        df = self._fetch_with_retry(
+            self.pro.stock_basic,
+            list_status="L",
+            fields="ts_code,symbol,name,industry,market,list_date"
+        )
+        
+        if df is None or df.empty:
+            logger.warning("无法获取行业分类数据")
+            return {}
+        
+        # 提取 6 位股票代码
+        df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 保存缓存
+        try:
+            df[["stock_code", "industry"]].to_parquet(cache_file, index=False)
+            logger.info(f"行业映射已缓存: {cache_file}")
+        except Exception as e:
+            logger.warning(f"缓存保存失败: {e}")
+        
+        # 构建映射
+        mapping = dict(zip(df["stock_code"], df["industry"]))
+        logger.info(f"获取行业映射成功: {len(mapping)} 只股票")
+        return mapping
+    
+    def fetch_sw_industry_mapping(
+        self,
+        level: int = 1
+    ) -> Dict[str, str]:
+        """
+        获取申万行业分类映射
+        
+        Parameters
+        ----------
+        level : int
+            行业分类级别：1(一级), 2(二级), 3(三级)
+            默认 1（一级行业）
+        
+        Returns
+        -------
+        Dict[str, str]
+            股票代码（6位）到申万行业名称的映射
+        
+        Notes
+        -----
+        申万行业分类是 A 股最常用的行业分类标准。
+        Tushare 需要较高权限才能使用申万行业接口。
+        """
+        logger.info(f"获取申万 {level} 级行业分类")
+        
+        # 尝试使用 stock_basic 的 industry 字段（通用行业分类）
+        # 如果需要精确的申万分类，需要使用 index_member 接口
+        
+        try:
+            # 尝试获取申万指数成分
+            df = self._fetch_with_retry(
+                self.pro.index_classify,
+                level=f"L{level}",
+                src="SW"
+            )
+            
+            if df is not None and not df.empty:
+                # 获取每个行业的成分股
+                result = {}
+                for _, row in df.iterrows():
+                    index_code = row.get("index_code", "")
+                    industry_name = row.get("industry_name", "")
+                    
+                    if index_code:
+                        members = self._fetch_with_retry(
+                            self.pro.index_member,
+                            index_code=index_code
+                        )
+                        if members is not None and not members.empty:
+                            for stock in members["con_code"].str[:6]:
+                                result[stock] = industry_name
+                
+                if result:
+                    logger.info(f"获取申万行业分类成功: {len(result)} 只股票")
+                    return result
+                    
+        except Exception as e:
+            logger.debug(f"申万分类接口不可用: {e}")
+        
+        # 降级到普通行业分类
+        logger.info("使用普通行业分类替代申万分类")
+        return self.fetch_industry_mapping()
 
 
 # ==================== 便捷函数 ====================

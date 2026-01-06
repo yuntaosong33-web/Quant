@@ -1,7 +1,7 @@
 """
 数据获取与ETL模块
 
-该模块提供数据获取、清洗和转换的核心功能，支持多种数据源。
+该模块提供数据获取、清洗和转换的核心功能，统一使用 Tushare Pro 作为数据源。
 使用抽象基类定义统一的数据处理接口，确保扩展性。
 """
 
@@ -14,111 +14,15 @@ from dataclasses import dataclass
 import logging
 import time
 import warnings
-import ssl
 import os
 
 import pandas as pd
 import numpy as np
-import akshare as ak
+
+# 导入 Tushare 数据加载器
+from .tushare_loader import TushareDataLoader, create_tushare_loader
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# SSL/网络配置（解决eastmoney等数据源的SSL连接问题）
-# ============================================================================
-def _configure_ssl_context() -> None:
-    """
-    配置SSL上下文以解决SSL_UNEXPECTED_EOF等连接问题
-    
-    针对中国金融数据API（如东方财富）常见的SSL问题进行优化：
-    - 部分服务器SSL实现不标准，会导致EOF错误
-    - 通过降低SSL验证级别来提升连接成功率
-    
-    Notes
-    -----
-    此配置会降低SSL安全性，仅用于获取公开金融数据场景。
-    生产环境建议使用VPN或代理解决网络问题。
-    """
-    try:
-        # 方法1：通过环境变量禁用SSL验证（requests库）
-        os.environ['PYTHONHTTPSVERIFY'] = '0'
-        os.environ['REQUESTS_CA_BUNDLE'] = ''
-        os.environ['CURL_CA_BUNDLE'] = ''
-        
-        # 方法2：配置全局SSL上下文
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # 方法3：创建更宽松的SSL上下文
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        ssl_context.set_ciphers('DEFAULT@SECLEVEL=0')
-        
-        # 设置更兼容的TLS选项，解决EOF问题
-        ssl_context.options |= ssl.OP_NO_SSLv2
-        ssl_context.options |= ssl.OP_NO_SSLv3
-        # 允许TLS重协商
-        ssl_context.options |= getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4)
-        
-        # 尝试修改默认HTTPS上下文
-        ssl._create_default_https_context = lambda: ssl_context
-        
-        logger.debug("SSL上下文已配置为宽松模式")
-        
-    except Exception as e:
-        logger.warning(f"SSL配置失败，使用默认设置: {e}")
-
-
-def _configure_requests_session() -> None:
-    """
-    配置 requests 库的全局会话以处理SSL问题
-    
-    通过 Monkey Patch 方式劫持 requests.Session.request 方法：
-    - 强制添加 Connection: close 头，禁用 Keep-Alive，解决 EOF 错误
-    - 设置默认超时 (10, 30)，防止请求卡死
-    
-    Notes
-    -----
-    使用 Monkey Patch 而非 HTTPAdapter 的原因：
-    - HTTPAdapter 无法强制禁用 Keep-Alive
-    - 需要在所有请求中统一添加 Connection: close 头
-    """
-    try:
-        import requests
-        
-        # 保存原始方法引用（确保可追溯）
-        _original_request = requests.Session.request
-        
-        def _patched_request(self, method, url, **kwargs):
-            """
-            劫持后的 request 方法
-            
-            强制禁用 Keep-Alive 并设置默认超时
-            """
-            # 强制添加 Connection: close 头，禁用长连接
-            headers = kwargs.get('headers', {}) or {}
-            headers['Connection'] = 'close'
-            kwargs['headers'] = headers
-            
-            # 设置默认超时 (连接超时 10s, 读取超时 30s)
-            if 'timeout' not in kwargs or kwargs['timeout'] is None:
-                kwargs['timeout'] = (10, 30)
-            
-            return _original_request(self, method, url, **kwargs)
-        
-        # Monkey Patch: 替换全局 Session.request 方法
-        requests.Session.request = _patched_request
-        
-        logger.debug("requests.Session.request 已通过 Monkey Patch 配置 (Connection: close, timeout=(10,30))")
-        
-    except Exception as e:
-        logger.warning(f"requests会话配置失败: {e}")
-
-
-# 模块加载时自动配置SSL和requests
-_configure_ssl_context()
-_configure_requests_session()
 
 
 class DataHandler(ABC):
@@ -348,320 +252,6 @@ class DataHandler(ABC):
         
         logger.error(f"所有重试均失败: {last_exception}")
         raise last_exception
-
-
-class AkshareDataLoader(DataHandler):
-    """
-    基于AkShare的数据加载器
-    
-    使用AkShare库从东方财富等数据源获取A股数据。
-    
-    Examples
-    --------
-    >>> config = {"data_source": {"retry_times": 3}}
-    >>> loader = AkshareDataLoader(config)
-    >>> df = loader.fetch_daily_data("000001", "2023-01-01", "2023-12-31")
-    >>> print(df.head())
-    """
-    
-    def __init__(self, config: Dict[str, Any]) -> None:
-        """
-        初始化AkShare数据加载器
-        
-        Parameters
-        ----------
-        config : Dict[str, Any]
-            数据配置字典
-        """
-        super().__init__(config)
-        self._request_delay = config.get("data_source", {}).get("request_delay", 0.5)
-        
-        # 配置AkShare底层请求库的超时和重试
-        self._configure_requests_session()
-        logger.info("AkShare数据加载器初始化完成")
-    
-    def _configure_requests_session(self) -> None:
-        """
-        配置requests库以提升网络稳定性
-        
-        针对东方财富API常见的SSL/连接问题进行优化：
-        - 增加连接超时和读取超时
-        - 禁用SSL证书验证（可选，仅用于调试）
-        - 配置连接池重试机制
-        """
-        try:
-            import requests
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
-            
-            # 创建重试策略
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "OPTIONS"]
-            )
-            
-            # 创建适配器
-            adapter = HTTPAdapter(
-                max_retries=retry_strategy,
-                pool_connections=10,
-                pool_maxsize=10
-            )
-            
-            # 尝试为AkShare配置session（如果支持）
-            # 注：AkShare内部使用自己的session，这里主要是设置默认超时
-            import socket
-            socket.setdefaulttimeout(self._timeout)
-            
-            logger.debug("网络请求配置完成: timeout=%ss", self._timeout)
-            
-        except ImportError as e:
-            logger.warning(f"配置请求session失败，使用默认设置: {e}")
-    
-    def fetch_daily_data(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: str
-    ) -> pd.DataFrame:
-        """
-        获取股票日线数据
-        
-        Parameters
-        ----------
-        symbol : str
-            股票代码，如 '000001'
-        start_date : str
-            开始日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
-        end_date : str
-            结束日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
-        
-        Returns
-        -------
-        pd.DataFrame
-            日线数据，包含 open, high, low, close, volume 等字段
-            索引为 DatetimeIndex
-        """
-        # 标准化日期格式
-        start_date = start_date.replace("-", "")
-        end_date = end_date.replace("-", "")
-        
-        def _fetch():
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"  # 前复权
-            )
-            return df
-        
-        df = self._retry_request(_fetch)
-        
-        if df.empty:
-            logger.warning(f"股票 {symbol} 在指定日期范围内无数据")
-            return pd.DataFrame()
-        
-        # 数据清洗和标准化
-        df = self._standardize_columns(df)
-        df = self._set_datetime_index(df)
-        
-        logger.info(f"获取 {symbol} 日线数据成功，共 {len(df)} 条记录")
-        return df
-    
-    def fetch_fundamental_data(self, symbol: str) -> pd.DataFrame:
-        """
-        获取股票基本面数据
-        
-        Parameters
-        ----------
-        symbol : str
-            股票代码
-        
-        Returns
-        -------
-        pd.DataFrame
-            基本面数据，包含市盈率、市净率等指标
-        """
-        def _fetch():
-            df = ak.stock_individual_info_em(symbol=symbol)
-            return df
-        
-        df = self._retry_request(_fetch)
-        logger.info(f"获取 {symbol} 基本面数据成功")
-        return df
-    
-    def get_stock_list(
-        self, 
-        index_code: Optional[str] = None,
-        use_cache: bool = True
-    ) -> List[str]:
-        """
-        获取股票列表（支持本地缓存降级）
-        
-        Parameters
-        ----------
-        index_code : Optional[str]
-            指数代码，如 '000300' 表示沪深300成分股
-        use_cache : bool, optional
-            是否启用缓存（网络失败时自动使用），默认 True
-        
-        Returns
-        -------
-        List[str]
-            股票代码列表
-        
-        Notes
-        -----
-        当网络请求失败时，会尝试从本地缓存加载股票列表。
-        缓存文件保存在 data/cache/ 目录下。
-        """
-        import json
-        
-        # 缓存目录和文件
-        cache_dir = Path("data/cache")
-        cache_file = cache_dir / f"stock_list_{index_code or 'all'}.json"
-        
-        def _fetch():
-            if index_code:
-                # 获取指数成分股
-                df = ak.index_stock_cons(symbol=index_code)
-                return df["品种代码"].tolist()
-            else:
-                # 获取全部A股列表
-                df = ak.stock_zh_a_spot_em()
-                return df["代码"].tolist()
-        
-        try:
-            stock_list = self._retry_request(_fetch)
-            
-            # 成功获取后更新缓存
-            if use_cache and stock_list:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_data = {
-                    "updated_at": datetime.now().isoformat(),
-                    "index_code": index_code,
-                    "stock_list": stock_list
-                }
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(cache_data, f, ensure_ascii=False)
-                logger.debug(f"股票列表已缓存至 {cache_file}")
-            
-            logger.info(f"获取股票列表成功，共 {len(stock_list)} 只股票")
-            return stock_list
-            
-        except Exception as e:
-            logger.error(f"网络获取股票列表失败: {e}")
-            
-            # 尝试从缓存加载
-            if use_cache and cache_file.exists():
-                try:
-                    with open(cache_file, "r", encoding="utf-8") as f:
-                        cache_data = json.load(f)
-                    stock_list = cache_data.get("stock_list", [])
-                    updated_at = cache_data.get("updated_at", "未知")
-                    logger.warning(
-                        f"使用缓存的股票列表 (更新时间: {updated_at})，"
-                        f"共 {len(stock_list)} 只股票"
-                    )
-                    return stock_list
-                except Exception as cache_error:
-                    logger.error(f"缓存加载失败: {cache_error}")
-            
-            # 缓存也没有则抛出异常
-            raise
-    
-    def fetch_index_data(
-        self,
-        index_code: str,
-        start_date: str,
-        end_date: str
-    ) -> pd.DataFrame:
-        """
-        获取指数日线数据
-        
-        Parameters
-        ----------
-        index_code : str
-            指数代码，如 '000300'
-        start_date : str
-            开始日期
-        end_date : str
-            结束日期
-        
-        Returns
-        -------
-        pd.DataFrame
-            指数日线数据
-        """
-        start_date = start_date.replace("-", "")
-        end_date = end_date.replace("-", "")
-        
-        def _fetch():
-            df = ak.stock_zh_index_daily(symbol=f"sh{index_code}")
-            return df
-        
-        df = self._retry_request(_fetch)
-        
-        # 过滤日期范围
-        df["date"] = pd.to_datetime(df["date"])
-        mask = (df["date"] >= start_date) & (df["date"] <= end_date)
-        df = df.loc[mask].copy()
-        df.set_index("date", inplace=True)
-        
-        logger.info(f"获取指数 {index_code} 数据成功，共 {len(df)} 条记录")
-        return df
-    
-    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        标准化列名
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            原始数据
-        
-        Returns
-        -------
-        pd.DataFrame
-            标准化后的数据
-        """
-        column_mapping = {
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "成交额": "amount",
-            "振幅": "amplitude",
-            "涨跌幅": "pct_change",
-            "涨跌额": "change",
-            "换手率": "turnover",
-        }
-        df = df.rename(columns=column_mapping)
-        return df
-    
-    def _set_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        设置日期时间索引
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            数据
-        
-        Returns
-        -------
-        pd.DataFrame
-            设置索引后的数据
-        """
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-            df.set_index("date", inplace=True)
-            df.sort_index(inplace=True)
-        return df
 
 
 class DataPipeline:
@@ -1193,9 +783,9 @@ class DownloadResult:
 
 class DataLoader:
     """
-    A股数据加载器（增强版）
+    A股数据加载器（Tushare Pro 版本）
     
-    基于AkShare实现的高性能数据加载器，支持：
+    基于 Tushare Pro 实现的高性能数据加载器，支持：
     - 前复权/不复权价格数据
     - 财务指标数据（PE、PB、股息率）
     - 并发批量下载
@@ -1216,6 +806,8 @@ class DataLoader:
         数据获取模式：'network'（网络优先）或 'local_first'（本地优先）
     lake_path : Path
         数据湖路径（仅 local_first 模式使用）
+    tushare_loader : TushareDataLoader
+        Tushare 数据加载器实例
     
     Examples
     --------
@@ -1232,7 +824,7 @@ class DataLoader:
     >>> df = loader_local.fetch_daily_price("000001", "2023-01-01", "2024-12-31")
     """
     
-    # AkShare 接口常量
+    # 复权常量
     ADJUST_QFQ = "qfq"      # 前复权
     ADJUST_HFQ = "hfq"      # 后复权
     ADJUST_NONE = ""        # 不复权
@@ -1249,7 +841,8 @@ class DataLoader:
         retry_delay: float = 3.0,
         timeout: int = 30,
         mode: str = "network",
-        lake_path: str = "data/lake/daily"
+        lake_path: str = "data/lake/daily",
+        tushare_token: Optional[str] = None
     ) -> None:
         """
         初始化数据加载器
@@ -1268,10 +861,12 @@ class DataLoader:
             请求超时时间（秒），默认30
         mode : str, optional
             数据获取模式，可选：
-            - 'network': 网络优先模式（默认），直接从 Akshare 获取数据
+            - 'network': 网络优先模式（默认），直接从 Tushare 获取数据
             - 'local_first': 本地优先模式，优先读取数据湖，缺失时降级到网络
         lake_path : str, optional
             数据湖路径，默认 'data/lake/daily'（仅 local_first 模式使用）
+        tushare_token : Optional[str]
+            Tushare API Token，如果不提供则从环境变量 TUSHARE_TOKEN 读取
         """
         self.output_dir = Path(output_dir)
         self.max_workers = max_workers
@@ -1290,6 +885,10 @@ class DataLoader:
         # 确保输出目录存在
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # 初始化 Tushare 数据加载器
+        self._tushare_token = tushare_token or os.environ.get("TUSHARE_TOKEN", "")
+        self._tushare_loader: Optional[TushareDataLoader] = None
+        
         # 下载统计
         self._download_stats = {
             "success": 0,
@@ -1297,15 +896,32 @@ class DataLoader:
             "total": 0
         }
         
-        # 全市场数据缓存（避免重复请求 stock_zh_a_spot_em）
+        # 全市场数据缓存
         self._spot_data_cache: Optional[pd.DataFrame] = None
         self._spot_data_cache_time: Optional[datetime] = None
         self._spot_cache_ttl = 300  # 缓存有效期5分钟
         
         logger.info(
             f"DataLoader初始化: output_dir={output_dir}, "
-            f"max_workers={max_workers}, mode={mode}"
+            f"max_workers={max_workers}, mode={mode}, data_source=tushare"
         )
+    
+    @property
+    def tushare_loader(self) -> TushareDataLoader:
+        """
+        获取 Tushare 数据加载器（延迟初始化）
+        
+        Returns
+        -------
+        TushareDataLoader
+            Tushare 数据加载器实例
+        """
+        if self._tushare_loader is None:
+            self._tushare_loader = TushareDataLoader(
+                api_token=self._tushare_token,
+                cache_dir="data/tushare_cache"
+            )
+        return self._tushare_loader
     
     def fetch_daily_price(
         self,
@@ -1317,8 +933,8 @@ class DataLoader:
         """
         获取股票日线价格数据
         
-        使用 ak.stock_zh_a_hist 接口获取数据。
-        默认获取前复权数据用于计算收益率，同时可保留不复权数据用于计算成交额。
+        使用 Tushare Pro 接口获取数据。
+        默认获取前复权数据用于计算收益率。
         
         在 local_first 模式下，优先读取本地数据湖，缺失或过期时降级到网络获取。
         
@@ -1340,10 +956,9 @@ class DataLoader:
             - date: 日期（索引）
             - open, high, low, close: 前复权OHLC
             - volume: 成交量（股）
-            - amount: 成交额（元，来自不复权数据）
+            - amount: 成交额（元）
             - turnover: 换手率
             - pct_change: 涨跌幅
-            - open_unadj, high_unadj, low_unadj, close_unadj: 不复权OHLC（可选）
         
         Raises
         ------
@@ -1514,7 +1129,7 @@ class DataLoader:
         include_unadjusted: bool = True
     ) -> pd.DataFrame:
         """
-        从网络获取日线数据（Akshare）
+        从网络获取日线数据（Tushare Pro）
         
         Parameters
         ----------
@@ -1525,61 +1140,44 @@ class DataLoader:
         end_date : str
             结束日期
         include_unadjusted : bool
-            是否包含不复权数据
+            是否包含不复权数据（Tushare 已包含复权因子）
         
         Returns
         -------
         pd.DataFrame
             日线数据
         """
-        # 标准化日期格式
-        start_date = start_date.replace("-", "")
-        end_date = end_date.replace("-", "")
-        
         logger.info(f"获取 {symbol} 日线数据: {start_date} - {end_date}")
         
-        # 获取前复权数据（用于计算收益率）
-        df_qfq = self._fetch_with_retry(
-            func=ak.stock_zh_a_hist,
-            symbol=symbol,
-            period="daily",
+        # 使用 Tushare 获取前复权数据
+        df = self.tushare_loader.fetch_daily_data(
+            stock_code=symbol,
             start_date=start_date,
             end_date=end_date,
-            adjust=self.ADJUST_QFQ
+            adj=self.ADJUST_QFQ
         )
         
-        if df_qfq is None or df_qfq.empty:
+        if df is None or df.empty:
             logger.warning(f"股票 {symbol} 无数据")
             return pd.DataFrame()
         
-        # 标准化列名
-        df_qfq = self._standardize_columns(df_qfq)
+        # Tushare 返回的数据已经标准化
+        # 确保索引是 DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if 'trade_date' in df.columns:
+                df['date'] = pd.to_datetime(df['trade_date'])
+                df = df.set_index('date')
+            elif 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
         
-        # 获取不复权数据（用于成交额等）
-        if include_unadjusted:
-            df_unadj = self._fetch_with_retry(
-                func=ak.stock_zh_a_hist,
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust=self.ADJUST_NONE
-            )
-            
-            if df_unadj is not None and not df_unadj.empty:
-                df_unadj = self._standardize_columns(df_unadj)
-                
-                # 合并不复权数据
-                df_qfq = self._merge_adjusted_data(df_qfq, df_unadj)
-        
-        # 设置日期索引
-        df_qfq = self._set_datetime_index(df_qfq)
+        df = df.sort_index()
         
         # 添加股票代码列
-        df_qfq["symbol"] = symbol
+        df["symbol"] = symbol
         
-        logger.info(f"获取 {symbol} 成功，共 {len(df_qfq)} 条记录")
-        return df_qfq
+        logger.info(f"获取 {symbol} 成功，共 {len(df)} 条记录")
+        return df
     
     def fetch_financial_indicator(
         self,
@@ -1588,7 +1186,7 @@ class DataLoader:
         """
         获取股票财务指标
         
-        获取市盈率(PE-TTM)、市净率(PB)、股息率(Dividend Yield)等估值指标。
+        使用 Tushare Pro 获取市盈率(PE-TTM)、市净率(PB)、股息率等估值指标。
         
         Parameters
         ----------
@@ -1616,49 +1214,25 @@ class DataLoader:
         
         result = pd.DataFrame()
         
-        # 方法1: 尝试使用 stock_a_lg_indicator 接口（雪球数据）
+        # 使用 Tushare daily_basic 获取估值指标
         try:
-            df = self._fetch_with_retry(
-                func=ak.stock_a_lg_indicator,
-                symbol=symbol
-            )
+            df = self.tushare_loader.fetch_daily_basic(symbol)
             
             if df is not None and not df.empty:
-                # 标准化列名
-                result = self._standardize_financial_columns(df)
-                logger.info(f"获取 {symbol} 财务指标成功（stock_a_lg_indicator）")
-                return result
+                logger.info(f"获取 {symbol} 财务指标成功（Tushare daily_basic）")
+                return df
         except Exception as e:
-            logger.debug(f"stock_a_lg_indicator 获取失败: {e}")
+            logger.debug(f"Tushare daily_basic 获取失败: {e}")
         
-        # 方法2: 尝试使用 stock_individual_info_em 接口
+        # 备选：尝试获取财务指标数据
         try:
-            df = self._fetch_with_retry(
-                func=ak.stock_individual_info_em,
-                symbol=symbol
-            )
+            df = self.tushare_loader.fetch_financial_indicator(symbol)
             
             if df is not None and not df.empty:
-                # 转换为标准格式
-                result = self._parse_individual_info(df, symbol)
-                logger.info(f"获取 {symbol} 财务指标成功（stock_individual_info_em）")
-                return result
+                logger.info(f"获取 {symbol} 财务指标成功（Tushare fina_indicator）")
+                return df
         except Exception as e:
-            logger.debug(f"stock_individual_info_em 获取失败: {e}")
-        
-        # 方法3: 尝试使用实时行情接口获取估值数据（使用缓存避免重复请求）
-        try:
-            df = self._get_spot_data_cached()
-            
-            if df is not None and not df.empty:
-                # 筛选指定股票
-                stock_data = df[df["代码"] == symbol]
-                if not stock_data.empty:
-                    result = self._parse_spot_data(stock_data)
-                    logger.info(f"获取 {symbol} 财务指标成功（stock_zh_a_spot_em 缓存）")
-                    return result
-        except Exception as e:
-            logger.debug(f"stock_zh_a_spot_em 获取失败: {e}")
+            logger.debug(f"Tushare fina_indicator 获取失败: {e}")
         
         logger.warning(f"无法获取 {symbol} 的财务指标")
         return result
@@ -1667,18 +1241,17 @@ class DataLoader:
         """
         获取全市场实时行情数据（带多级缓存和容错）
         
+        使用 Tushare Pro 获取全市场股票数据。
+        
         缓存策略：
         1. 内存缓存（5分钟有效期）
         2. 磁盘缓存（当日有效）
-        3. 多API降级（stock_zh_a_spot_em -> 单只股票API）
         
         Returns
         -------
         Optional[pd.DataFrame]
             全市场行情数据，失败返回 None
         """
-        from pathlib import Path
-        
         now = datetime.now()
         cache_dir = Path("data/cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1691,23 +1264,23 @@ class DataLoader:
             logger.debug("使用内存缓存的全市场行情数据")
             return self._spot_data_cache
         
-        # 2. 尝试多种API获取数据
+        # 2. 尝试从 Tushare 获取数据
         df = None
-        api_methods = [
-            ("stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em()),
-            ("stock_info_a_code_name", lambda: self._fetch_spot_via_code_name()),
-        ]
-        
-        for api_name, api_func in api_methods:
-            logger.info(f"尝试获取全市场行情数据 (API: {api_name})...")
-            try:
-                df = self._fetch_with_retry(func=api_func)
-                if df is not None and not df.empty:
-                    logger.info(f"✅ {api_name} 成功，共 {len(df)} 条记录")
-                    break
-            except Exception as e:
-                logger.warning(f"❌ {api_name} 失败: {type(e).__name__}")
-                continue
+        try:
+            logger.info("尝试获取全市场行情数据 (Tushare daily_basic)...")
+            # 获取当日所有股票的基础数据
+            trade_date = now.strftime("%Y%m%d")
+            df = self.tushare_loader.pro.daily_basic(
+                trade_date=trade_date,
+                fields='ts_code,close,pe_ttm,pb,total_mv,circ_mv,turnover_rate'
+            )
+            
+            if df is not None and not df.empty:
+                # 提取 6 位股票代码
+                df["代码"] = df["ts_code"].str[:6]
+                logger.info(f"✅ Tushare daily_basic 成功，共 {len(df)} 条记录")
+        except Exception as e:
+            logger.warning(f"❌ Tushare daily_basic 失败: {e}")
         
         # 3. 如果网络获取成功，更新缓存
         if df is not None and not df.empty:
@@ -1751,28 +1324,11 @@ class DataLoader:
         logger.error("所有数据源和缓存均失败")
         return None
     
-    def _fetch_spot_via_code_name(self) -> Optional[pd.DataFrame]:
-        """
-        备用方法：通过 stock_info_a_code_name 获取基础股票信息
-        
-        该API更稳定，但数据较少（仅代码和名称）
-        """
-        try:
-            df = ak.stock_info_a_code_name()
-            if df is not None and not df.empty:
-                # 重命名列以匹配主API格式
-                df = df.rename(columns={
-                    "code": "代码",
-                    "name": "名称"
-                })
-                return df
-        except Exception as e:
-            logger.debug(f"stock_info_a_code_name 失败: {e}")
-        return None
-    
     def get_hs300_constituents(self) -> List[str]:
         """
         获取沪深300成分股列表
+        
+        使用 Tushare Pro 获取沪深300成分股。
         
         Returns
         -------
@@ -1782,25 +1338,15 @@ class DataLoader:
         logger.info("获取沪深300成分股列表")
         
         try:
-            df = self._fetch_with_retry(
-                func=ak.index_stock_cons,
-                symbol="000300"
+            stocks = self.tushare_loader.fetch_index_constituents(
+                index_code="hs300"
             )
             
-            if df is not None and not df.empty:
-                # 列名可能是 "品种代码" 或 "成分券代码"
-                code_col = None
-                for col in ["品种代码", "成分券代码", "代码", "stock_code"]:
-                    if col in df.columns:
-                        code_col = col
-                        break
-                
-                if code_col:
-                    stocks = df[code_col].tolist()
-                    logger.info(f"获取沪深300成分股成功，共 {len(stocks)} 只")
-                    return stocks
+            if stocks:
+                logger.info(f"获取沪深300成分股成功，共 {len(stocks)} 只")
+                return stocks
             
-            logger.warning("无法解析沪深300成分股数据")
+            logger.warning("无法获取沪深300成分股数据")
             return []
             
         except Exception as e:
@@ -2258,17 +1804,14 @@ class DataLoader:
         **kwargs
     ) -> Optional[pd.DataFrame]:
         """
-        带重试机制的数据获取（增强版SSL错误处理）
+        带重试机制的数据获取
         
-        针对东方财富等数据源的SSL EOF错误进行专门优化：
-        - SSL错误使用更长的指数退避时间
-        - 自动清理连接池避免连接复用导致的问题
-        - 添加随机抖动避免请求风暴
+        通用的重试包装器，处理网络错误和超时。
         
         Parameters
         ----------
         func : Callable
-            AkShare 接口函数
+            数据获取函数
         *args, **kwargs
             传递给接口的参数
         
@@ -2554,13 +2097,12 @@ class DataLoader:
         """
         获取指数日线价格数据
         
-        用于获取沪深300、中证500等指数的历史价格，支持大盘风控计算。
+        使用 Tushare Pro 获取沪深300、中证500等指数的历史价格，支持大盘风控计算。
         
         Parameters
         ----------
         index_code : str
             指数代码，如 '000300' (沪深300), '000905' (中证500)
-            注意：会自动添加 'sh' 前缀用于 AkShare 接口
         start_date : str
             开始日期，格式 'YYYY-MM-DD' 或 'YYYYMMDD'
         end_date : str
@@ -2587,7 +2129,7 @@ class DataLoader:
         
         Notes
         -----
-        - 使用 ak.stock_zh_index_daily 接口获取数据
+        - 使用 Tushare Pro index_daily 接口获取数据
         - 自动处理日期格式转换
         - 内置重试机制处理网络异常
         """
@@ -2595,56 +2137,53 @@ class DataLoader:
         start_date_clean = start_date.replace("-", "")
         end_date_clean = end_date.replace("-", "")
         
-        # 确定指数符号（AkShare 需要 sh/sz 前缀）
-        # 沪深300 (000300) 在上海交易所，中证500 (000905) 也在上海
-        if index_code.startswith(("000", "399")):
-            symbol = f"sh{index_code}"
+        # Tushare 指数代码格式：000300.SH
+        if index_code.startswith("000"):
+            ts_code = f"{index_code}.SH"
+        elif index_code.startswith("399"):
+            ts_code = f"{index_code}.SZ"
         else:
-            symbol = f"sh{index_code}"  # 默认上海
+            ts_code = f"{index_code}.SH"  # 默认上海
         
-        logger.info(f"获取指数 {index_code} ({symbol}) 日线数据: {start_date} - {end_date}")
+        logger.info(f"获取指数 {index_code} ({ts_code}) 日线数据: {start_date} - {end_date}")
         
-        # 使用重试机制获取数据
-        df = self._fetch_with_retry(
-            func=ak.stock_zh_index_daily,
-            symbol=symbol
-        )
-        
-        if df is None or df.empty:
-            logger.warning(f"指数 {index_code} 无数据")
-            return pd.DataFrame()
-        
-        # 数据清洗和标准化
-        # 确保日期列存在并转换
-        if 'date' in df.columns:
+        try:
+            # 使用 Tushare 获取指数日线数据
+            df = self.tushare_loader.pro.index_daily(
+                ts_code=ts_code,
+                start_date=start_date_clean,
+                end_date=end_date_clean
+            )
+            
+            if df is None or df.empty:
+                logger.warning(f"指数 {index_code} 无数据")
+                return pd.DataFrame()
+            
+            # 标准化列名
+            column_mapping = {
+                'trade_date': 'date',
+                'open': 'open',
+                'high': 'high',
+                'low': 'low',
+                'close': 'close',
+                'vol': 'volume',
+                'amount': 'amount',
+                'pct_chg': 'pct_change',
+            }
+            df = df.rename(columns=column_mapping)
+            
+            # 设置日期索引
             df['date'] = pd.to_datetime(df['date'])
-        elif '日期' in df.columns:
-            df['date'] = pd.to_datetime(df['日期'])
-            df = df.drop(columns=['日期'])
-        
-        # 过滤日期范围
-        start_dt = pd.to_datetime(start_date_clean)
-        end_dt = pd.to_datetime(end_date_clean)
-        
-        df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)].copy()
-        
-        # 设置日期索引
-        df = df.set_index('date')
-        df = df.sort_index()
-        df.index.name = 'date'
-        
-        # 确保列名标准化
-        column_mapping = {
-            '开盘': 'open',
-            '收盘': 'close',
-            '最高': 'high',
-            '最低': 'low',
-            '成交量': 'volume',
-        }
-        df = df.rename(columns=column_mapping)
-        
-        logger.info(f"获取指数 {index_code} 成功，共 {len(df)} 条记录")
-        return df
+            df = df.set_index('date')
+            df = df.sort_index()
+            df.index.name = 'date'
+            
+            logger.info(f"获取指数 {index_code} 成功，共 {len(df)} 条记录")
+            return df
+            
+        except Exception as e:
+            logger.error(f"获取指数 {index_code} 失败: {e}")
+            return pd.DataFrame()
 
 
 class DataCleaner:
@@ -3146,10 +2685,12 @@ class DataCleaner:
     def generate_trading_calendar(
         start_date: str,
         end_date: str,
-        source: str = "akshare"
+        source: str = "tushare"
     ) -> pd.DatetimeIndex:
         """
         生成交易日历
+        
+        使用 Tushare Pro 获取 A 股交易日历。
         
         Parameters
         ----------
@@ -3158,7 +2699,7 @@ class DataCleaner:
         end_date : str
             结束日期
         source : str, optional
-            数据源，默认 'akshare'
+            数据源，默认 'tushare'
         
         Returns
         -------
@@ -3170,23 +2711,16 @@ class DataCleaner:
         >>> calendar = DataCleaner.generate_trading_calendar("2023-01-01", "2024-12-31")
         >>> cleaner = DataCleaner(trading_calendar=calendar)
         """
-        if source == "akshare":
+        if source == "tushare":
             try:
-                # 获取交易日历
-                df = ak.tool_trade_date_hist_sina()
-                dates = pd.to_datetime(df["trade_date"])
+                # 使用 Tushare 获取交易日历
+                loader = create_tushare_loader()
+                calendar = loader.fetch_trade_calendar(start_date, end_date)
                 
-                # 过滤日期范围
-                start = pd.to_datetime(start_date)
-                end = pd.to_datetime(end_date)
-                dates = dates[(dates >= start) & (dates <= end)]
-                
-                calendar = pd.DatetimeIndex(sorted(dates))
-                calendar.name = "date"
-                
-                logger.info(f"生成交易日历: {len(calendar)} 个交易日")
-                return calendar
-                
+                if calendar is not None and len(calendar) > 0:
+                    logger.info(f"生成交易日历: {len(calendar)} 个交易日")
+                    return calendar
+                    
             except Exception as e:
                 logger.warning(f"获取交易日历失败: {e}，使用工作日近似")
         

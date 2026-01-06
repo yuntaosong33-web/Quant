@@ -755,7 +755,7 @@ class AsyncNewsFetcher:
         
         async with self._semaphore:
             try:
-                # 在线程池中执行同步的 AkShare 调用
+                # 在线程池中执行同步的 Tushare 调用
                 loop = asyncio.get_event_loop()
                 content = await loop.run_in_executor(
                     None,
@@ -781,6 +781,8 @@ class AsyncNewsFetcher:
         """
         同步获取新闻（在线程池中执行）
         
+        使用 Tushare Pro 获取股票新闻。
+        
         Parameters
         ----------
         stock_code : str
@@ -794,9 +796,9 @@ class AsyncNewsFetcher:
             新闻内容
         """
         try:
-            import akshare as ak
+            from .tushare_loader import TushareDataLoader
         except ImportError:
-            logger.warning("akshare 未安装")
+            logger.warning("tushare_loader 未安装")
             return ""
         
         try:
@@ -805,50 +807,16 @@ class AsyncNewsFetcher:
             if len(clean_code) > 6:
                 clean_code = clean_code[:6]
             
-            # 获取新闻
-            news_df = ak.stock_news_em(symbol=clean_code)
+            # 使用 Tushare 获取新闻
+            loader = TushareDataLoader()
+            news_text = loader.fetch_stock_news(clean_code, days_back=7)
             
-            if news_df is None or news_df.empty:
+            if not news_text:
+                logger.debug(f"股票 {stock_code} 无新闻")
                 return ""
             
-            # 过滤日期范围（前后3天）
-            target_date = pd.to_datetime(date)
-            
-            if "发布时间" in news_df.columns:
-                news_df["发布时间"] = pd.to_datetime(news_df["发布时间"], errors="coerce")
-                date_mask = (
-                    (news_df["发布时间"] >= target_date - pd.Timedelta(days=3)) &
-                    (news_df["发布时间"] <= target_date + pd.Timedelta(days=1))
-                )
-                filtered = news_df[date_mask]
-            else:
-                filtered = news_df.head(5)
-            
-            if filtered.empty:
-                filtered = news_df.head(3)
-            
-            # 提取标题和内容
-            texts = []
-            title_col = "新闻标题" if "新闻标题" in filtered.columns else None
-            content_col = "新闻内容" if "新闻内容" in filtered.columns else None
-            
-            for _, row in filtered.head(5).iterrows():
-                parts = []
-                if title_col and pd.notna(row.get(title_col)):
-                    parts.append(str(row[title_col]))
-                if content_col and pd.notna(row.get(content_col)):
-                    parts.append(str(row[content_col])[:200])
-                if parts:
-                    texts.append("; ".join(parts))
-            
-            combined = " | ".join(texts)
-            
-            # 截断
-            if len(combined) > 1500:
-                combined = combined[:1500] + "..."
-            
-            logger.debug(f"获取新闻成功: {stock_code}, {len(texts)} 条")
-            return combined
+            logger.debug(f"获取新闻成功: {stock_code}")
+            return news_text
             
         except Exception as e:
             logger.warning(f"获取新闻异常 {stock_code}: {e}")
@@ -1502,7 +1470,7 @@ if __name__ == "__main__":
     for i, result in enumerate(batch_results):
         print(f"  [{i+1}] {result.label}: {result.score:.2f}")
     
-    # 3. 测试完整管道（如果安装了 akshare）
+    # 3. 测试完整管道（需要配置 Tushare token）
     print("\n3. 测试完整管道")
     try:
         pipeline = create_sentiment_pipeline(device="cpu")
@@ -1519,7 +1487,7 @@ if __name__ == "__main__":
         print(result_df.to_string(index=False))
         
     except ImportError:
-        print("  跳过管道测试（需要安装 akshare）")
+        print("  跳过管道测试（需要配置 Tushare token）")
     except Exception as e:
         print(f"  管道测试失败: {e}")
     

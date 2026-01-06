@@ -18,11 +18,14 @@ __author__ = "Quant Developer"
 
 from .data_loader import (
     DataHandler,
-    AkshareDataLoader,
     AShareDataCleaner,
     DataLoader,
     DataCleaner,
     DownloadResult,
+)
+from .tushare_loader import (
+    TushareDataLoader,
+    create_tushare_loader,
 )
 from .features import (
     FeatureEngine,
@@ -76,11 +79,12 @@ from .utils import (
 __all__ = [
     # 数据处理
     "DataHandler",
-    "AkshareDataLoader",
     "AShareDataCleaner",
     "DataLoader",
     "DataCleaner",
     "DownloadResult",
+    "TushareDataLoader",
+    "create_tushare_loader",
     # 特征工程
     "FeatureEngine",
     "TechnicalFeatures",

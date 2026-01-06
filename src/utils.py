@@ -1630,7 +1630,7 @@ class DataStandardizer:
     """
     数据源列名标准化器
     
-    将 Tushare 和 Akshare 返回的 DataFrame 统一映射为标准格式。
+    将 Tushare Pro 返回的 DataFrame 统一映射为标准格式。
     支持 OHLCV + adj_factor 等常用字段的标准化。
     
     Attributes
@@ -1639,8 +1639,6 @@ class DataStandardizer:
         标准列名列表
     TUSHARE_MAPPING : Dict[str, str]
         Tushare 列名到标准列名的映射
-    AKSHARE_MAPPING : Dict[str, str]
-        Akshare 列名到标准列名的映射
     
     Examples
     --------
@@ -1649,10 +1647,6 @@ class DataStandardizer:
     >>> # 标准化 Tushare 数据
     >>> df_tushare = ts.pro_api().daily(ts_code='000001.SZ')
     >>> df_std = standardizer.standardize(df_tushare, source='tushare')
-    >>> 
-    >>> # 标准化 Akshare 数据
-    >>> df_akshare = ak.stock_zh_a_hist(symbol='000001')
-    >>> df_std = standardizer.standardize(df_akshare, source='akshare')
     """
     
     # 标准列名（输出格式）
@@ -1678,21 +1672,6 @@ class DataStandardizer:
         'pre_close': 'pre_close',
     }
     
-    # Akshare 列名映射（中文列名）
-    AKSHARE_MAPPING: Dict[str, str] = {
-        '日期': 'date',
-        '开盘': 'open',
-        '收盘': 'close',
-        '最高': 'high',
-        '最低': 'low',
-        '成交量': 'volume',
-        '成交额': 'amount',
-        '振幅': 'amplitude',
-        '涨跌幅': 'pct_change',
-        '涨跌额': 'change',
-        '换手率': 'turnover',
-    }
-    
     # 数值单位转换因子
     TUSHARE_VOLUME_FACTOR: float = 100.0    # Tushare vol 单位是手，转换为股需 * 100
     TUSHARE_AMOUNT_FACTOR: float = 1000.0   # Tushare amount 单位是千元，转换为元需 * 1000
@@ -1716,7 +1695,7 @@ class DataStandardizer:
         df : pd.DataFrame
             原始数据
         source : str
-            数据源，可选 'tushare' 或 'akshare'
+            数据源，目前仅支持 'tushare'
         convert_units : bool, optional
             是否转换单位（如 Tushare 的成交量从手转换为股），默认 True
         set_datetime_index : bool, optional
@@ -1748,10 +1727,8 @@ class DataStandardizer:
         # 根据数据源选择映射
         if source.lower() == 'tushare':
             df = self._standardize_tushare(df, convert_units)
-        elif source.lower() == 'akshare':
-            df = self._standardize_akshare(df)
         else:
-            raise ValueError(f"不支持的数据源: {source}，可选 'tushare' 或 'akshare'")
+            raise ValueError(f"不支持的数据源: {source}，目前仅支持 'tushare'")
         
         # 设置日期索引
         if set_datetime_index and 'date' in df.columns:
@@ -1798,29 +1775,6 @@ class DataStandardizer:
         
         return df
     
-    def _standardize_akshare(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        标准化 Akshare 数据
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Akshare 原始数据
-        
-        Returns
-        -------
-        pd.DataFrame
-            标准化后的数据
-        """
-        # 重命名列
-        df = df.rename(columns=self.AKSHARE_MAPPING)
-        
-        # 转换日期格式
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        
-        return df
-    
     def _set_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         设置日期时间索引
@@ -1848,7 +1802,7 @@ class DataStandardizer:
         Parameters
         ----------
         source : str
-            数据源
+            数据源，目前仅支持 'tushare'
         
         Returns
         -------
@@ -1857,10 +1811,8 @@ class DataStandardizer:
         """
         if source.lower() == 'tushare':
             return ['trade_date', 'open', 'high', 'low', 'close', 'vol']
-        elif source.lower() == 'akshare':
-            return ['日期', '开盘', '最高', '最低', '收盘', '成交量']
         else:
-            raise ValueError(f"不支持的数据源: {source}")
+            raise ValueError(f"不支持的数据源: {source}，目前仅支持 'tushare'")
     
     def validate_columns(self, df: pd.DataFrame, source: str) -> bool:
         """

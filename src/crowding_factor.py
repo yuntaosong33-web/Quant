@@ -1032,7 +1032,7 @@ def fetch_sw_industry_mapping(
     """
     获取申万一级行业分类映射
     
-    从 AkShare 获取 A 股的申万一级行业分类。
+    使用 Tushare Pro 获取 A 股的行业分类。
     
     Parameters
     ----------
@@ -1042,7 +1042,7 @@ def fetch_sw_industry_mapping(
     Returns
     -------
     Dict[str, str]
-        股票代码到申万一级行业名称的映射
+        股票代码到行业名称的映射
     
     Examples
     --------
@@ -1052,45 +1052,36 @@ def fetch_sw_industry_mapping(
     
     Notes
     -----
-    - 依赖 AkShare 库
+    - 依赖 Tushare Pro
     - 网络请求可能失败，建议缓存结果
     """
     try:
-        import akshare as ak
+        from .tushare_loader import TushareDataLoader
     except ImportError:
-        raise ImportError("需要安装 akshare: pip install akshare")
+        raise ImportError("需要安装 tushare: pip install tushare")
     
     result: Dict[str, str] = {}
     
     try:
-        # 获取申万行业成分股
-        for sector_code, sector_name in CrowdingFactorCalculator.SW_LEVEL1_SECTORS.items():
-            try:
-                df = ak.index_stock_cons_csindex(symbol=sector_code)
-                
-                if df is not None and not df.empty:
-                    # 提取股票代码
-                    code_col = None
-                    for col in ["成分券代码", "品种代码", "代码", "code"]:
-                        if col in df.columns:
-                            code_col = col
-                            break
-                    
-                    if code_col:
-                        for code in df[code_col]:
-                            code_str = str(code).zfill(6)
-                            if stock_codes is None or code_str in stock_codes:
-                                result[code_str] = sector_name
-                                
-            except Exception as e:
-                logger.debug(f"获取行业 {sector_name} 成分股失败: {e}")
-                continue
+        # 使用 Tushare 获取行业映射
+        loader = TushareDataLoader()
+        all_mapping = loader.fetch_industry_mapping()
         
-        logger.info(f"获取申万行业映射成功: {len(result)} 只股票")
+        if all_mapping:
+            if stock_codes:
+                # 过滤指定股票
+                for code in stock_codes:
+                    clean_code = str(code).zfill(6)[:6]
+                    if clean_code in all_mapping:
+                        result[clean_code] = all_mapping[clean_code]
+            else:
+                result = all_mapping
+        
+        logger.info(f"获取行业映射成功: {len(result)} 只股票")
         return result
         
     except Exception as e:
-        logger.error(f"获取申万行业映射失败: {e}")
+        logger.error(f"获取行业映射失败: {e}")
         return result
 
 

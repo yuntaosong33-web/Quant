@@ -5,7 +5,7 @@
 
 # 数据配置
 data:
-  # 数据源：tushare (推荐，稳定可靠) 或 akshare (免费但不稳定)
+  # 数据源：统一使用 tushare pro
   data_source: "tushare"
   
   # 股票池: hs300(沪深300), zz500(中证500), zz1000(中证1000), all(全市场)

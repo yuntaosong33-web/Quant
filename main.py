@@ -29,9 +29,10 @@ import numpy as np
 
 from src import (
     # 数据处理
-    AkshareDataLoader,
     AShareDataCleaner,
     DataLoader,
+    TushareDataLoader,
+    create_tushare_loader,
     # 因子计算
     FactorCalculator,
     z_score_normalize,
@@ -87,8 +88,8 @@ class DailyUpdateRunner:
     ----------
     config : Dict[str, Any]
         配置参数
-    data_loader : AkshareDataLoader
-        数据加载器
+    tushare_loader : TushareDataLoader
+        Tushare 数据加载器
     strategy : MultiFactorStrategy
         多因子策略
     logger : logging.Logger
@@ -183,34 +184,24 @@ class DailyUpdateRunner:
     
     def _init_components(self) -> None:
         """初始化各组件"""
-        # 根据配置选择数据源
-        data_source = self.config.get("data", {}).get("data_source", "akshare")
+        # 统一使用 Tushare 数据源
+        tushare_config = self.config.get("tushare", {})
+        api_token = tushare_config.get("api_token") or os.environ.get("TUSHARE_TOKEN", "")
         
-        if data_source == "tushare":
-            # 使用 Tushare 数据源（推荐）
-            from src.tushare_loader import TushareDataLoader
-            tushare_config = self.config.get("tushare", {})
-            api_token = tushare_config.get("api_token") or os.environ.get("TUSHARE_TOKEN", "")
-            
-            if not api_token:
-                self.logger.error(
-                    "Tushare API Token 未配置！\n"
-                    "请在 config/strategy_config.yaml 中设置 tushare.api_token\n"
-                    "或通过环境变量 TUSHARE_TOKEN 设置"
-                )
-                raise ValueError("Tushare API Token 未配置")
-            
-            self.tushare_loader = TushareDataLoader(
-                api_token=api_token,
-                cache_dir=tushare_config.get("cache_dir", "data/tushare_cache")
+        if not api_token:
+            self.logger.error(
+                "Tushare API Token 未配置！\n"
+                "请在 config/strategy_config.yaml 中设置 tushare.api_token\n"
+                "或通过环境变量 TUSHARE_TOKEN 设置"
             )
-            self.data_source = "tushare"
-            self.logger.info("使用 Tushare 数据源")
-        else:
-            # 使用 AkShare 数据源（兼容旧代码）
-            self.data_loader = AkshareDataLoader(self.config)
-            self.data_source = "akshare"
-            self.logger.info("使用 AkShare 数据源")
+            raise ValueError("Tushare API Token 未配置")
+        
+        self.tushare_loader = TushareDataLoader(
+            api_token=api_token,
+            cache_dir=tushare_config.get("cache_dir", "data/tushare_cache")
+        )
+        self.data_source = "tushare"
+        self.logger.info("使用 Tushare Pro 数据源")
         
         self.data_cleaner = AShareDataCleaner()
         
@@ -376,7 +367,7 @@ class DailyUpdateRunner:
         """
         更新市场数据（带缓存检查）
         
-        支持 Tushare 和 AkShare 两种数据源。
+        使用 Tushare Pro 获取市场数据。
         
         Returns
         -------
@@ -405,11 +396,8 @@ class DailyUpdateRunner:
             update_days = data_config.get("update_days", 5)
             start_date = (self.today - timedelta(days=update_days * 2)).strftime("%Y%m%d")
             
-            # 根据数据源选择不同的获取方式
-            if self.data_source == "tushare":
-                return self._update_market_data_tushare(stock_pool, start_date, end_date)
-            else:
-                return self._update_market_data_akshare(stock_pool, start_date, end_date)
+            # 使用 Tushare 获取数据
+            return self._update_market_data_tushare(stock_pool, start_date, end_date)
             
         except Exception as e:
             self.logger.error(f"更新市场数据失败: {e}")
@@ -468,65 +456,6 @@ class DailyUpdateRunner:
         
         return True
     
-    def _update_market_data_akshare(
-        self,
-        stock_pool: str,
-        start_date: str,
-        end_date: str
-    ) -> bool:
-        """使用 AkShare 更新市场数据（兼容旧代码）"""
-        # 获取股票列表（支持主要指数成分股）
-        stock_pool_to_index = {
-            "hs300": "000300",
-            "zz500": "000905",
-            "zz1000": "000852",
-            "sz50": "000016",
-            "cyb50": "399673",
-        }
-        
-        if stock_pool in stock_pool_to_index:
-            index_code = stock_pool_to_index[stock_pool]
-            stock_list = self.data_loader.get_stock_list(index_code)
-        elif stock_pool == "all":
-            self.logger.warning("全市场模式网络依赖较高，建议使用指数成分股模式")
-            stock_list = self.data_loader.get_stock_list()
-        else:
-            self.logger.warning(f"未知的股票池 '{stock_pool}'，使用默认沪深300")
-            stock_list = self.data_loader.get_stock_list("000300")
-        
-        self.logger.info(f"股票池: {stock_pool}, 股票数量: {len(stock_list)}")
-        
-        # 下载OHLCV数据
-        ohlcv_list = []
-        total_stocks = len(stock_list)
-        for i, stock in enumerate(stock_list):
-            try:
-                df = self.data_loader.fetch_daily_data(stock, start_date, end_date)
-                if df is not None and not df.empty:
-                    if isinstance(df.index, pd.DatetimeIndex):
-                        df = df.reset_index(names=['date'])
-                    df['stock_code'] = stock
-                    ohlcv_list.append(df)
-            except Exception as e:
-                self.logger.debug(f"获取 {stock} 数据失败: {e}")
-            
-            if (i + 1) % 50 == 0 or (i + 1) == total_stocks:
-                self.logger.info(f"已处理 {i + 1}/{total_stocks} 只股票")
-        
-        if ohlcv_list:
-            self.ohlcv_data = pd.concat(ohlcv_list, ignore_index=True)
-            self.logger.info(f"OHLCV 数据更新完成，共 {len(self.ohlcv_data)} 条记录")
-        else:
-            self.logger.warning("未获取到任何 OHLCV 数据")
-            return False
-        
-        # 保存数据
-        ohlcv_path = DATA_RAW_PATH / f"ohlcv_{self.today.strftime('%Y%m%d')}.parquet"
-        self.ohlcv_data.to_parquet(ohlcv_path)
-        self.logger.info(f"OHLCV 数据已保存至 {ohlcv_path}")
-        
-        return True
-    
     def update_financial_data(self) -> bool:
         """
         更新财务数据（实盘安全版，带缓存检查）
@@ -560,11 +489,8 @@ class DailyUpdateRunner:
             except Exception as e:
                 self.logger.warning(f"读取缓存失败: {e}，将重新下载")
         
-        # 根据数据源选择不同的获取方式
-        if self.data_source == "tushare":
-            return self._update_financial_data_tushare()
-        else:
-            return self._update_financial_data_akshare()
+        # 使用 Tushare 获取财务数据
+        return self._update_financial_data_tushare()
     
     def _update_financial_data_tushare(self) -> bool:
         """使用 Tushare 更新财务数据"""
@@ -654,197 +580,6 @@ class DailyUpdateRunner:
             
         except Exception as e:
             self.logger.error(f"Tushare 财务数据获取失败: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
-            return False
-    
-    def _update_financial_data_akshare(self) -> bool:
-        """使用 AkShare 更新财务数据（兼容旧代码）"""
-        # 失败率阈值（超过此比例将触发 Critical Error）
-        FAILURE_THRESHOLD = 0.30  # 30%
-        
-        try:
-            if self.ohlcv_data is None:
-                self.logger.warning("OHLCV 数据为空，无法生成财务数据")
-                return False
-            
-            stocks = self.ohlcv_data['stock_code'].unique().tolist()
-            total_stocks = len(stocks)
-            self.logger.info(f"需获取 {total_stocks} 只股票的财务数据")
-            
-            # 预先获取全市场数据并缓存（避免为每只股票重复请求）
-            self.logger.info("预获取全市场行情数据以加速财务指标获取...")
-            spot_data_available = False
-            try:
-                spot_df = self.financial_loader._get_spot_data_cached()
-                spot_data_available = spot_df is not None and not spot_df.empty
-                if spot_data_available:
-                    self.logger.info("✅ 全市场行情数据就绪")
-            except Exception as e:
-                self.logger.warning(f"预获取全市场数据失败: {e}")
-            
-            # 如果全市场数据获取失败，尝试使用历史财务数据作为备份
-            if not spot_data_available:
-                fallback_df = self._load_fallback_financial_data(stocks)
-                if fallback_df is not None:
-                    self.logger.info(f"⚠️ 使用历史财务数据作为备份（{len(fallback_df)} 条）")
-                    self.financial_data = fallback_df
-                    self._excluded_stocks = set()
-                    return True
-                self.logger.warning("无可用的历史财务数据备份，将尝试逐只股票获取")
-            
-            # 使用真实数据接口获取财务指标
-            financial_records = []
-            failed_stocks = []
-            
-            import time
-            
-            for i, stock in enumerate(stocks):
-                try:
-                    # 调用 DataLoader.fetch_financial_indicator 获取真实数据
-                    fin_df = self.financial_loader.fetch_financial_indicator(stock)
-                    
-                    if fin_df is not None and not fin_df.empty:
-                        # 提取最新的财务指标
-                        if isinstance(fin_df, pd.DataFrame) and len(fin_df) > 0:
-                            latest = fin_df.iloc[-1] if len(fin_df) > 1 else fin_df.iloc[0]
-                            
-                            # 构建财务记录
-                            circ_mv = self._safe_get_value(latest, ['circ_mv', '流通市值'], default=np.nan)
-                            total_mv = self._safe_get_value(latest, ['total_mv', '总市值'], default=np.nan)
-                            
-                            # 检查关键字段是否有效（流通市值对小市值策略至关重要）
-                            has_valid_mv = pd.notna(circ_mv) or pd.notna(total_mv)
-                            
-                            record = {
-                                'stock_code': stock,
-                                'pe_ttm': self._safe_get_value(latest, ['pe_ttm', 'pe', '市盈率'], default=np.nan),
-                                'pb': self._safe_get_value(latest, ['pb', '市净率'], default=np.nan),
-                                'dividend_yield': self._safe_get_value(latest, ['dividend_yield', 'dv_ratio', '股息率'], default=np.nan),
-                                'ps_ttm': self._safe_get_value(latest, ['ps_ttm', 'ps', '市销率'], default=np.nan),
-                                'roe': self._safe_get_value(latest, ['roe', 'roe_ttm'], default=np.nan),
-                                'total_mv': total_mv,
-                                'circ_mv': circ_mv,
-                                # 标记数据是否有效（用于后续过滤）
-                                'data_valid': has_valid_mv,
-                            }
-                            
-                            # 估算上市天数
-                            record['listing_days'] = self._estimate_listing_days(stock)
-                            
-                            financial_records.append(record)
-                            
-                            if has_valid_mv:
-                                self.logger.debug(
-                                    f"✓ {stock} 财务数据有效: "
-                                    f"circ_mv={circ_mv/1e8:.2f}亿" if pd.notna(circ_mv) else f"✓ {stock} 财务数据获取成功"
-                                )
-                            else:
-                                # 数据获取成功但缺少关键字段，标记为失败
-                                self.logger.warning(
-                                    f"⚠ {stock} 缺少关键市值数据，将从选股池中剔除"
-                                )
-                                failed_stocks.append(stock)
-                        else:
-                            self.logger.warning(f"⚠ {stock} 财务数据为空，将从选股池中剔除")
-                            failed_stocks.append(stock)
-                    else:
-                        self.logger.warning(f"⚠ {stock} 无法获取财务数据，将从选股池中剔除")
-                        failed_stocks.append(stock)
-                        
-                except Exception as e:
-                    self.logger.warning(f"⚠ {stock} 财务数据获取异常: {e}，将从选股池中剔除")
-                    failed_stocks.append(stock)
-                
-                # 进度日志
-                if (i + 1) % 10 == 0:
-                    current_failure_rate = len(failed_stocks) / (i + 1)
-                    self.logger.info(
-                        f"财务数据获取进度: {i + 1}/{total_stocks} | "
-                        f"失败: {len(failed_stocks)} ({current_failure_rate:.1%})"
-                    )
-                
-                # 添加延时避免请求过快（已有缓存时可减少延时）
-                time.sleep(0.05)
-            
-            # ========== Fail Fast 检查 ==========
-            failure_rate = len(failed_stocks) / total_stocks if total_stocks > 0 else 0
-            
-            if failure_rate > FAILURE_THRESHOLD:
-                error_msg = (
-                    f"🚨 CRITICAL ERROR: 财务数据获取失败率过高!\n"
-                    f"   失败数量: {len(failed_stocks)}/{total_stocks} ({failure_rate:.1%})\n"
-                    f"   阈值: {FAILURE_THRESHOLD:.0%}\n"
-                    f"   失败股票示例: {failed_stocks[:10]}...\n"
-                    f"   为确保实盘安全，程序终止。请检查数据源或网络连接。"
-                )
-                self.logger.critical(error_msg)
-                
-                # 尝试发送报警通知
-                try:
-                    token = os.environ.get("PUSHPLUS_TOKEN", "")
-                    if not token:
-                        token = self.config.get("notification", {}).get("pushplus_token", "")
-                    if token:
-                        send_pushplus_msg(
-                            token=token,
-                            title="🚨 量化系统 Critical Error",
-                            content=error_msg.replace("\n", "<br>"),
-                            template="html"
-                        )
-                except Exception:
-                    pass
-                
-                raise RuntimeError(error_msg)
-            
-            # ========== 处理失败股票（不使用 Fallback，仅记录） ==========
-            if failed_stocks:
-                self.logger.warning(
-                    f"📊 财务数据获取结果:\n"
-                    f"   成功: {total_stocks - len(failed_stocks)}/{total_stocks}\n"
-                    f"   失败: {len(failed_stocks)}/{total_stocks} ({failure_rate:.1%})\n"
-                    f"   ⚠ 失败股票将被排除在选股池之外（不使用虚假数据填充）"
-                )
-                
-                # 保存失败股票列表供后续过滤使用
-                self._excluded_stocks = set(failed_stocks)
-            else:
-                self._excluded_stocks = set()
-            
-            if not financial_records:
-                self.logger.error("未获取到任何有效财务数据")
-                return False
-            
-            self.financial_data = pd.DataFrame(financial_records)
-            
-            # 数据清洗：处理异常值
-            self._clean_financial_data()
-            
-            # 获取行业数据
-            self.industry_data = self._fetch_industry_data(stocks)
-            
-            # 统计有效数据
-            valid_count = self.financial_data['data_valid'].sum() if 'data_valid' in self.financial_data.columns else len(self.financial_data)
-            
-            self.logger.info(
-                f"✅ 财务数据更新完成:\n"
-                f"   总记录: {len(self.financial_data)}\n"
-                f"   有效数据: {valid_count}\n"
-                f"   已剔除: {len(failed_stocks)} 只股票"
-            )
-            
-            # 保存数据
-            financial_path = DATA_RAW_PATH / f"financial_{self.today.strftime('%Y%m%d')}.parquet"
-            self.financial_data.to_parquet(financial_path)
-            self.logger.info(f"财务数据已保存至 {financial_path}")
-            
-            return True
-            
-        except RuntimeError:
-            # Critical Error，直接向上抛出
-            raise
-        except Exception as e:
-            self.logger.error(f"更新财务数据失败: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             return False
@@ -1056,47 +791,20 @@ class DailyUpdateRunner:
         self.logger.info("获取行业分类数据...")
         
         try:
-            import akshare as ak
+            # 使用 Tushare 获取行业分类
+            industry_mapping = self.tushare_loader.fetch_industry_mapping()
             
-            # 尝试获取申万行业分类
-            industry_df = ak.stock_board_industry_name_em()
-            
-            if industry_df is not None and not industry_df.empty:
-                # 构建股票到行业的映射
-                stock_industry = {}
+            if industry_mapping:
+                # 构建股票到行业的 DataFrame
+                stock_industry = {s: industry_mapping.get(s, '其他') for s in stocks}
                 
-                for _, row in industry_df.iterrows():
-                    industry_name = row.get('板块名称', '')
-                    industry_code = row.get('板块代码', '')
-                    
-                    try:
-                        # 获取该行业的成分股
-                        cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
-                        if cons_df is not None and not cons_df.empty:
-                            code_col = '代码' if '代码' in cons_df.columns else cons_df.columns[0]
-                            for stock_code in cons_df[code_col]:
-                                if stock_code in stocks:
-                                    stock_industry[stock_code] = industry_name
-                    except Exception:
-                        continue
+                result = pd.DataFrame([
+                    {'stock_code': k, 'sw_industry_l1': v}
+                    for k, v in stock_industry.items()
+                ])
                 
-                if stock_industry:
-                    result = pd.DataFrame([
-                        {'stock_code': k, 'sw_industry_l1': v}
-                        for k, v in stock_industry.items()
-                    ])
-                    
-                    # 补充未找到的股票
-                    missing_stocks = set(stocks) - set(stock_industry.keys())
-                    if missing_stocks:
-                        missing_df = pd.DataFrame({
-                            'stock_code': list(missing_stocks),
-                            'sw_industry_l1': '其他'
-                        })
-                        result = pd.concat([result, missing_df], ignore_index=True)
-                    
-                    self.logger.info(f"行业分类数据获取成功，共 {len(result)} 条记录")
-                    return result
+                self.logger.info(f"行业分类数据获取成功，共 {len(result)} 条记录")
+                return result
             
         except Exception as e:
             self.logger.warning(f"获取真实行业数据失败: {e}，使用模拟数据")
@@ -1404,7 +1112,7 @@ class DailyUpdateRunner:
                 factor_data['small_cap'] = np.nan
             
             # 3. 换手率因子 turnover_5d（激进型策略使用）
-            # 支持多种列名：turn（AkShare spot_em）或 turnover（其他数据源）
+            # 支持多种列名：turn 或 turnover
             turn_col = None
             if 'turn' in factor_data.columns:
                 turn_col = 'turn'
@@ -3490,21 +3198,16 @@ def run_backtest(
         # 获取股票列表（根据配置选择股票池）
         stock_pool = data_config.get("stock_pool", "zz500")
         
-        # 尝试获取指定股票池的成分股
-        # 注意：DataLoader 目前只实现了 get_hs300_constituents
-        # 对于中证500等其他指数，使用 AkShare 直接获取
+        # 尝试获取指定股票池的成分股（使用 Tushare）
         stock_list = []
+        tushare_loader = create_tushare_loader()
         
         if stock_pool == "zz500":
-            # 尝试使用 AkShare 直接获取中证500成分股
+            # 获取中证500成分股
             try:
-                import akshare as ak
-                df = ak.index_stock_cons(symbol="000905")
-                if df is not None and not df.empty:
-                    code_col = next((c for c in df.columns if '代码' in c), None)
-                    if code_col:
-                        stock_list = df[code_col].tolist()
-                        logger.info(f"获取中证500成分股成功，共 {len(stock_list)} 只")
+                stock_list = tushare_loader.fetch_index_constituents(index_code="zz500")
+                if stock_list:
+                    logger.info(f"获取中证500成分股成功，共 {len(stock_list)} 只")
             except Exception as e:
                 logger.warning(f"获取中证500成分股失败: {e}")
             
@@ -3516,19 +3219,14 @@ def run_backtest(
         elif stock_pool == "zz1000":
             # 获取中证1000成分股
             try:
-                import akshare as ak
-                df = ak.index_stock_cons(symbol="000852")
-                if df is not None and not df.empty:
-                    code_col = next((c for c in df.columns if '代码' in c), None)
-                    if code_col:
-                        stock_list = df[code_col].tolist()
-                        logger.info(f"获取中证1000成分股成功，共 {len(stock_list)} 只")
+                stock_list = tushare_loader.fetch_index_constituents(index_code="zz1000")
+                if stock_list:
+                    logger.info(f"获取中证1000成分股成功，共 {len(stock_list)} 只")
             except Exception as e:
                 logger.warning(f"获取中证1000成分股失败: {e}")
                 
             if not stock_list:
                 logger.warning("无法获取中证1000成分股，尝试从本地缓存加载或使用示例股票")
-                # TODO: 实现本地缓存加载逻辑
         else:
             stock_list = data_loader.get_hs300_constituents()
         

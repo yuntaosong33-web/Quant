@@ -2,8 +2,8 @@
 """
 数据同步脚本
 
-盘后运行的独立脚本，用于从 Tushare/Akshare 下载数据并存储到本地数据湖。
-支持增量更新、双源降级和并发下载。
+盘后运行的独立脚本，用于从 Tushare Pro 下载数据并存储到本地数据湖。
+支持增量更新和并发下载。
 
 Usage
 -----
@@ -59,7 +59,7 @@ class SyncResult:
     success : bool
         是否成功
     source : Optional[str]
-        数据来源（tushare/akshare）
+        数据来源（tushare）
     rows_added : int
         新增行数
     error : Optional[str]
@@ -76,7 +76,7 @@ class DataSyncer:
     """
     数据同步器
     
-    从 Tushare（主）和 Akshare（备）下载 A 股日线数据，
+    从 Tushare Pro 下载 A 股日线数据，
     支持增量更新并存储为 Parquet 格式。
     
     Attributes
@@ -166,7 +166,7 @@ class DataSyncer:
             return self._ts_api
         
         if not self.tushare_token:
-            logger.warning("Tushare token 未配置，将使用 Akshare 作为数据源")
+            logger.error("Tushare token 未配置")
             return None
         
         try:
@@ -185,34 +185,29 @@ class DataSyncer:
         """
         获取股票池
         
-        从配置文件读取指数成分股，作为同步目标。
+        从 Tushare 读取指数成分股，作为同步目标。
         
         Returns
         -------
         List[str]
             股票代码列表
         """
-        import akshare as ak
+        from src.tushare_loader import TushareDataLoader
         
         universe_config = self.config.get("universe", {})
-        index_codes = universe_config.get("index_codes", ["000300"])
+        index_codes = universe_config.get("index_codes", ["hs300"])
+        
+        # 初始化 Tushare 加载器
+        loader = TushareDataLoader(api_token=self.tushare_token)
         
         all_symbols = set()
         
         for index_code in index_codes:
             logger.info(f"获取指数 {index_code} 成分股...")
             try:
-                df = ak.index_stock_cons(symbol=index_code)
+                symbols = loader.fetch_index_constituents(index_code=index_code)
                 
-                # 列名可能是 "品种代码" 或 "成分券代码"
-                code_col = None
-                for col in ["品种代码", "成分券代码", "代码", "stock_code"]:
-                    if col in df.columns:
-                        code_col = col
-                        break
-                
-                if code_col:
-                    symbols = df[code_col].tolist()
+                if symbols:
                     all_symbols.update(symbols)
                     logger.info(f"指数 {index_code}: {len(symbols)} 只股票")
             except Exception as e:
@@ -350,65 +345,6 @@ class DataSyncer:
         
         return None
     
-    def _fetch_from_akshare(
-        self,
-        symbol: str,
-        start_date: str,
-        end_date: str
-    ) -> Optional[pd.DataFrame]:
-        """
-        从 Akshare 获取数据（备用）
-        
-        Parameters
-        ----------
-        symbol : str
-            股票代码
-        start_date : str
-            开始日期
-        end_date : str
-            结束日期
-        
-        Returns
-        -------
-        Optional[pd.DataFrame]
-            日线数据，失败返回 None
-        """
-        import akshare as ak
-        
-        # 格式化日期（Akshare 需要 YYYYMMDD 格式）
-        start_date_fmt = start_date.replace("-", "")
-        end_date_fmt = end_date.replace("-", "")
-        
-        for attempt in range(self.retry_times):
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period="daily",
-                    start_date=start_date_fmt,
-                    end_date=end_date_fmt,
-                    adjust="qfq"  # 前复权
-                )
-                
-                if df is None or df.empty:
-                    logger.debug(f"Akshare {symbol} 无数据")
-                    return None
-                
-                # 标准化列名
-                df = self.standardizer.standardize(df, source='akshare')
-                
-                logger.debug(f"Akshare {symbol} 获取成功: {len(df)} 行")
-                return df
-                
-            except Exception as e:
-                wait_time = self.retry_delay * (attempt + 1)
-                logger.warning(
-                    f"Akshare {symbol} 请求失败 "
-                    f"(尝试 {attempt + 1}/{self.retry_times}): {e}"
-                )
-                if attempt < self.retry_times - 1:
-                    time.sleep(wait_time)
-        
-        return None
     
     def sync_symbol(
         self,
@@ -459,26 +395,19 @@ class DataSyncer:
                     start_date = self.start_date
                     logger.debug(f"{symbol}: 本地无数据，起始日期 {start_date}")
             
-            # 获取数据（双源降级）
+            # 从 Tushare 获取数据
             df = None
             source = None
             
-            # 优先使用 Tushare
             df = self._fetch_from_tushare(symbol, start_date, end_date)
             if df is not None and not df.empty:
                 source = "tushare"
-            else:
-                # 降级到 Akshare
-                logger.debug(f"{symbol}: Tushare 失败，降级到 Akshare")
-                df = self._fetch_from_akshare(symbol, start_date, end_date)
-                if df is not None and not df.empty:
-                    source = "akshare"
             
             if df is None or df.empty:
                 return SyncResult(
                     symbol=symbol,
                     success=False,
-                    error="两个数据源均无数据"
+                    error="无数据"
                 )
             
             # 保存/追加数据
@@ -657,13 +586,11 @@ class DataSyncer:
         # 统计
         total_rows = sum(r.rows_added for r in results if r.success)
         tushare_count = sum(1 for r in results if r.source == "tushare")
-        akshare_count = sum(1 for r in results if r.source == "akshare")
         
         logger.info(
             f"同步完成: 成功 {success_count}/{total}, "
             f"失败 {failed_count}, "
-            f"新增 {total_rows} 行 "
-            f"(Tushare: {tushare_count}, Akshare: {akshare_count})"
+            f"新增 {total_rows} 行"
         )
         
         return results

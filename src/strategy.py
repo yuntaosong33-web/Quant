@@ -13,10 +13,6 @@ import logging
 
 import pandas as pd
 import numpy as np
-try:
-    import akshare as ak
-except ImportError:
-    ak = None
 
 # 导入 LLM 熔断器异常（用于风控）
 try:

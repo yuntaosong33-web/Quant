@@ -76,22 +76,20 @@ def get_stock_list(
     
     if index:
         try:
-            import akshare as ak
+            from src.tushare_loader import TushareDataLoader
             
             index_map = {
-                "HS300": "000300",
-                "ZZ500": "000905",
-                "ZZ1000": "000852"
+                "HS300": "hs300",
+                "ZZ500": "zz500",
+                "ZZ1000": "zz1000"
             }
             
-            index_code = index_map.get(index.upper(), index)
-            df = ak.index_stock_cons(symbol=index_code)
+            index_code = index_map.get(index.upper(), index.lower())
+            loader = TushareDataLoader()
+            stock_list = loader.fetch_index_constituents(index_code=index_code)
             
-            # 尝试不同的列名
-            code_cols = ["品种代码", "成分券代码", "代码", "stock_code"]
-            for col in code_cols:
-                if col in df.columns:
-                    return df[col].tolist()
+            if stock_list:
+                return stock_list
             
             logger.warning(f"无法从指数 {index} 获取成分股")
             return []

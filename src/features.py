@@ -2842,7 +2842,7 @@ class SentimentEngine:
         """
         获取股票新闻
         
-        使用 AkShare 获取指定股票在指定日期附近的新闻。
+        使用 Tushare Pro 获取指定股票在指定日期附近的新闻。
         
         Parameters
         ----------
@@ -2858,7 +2858,7 @@ class SentimentEngine:
         
         Notes
         -----
-        - 使用 akshare.stock_news_em() 获取东方财富新闻
+        - 使用 Tushare Pro news 接口获取新闻
         - 获取失败时返回空字符串，不影响策略运行
         - 新闻内容会被截断以控制 API 调用成本
         - 内置简单缓存避免重复获取
@@ -2869,9 +2869,9 @@ class SentimentEngine:
             return self._news_cache[cache_key]
         
         try:
-            import akshare as ak
+            from .tushare_loader import TushareDataLoader
         except ImportError:
-            logger.warning("akshare 未安装，无法获取新闻")
+            logger.warning("tushare_loader 未安装，无法获取新闻")
             return ""
         
         try:
@@ -2880,52 +2880,17 @@ class SentimentEngine:
             if len(clean_code) > 6:
                 clean_code = clean_code[:6]
             
-            # 获取股票新闻
-            news_df = ak.stock_news_em(symbol=clean_code)
+            # 使用 Tushare 获取股票新闻
+            loader = TushareDataLoader()
+            combined_news = loader.fetch_stock_news(clean_code, days_back=7)
             
-            if news_df is None or news_df.empty:
+            if not combined_news:
                 logger.debug(f"未找到股票新闻: {stock_code}")
                 self._news_cache[cache_key] = ""
                 return ""
             
-            # 过滤指定日期附近的新闻（前后3天）
-            target_date = pd.to_datetime(date)
-            if "发布时间" in news_df.columns:
-                news_df["发布时间"] = pd.to_datetime(news_df["发布时间"], errors="coerce")
-                date_mask = (
-                    (news_df["发布时间"] >= target_date - pd.Timedelta(days=3)) &
-                    (news_df["发布时间"] <= target_date + pd.Timedelta(days=1))
-                )
-                filtered_news = news_df[date_mask]
-            else:
-                filtered_news = news_df.head(5)
-            
-            if filtered_news.empty:
-                filtered_news = news_df.head(3)
-            
-            # 提取新闻标题和内容
-            news_texts = []
-            title_col = "新闻标题" if "新闻标题" in filtered_news.columns else None
-            content_col = "新闻内容" if "新闻内容" in filtered_news.columns else None
-            
-            for _, row in filtered_news.head(5).iterrows():
-                text_parts = []
-                if title_col and pd.notna(row.get(title_col)):
-                    text_parts.append(str(row[title_col]))
-                if content_col and pd.notna(row.get(content_col)):
-                    content = str(row[content_col])[:200]
-                    text_parts.append(content)
-                if text_parts:
-                    news_texts.append("; ".join(text_parts))
-            
-            combined_news = " | ".join(news_texts)
-            
-            if len(combined_news) > 1500:
-                combined_news = combined_news[:1500] + "..."
-            
             logger.debug(
                 f"获取新闻成功: stock={stock_code}, "
-                f"news_count={len(filtered_news)}, "
                 f"text_len={len(combined_news)}"
             )
             
@@ -3060,7 +3025,7 @@ class SentimentEngine:
                 for code in stock_list
             ])
         
-        # 预先获取所有新闻（串行，避免 AkShare 并发问题）
+        # 预先获取所有新闻（串行，避免并发问题）
         news_dict: Dict[str, str] = {}
         for stock_code in stock_list:
             news_content = self._fetch_news(stock_code, date)
