@@ -74,8 +74,15 @@ distributed = [
     "ray[default]>=2.9.0",
     "dask[complete]>=2024.1.0",
 ]
+# FinBERT 情感分析模块依赖
+sentiment = [
+    "transformers>=4.35.0",
+    "torch>=2.0.0",
+    "accelerate>=0.25.0",
+    "sentencepiece>=0.1.99",
+]
 all = [
-    "ashare-quant-system[dev,notebook,distributed]",
+    "ashare-quant-system[dev,notebook,distributed,sentiment]",
 ]
 
 [project.urls]
@@ -85,6 +92,7 @@ all = [
 
 [project.scripts]
 ashare-quant = "main:main"
+aggregate-sentiment = "tools.aggregate_sentiment:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
