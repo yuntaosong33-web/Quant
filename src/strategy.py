@@ -980,6 +980,12 @@ class MultiFactorStrategy(BaseStrategy):
         # ===== [NEW] Alpha 因子开关 =====
         self._enable_alpha_factors: bool = self.config.get("enable_alpha_factors", True)
         
+        # ===== [NEW] 市场状态自适应权重配置 =====
+        # 根据市场状态（牛市/熊市/震荡市）动态调整因子权重
+        self._market_regime_config = self.config.get("market_regime", {})
+        self._enable_adaptive_weights: bool = self._market_regime_config.get("enabled", False)
+        self._current_market_regime: str = "sideways"  # 当前市场状态缓存
+        
         # 初始化情绪分析引擎（如果启用）
         if self._enable_sentiment_filter:
             try:
@@ -1006,8 +1012,576 @@ class MultiFactorStrategy(BaseStrategy):
             f"Top N={self.top_n}, 调仓频率={self.rebalance_frequency}, "
             f"再平衡缓冲区={self.rebalance_buffer:.1%}, "
             f"持股惯性加分={self.holding_bonus:.2f}, "
-            f"情绪过滤={'启用' if self._enable_sentiment_filter else '禁用'}"
+            f"情绪过滤={'启用' if self._enable_sentiment_filter else '禁用'}, "
+            f"自适应权重={'启用' if self._enable_adaptive_weights else '禁用'}"
         )
+    
+    # ==================== 市场状态识别与自适应权重 ====================
+    
+    def identify_market_regime(
+        self,
+        index_data: pd.DataFrame,
+        date: Optional[pd.Timestamp] = None
+    ) -> str:
+        """
+        识别市场状态（趋势 + 波动率双维度）
+        
+        根据大盘指数的趋势位置和波动率水平，判断当前市场处于
+        牛市、熊市还是震荡市状态。
+        
+        Parameters
+        ----------
+        index_data : pd.DataFrame
+            指数数据，需包含 close 列，索引为 DatetimeIndex
+        date : Optional[pd.Timestamp]
+            分析日期，默认使用最新日期
+        
+        Returns
+        -------
+        str
+            市场状态: 'bull'(牛市), 'bear'(熊市), 'sideways'(震荡市)
+        
+        Notes
+        -----
+        判断逻辑（趋势 + 波动率双维度）：
+        - 牛市: 指数 > MA60 且 波动率 < 25%
+        - 熊市: 指数 < MA60 且 波动率 > 15%
+        - 震荡市: 其他情况
+        """
+        if index_data.empty:
+            logger.warning("指数数据为空，默认返回震荡市")
+            return 'sideways'
+        
+        try:
+            # 确保数据按日期排序
+            if not isinstance(index_data.index, pd.DatetimeIndex):
+                if 'date' in index_data.columns:
+                    index_data = index_data.set_index('date')
+                elif 'trade_date' in index_data.columns:
+                    index_data = index_data.set_index('trade_date')
+            index_data = index_data.sort_index()
+            
+            # 获取配置参数
+            ma_period = self._market_regime_config.get('trend_ma_period', 60)
+            vol_period = self._market_regime_config.get('volatility_period', 20)
+            high_vol_threshold = self._market_regime_config.get('high_volatility_threshold', 0.25)
+            low_vol_threshold = self._market_regime_config.get('low_volatility_threshold', 0.15)
+            
+            # 使用指定日期或最新日期
+            if date is not None:
+                # 找到该日期或之前最近的数据
+                valid_dates = index_data.index[index_data.index <= date]
+                if len(valid_dates) == 0:
+                    return 'sideways'
+                index_data = index_data.loc[:valid_dates[-1]]
+            
+            # 趋势维度: 指数 vs MA
+            latest_close = index_data['close'].iloc[-1]
+            ma_value = index_data['close'].rolling(ma_period, min_periods=ma_period//2).mean().iloc[-1]
+            
+            if pd.isna(ma_value):
+                logger.warning("MA 计算结果为 NaN，默认返回震荡市")
+                return 'sideways'
+            
+            trend_up = latest_close > ma_value
+            
+            # 波动率维度: 年化波动率
+            returns = index_data['close'].pct_change()
+            volatility = returns.rolling(vol_period, min_periods=vol_period//2).std().iloc[-1] * np.sqrt(252)
+            
+            if pd.isna(volatility):
+                logger.warning("波动率计算结果为 NaN，默认返回震荡市")
+                return 'sideways'
+            
+            # 双维度判断
+            if trend_up and volatility < high_vol_threshold:
+                regime = 'bull'
+            elif not trend_up and volatility > low_vol_threshold:
+                regime = 'bear'
+            else:
+                regime = 'sideways'
+            
+            # 缓存当前市场状态
+            self._current_market_regime = regime
+            
+            logger.info(
+                f"市场状态识别: {regime.upper()} "
+                f"(趋势={'上升' if trend_up else '下降'}, "
+                f"波动率={volatility:.1%}, MA{ma_period}={ma_value:.2f})"
+            )
+            
+            return regime
+            
+        except Exception as e:
+            logger.warning(f"市场状态识别失败: {e}，默认返回震荡市")
+            return 'sideways'
+    
+    def get_adaptive_weights(self, market_regime: Optional[str] = None) -> Dict[str, float]:
+        """
+        根据市场状态返回因子权重
+        
+        不同市场状态下采用不同的因子权重配置：
+        - 牛市: 重动量+情绪，轻价值
+        - 熊市: 重价值+质量，轻动量
+        - 震荡: 均衡配置
+        
+        Parameters
+        ----------
+        market_regime : Optional[str]
+            市场状态，如果为 None 则使用缓存的状态
+        
+        Returns
+        -------
+        Dict[str, float]
+            因子权重字典，包含:
+            - momentum_weight: 动量因子权重
+            - sentiment_weight: 情绪因子权重
+            - size_weight: 市值因子权重
+            - quality_weight: 质量因子权重
+            - value_weight: 价值因子权重
+        
+        Notes
+        -----
+        权重配置逻辑：
+        - 牛市: 动量40% + 情绪30% + 小市值20% + 质量10%
+        - 熊市: 价值50% + 质量30% + 动量10% + 情绪10%
+        - 震荡: 动量30% + 价值20% + 质量20% + 情绪20% + 小市值10%
+        """
+        if market_regime is None:
+            market_regime = self._current_market_regime
+        
+        regime_weights = {
+            'bull': {
+                'momentum_weight': 0.4,
+                'sentiment_weight': 0.3,
+                'size_weight': 0.2,
+                'quality_weight': 0.1,
+                'value_weight': 0.0
+            },
+            'bear': {
+                'momentum_weight': 0.1,
+                'sentiment_weight': 0.1,
+                'size_weight': 0.0,
+                'quality_weight': 0.3,
+                'value_weight': 0.5
+            },
+            'sideways': {
+                'momentum_weight': 0.3,
+                'sentiment_weight': 0.2,
+                'size_weight': 0.1,
+                'quality_weight': 0.2,
+                'value_weight': 0.2
+            }
+        }
+        
+        weights = regime_weights.get(market_regime, regime_weights['sideways'])
+        
+        logger.debug(f"自适应权重 ({market_regime}): {weights}")
+        return weights
+    
+    def apply_adaptive_weights(self, index_data: pd.DataFrame, date: Optional[pd.Timestamp] = None) -> None:
+        """
+        应用自适应权重
+        
+        根据市场状态自动调整策略的因子权重。
+        
+        Parameters
+        ----------
+        index_data : pd.DataFrame
+            指数数据
+        date : Optional[pd.Timestamp]
+            分析日期
+        
+        Notes
+        -----
+        此方法会直接修改策略实例的权重属性。
+        仅在 _enable_adaptive_weights=True 时生效。
+        """
+        if not self._enable_adaptive_weights:
+            logger.debug("自适应权重未启用，跳过")
+            return
+        
+        # 识别市场状态
+        regime = self.identify_market_regime(index_data, date)
+        
+        # 获取对应权重
+        weights = self.get_adaptive_weights(regime)
+        
+        # 应用权重
+        self.momentum_weight = weights['momentum_weight']
+        self.sentiment_weight = weights['sentiment_weight']
+        self.size_weight = weights['size_weight']
+        self.quality_weight = weights['quality_weight']
+        self.value_weight = weights['value_weight']
+        
+        logger.info(
+            f"自适应权重已应用 ({regime}): "
+            f"动量={self.momentum_weight:.0%}, 情绪={self.sentiment_weight:.0%}, "
+            f"市值={self.size_weight:.0%}, 质量={self.quality_weight:.0%}, "
+            f"价值={self.value_weight:.0%}"
+        )
+    
+    def apply_factor_circuit_breaker(
+        self,
+        ic_results: pd.DataFrame,
+        ic_threshold: float = 0.01,
+        ir_threshold: float = 0.3
+    ) -> Dict[str, float]:
+        """
+        因子失效熔断：自动将失效因子权重降为 0
+        
+        当因子的 IC 均值低于阈值且 IC_IR 也低于阈值时，
+        认为该因子已失效，自动将其权重降为 0。
+        
+        Parameters
+        ----------
+        ic_results : pd.DataFrame
+            因子 IC 计算结果，需包含 factor, ic_mean, ic_ir 列
+        ic_threshold : float
+            IC 阈值，低于此值视为失效，默认 0.01
+        ir_threshold : float
+            IC_IR 阈值，低于此值视为不稳定，默认 0.3
+        
+        Returns
+        -------
+        Dict[str, float]
+            被熔断的因子及其原始权重
+        
+        Notes
+        -----
+        - 熔断条件：IC < ic_threshold AND IC_IR < ir_threshold
+        - 只熔断已配置权重的因子
+        - 熔断后权重设为 0，不会删除因子
+        
+        Examples
+        --------
+        >>> ic_df = calculate_factor_ic(data, factor_cols)
+        >>> breaker_result = strategy.apply_factor_circuit_breaker(ic_df)
+        >>> print(f"熔断因子: {list(breaker_result.keys())}")
+        """
+        if ic_results is None or ic_results.empty:
+            logger.debug("IC 结果为空，跳过因子熔断检测")
+            return {}
+        
+        # 因子名称到权重属性的映射
+        factor_weight_mapping = {
+            'momentum_composite': 'momentum_weight',
+            'momentum': 'momentum_weight',
+            'small_cap': 'size_weight',
+            'size': 'size_weight',
+            'turnover_5d': 'quality_weight',
+            'quality_composite': 'quality_weight',
+            'quality': 'quality_weight',
+            'value_composite': 'value_weight',
+            'value': 'value_weight',
+            'sentiment': 'sentiment_weight',
+        }
+        
+        breaker_triggered = {}
+        
+        for _, row in ic_results.iterrows():
+            factor_name = row['factor']
+            ic_mean = row.get('ic_mean', 0)
+            ic_ir = row.get('ic_ir', 0)
+            
+            # 检查是否满足熔断条件
+            if ic_mean < ic_threshold and ic_ir < ir_threshold:
+                # 提取因子基础名称（移除 _zscore 后缀）
+                base_name = factor_name.replace('_zscore', '')
+                
+                # 查找对应的权重属性
+                weight_attr = None
+                for prefix, attr in factor_weight_mapping.items():
+                    if base_name.startswith(prefix) or base_name == prefix:
+                        weight_attr = attr
+                        break
+                
+                if weight_attr is not None and hasattr(self, weight_attr):
+                    old_weight = getattr(self, weight_attr)
+                    
+                    # 只处理非零权重的因子
+                    if old_weight > 0:
+                        setattr(self, weight_attr, 0.0)
+                        breaker_triggered[factor_name] = old_weight
+                        
+                        logger.warning(
+                            f"因子熔断触发: {factor_name} 权重 {old_weight:.0%} -> 0% "
+                            f"(IC={ic_mean:.4f} < {ic_threshold}, "
+                            f"IR={ic_ir:.2f} < {ir_threshold})"
+                        )
+        
+        if breaker_triggered:
+            # 重新归一化剩余权重
+            remaining_weight = (
+                self.value_weight + self.quality_weight + 
+                self.momentum_weight + self.size_weight
+            )
+            
+            if remaining_weight > 0 and remaining_weight < 1.0:
+                # 按比例放大剩余权重
+                scale = 1.0 / remaining_weight
+                self.value_weight *= scale
+                self.quality_weight *= scale
+                self.momentum_weight *= scale
+                self.size_weight *= scale
+                
+                logger.info(
+                    f"权重重新归一化: 动量={self.momentum_weight:.0%}, "
+                    f"质量={self.quality_weight:.0%}, 市值={self.size_weight:.0%}, "
+                    f"价值={self.value_weight:.0%}"
+                )
+            elif remaining_weight == 0:
+                logger.error("所有因子均已熔断，策略无法正常运行！")
+        else:
+            logger.debug("因子熔断检测完成，无因子触发熔断")
+        
+        return breaker_triggered
+    
+    def check_position_drift(
+        self,
+        current_positions: Dict[str, float],
+        target_positions: Dict[str, float],
+        max_drift: float = 0.15
+    ) -> Tuple[bool, float, Dict[str, float]]:
+        """
+        检测持仓累计偏移
+        
+        计算当前持仓与目标持仓之间的权重偏移度。
+        当偏移超过阈值时，建议强制调仓。
+        
+        Parameters
+        ----------
+        current_positions : Dict[str, float]
+            当前持仓 {股票代码: 持仓金额}
+        target_positions : Dict[str, float]
+            目标持仓 {股票代码: 目标金额}
+        max_drift : float
+            最大允许偏移度，默认 0.15 (15%)
+        
+        Returns
+        -------
+        Tuple[bool, float, Dict[str, float]]
+            (是否需要强制调仓, 总偏移度, 各股票偏移详情)
+        
+        Notes
+        -----
+        偏移度计算公式:
+            drift = sum(|current_weight - target_weight|) / 2
+        
+        偏移度范围 [0, 1]:
+        - 0: 完全一致
+        - 1: 完全不一致（所有股票都不同）
+        
+        Examples
+        --------
+        >>> force, drift, details = strategy.check_position_drift(
+        ...     current={'600519': 50000, '000858': 50000},
+        ...     target={'600519': 60000, '000651': 40000},
+        ...     max_drift=0.15
+        ... )
+        >>> print(f"偏移度: {drift:.1%}, 需要调仓: {force}")
+        """
+        # 处理空持仓情况
+        current_total = sum(current_positions.values()) if current_positions else 0
+        target_total = sum(target_positions.values()) if target_positions else 0
+        
+        # 如果两者都为空，无偏移
+        if current_total == 0 and target_total == 0:
+            return False, 0.0, {}
+        
+        # 如果只有一方为空，视为 100% 偏移
+        if current_total == 0 or target_total == 0:
+            logger.info("当前持仓或目标持仓为空，视为需要调仓")
+            return True, 1.0, {}
+        
+        # 获取所有涉及的股票
+        all_stocks = set(current_positions.keys()) | set(target_positions.keys())
+        
+        # 计算各股票的权重偏移
+        drift_details = {}
+        total_drift = 0.0
+        
+        for stock in all_stocks:
+            current_weight = current_positions.get(stock, 0) / current_total
+            target_weight = target_positions.get(stock, 0) / target_total
+            drift = abs(current_weight - target_weight)
+            
+            drift_details[stock] = {
+                'current_weight': current_weight,
+                'target_weight': target_weight,
+                'drift': drift
+            }
+            total_drift += drift
+        
+        # 归一化偏移度到 [0, 1]
+        # 总偏移的最大值为 2（当完全不重叠时）
+        normalized_drift = total_drift / 2
+        
+        force_rebalance = normalized_drift > max_drift
+        
+        if force_rebalance:
+            logger.warning(
+                f"持仓偏移超限: {normalized_drift:.1%} > {max_drift:.1%}，建议强制调仓"
+            )
+            
+            # 输出偏移最大的几只股票
+            sorted_drifts = sorted(
+                drift_details.items(), 
+                key=lambda x: x[1]['drift'], 
+                reverse=True
+            )[:5]
+            
+            for stock, info in sorted_drifts:
+                logger.info(
+                    f"  {stock}: 当前={info['current_weight']:.1%}, "
+                    f"目标={info['target_weight']:.1%}, 偏移={info['drift']:.1%}"
+                )
+        else:
+            logger.debug(f"持仓偏移: {normalized_drift:.1%} <= {max_drift:.1%}，无需强制调仓")
+        
+        return force_rebalance, normalized_drift, drift_details
+    
+    def calculate_dynamic_slippage(
+        self,
+        order_value: float,
+        daily_amount: float,
+        avg_spread: float = 0.001,
+        impact_coefficient: float = 0.1
+    ) -> float:
+        """
+        计算动态滑点
+        
+        使用平方根市场冲击模型计算滑点成本。
+        
+        滑点 = 买卖价差/2 + 市场冲击成本
+        市场冲击 = impact_coefficient * sqrt(订单金额 / 日成交额)
+        
+        Parameters
+        ----------
+        order_value : float
+            订单金额（元）
+        daily_amount : float
+            股票日成交额（元）
+        avg_spread : float
+            平均买卖价差，默认 0.001 (0.1%)
+        impact_coefficient : float
+            市场冲击系数，默认 0.1
+        
+        Returns
+        -------
+        float
+            预估滑点比例，范围通常在 0.001 - 0.02
+        
+        Notes
+        -----
+        平方根冲击模型:
+            impact = k * sqrt(Q / V)
+        其中:
+            k = 冲击系数 (通常 0.05 - 0.2)
+            Q = 订单金额
+            V = 日成交额
+        
+        滑点上限为 2%，防止极端情况。
+        
+        Examples
+        --------
+        >>> slippage = strategy.calculate_dynamic_slippage(
+        ...     order_value=50000,
+        ...     daily_amount=100000000
+        ... )
+        >>> print(f"预估滑点: {slippage:.3%}")  # 约 0.12%
+        """
+        # 流动性不足时使用保守值
+        if daily_amount <= 0:
+            logger.warning("日成交额为 0，使用保守滑点 0.5%")
+            return 0.005
+        
+        # 计算订单占日成交额比例
+        volume_ratio = order_value / daily_amount
+        
+        # 平方根市场冲击
+        market_impact = impact_coefficient * np.sqrt(volume_ratio)
+        
+        # 总滑点 = 价差/2 + 市场冲击
+        total_slippage = avg_spread / 2 + market_impact
+        
+        # 限制滑点上限为 2%
+        max_slippage = self.config.get("slippage", {}).get("max_slippage", 0.02)
+        total_slippage = min(total_slippage, max_slippage)
+        
+        return total_slippage
+    
+    def estimate_trading_cost(
+        self,
+        order_value: float,
+        daily_amount: float,
+        is_buy: bool = True,
+        commission_rate: float = 0.0003,
+        stamp_duty: float = 0.001,
+        min_commission: float = 5.0
+    ) -> Dict[str, float]:
+        """
+        估算完整交易成本
+        
+        包含佣金、印花税、滑点三部分成本。
+        
+        Parameters
+        ----------
+        order_value : float
+            订单金额
+        daily_amount : float
+            日成交额
+        is_buy : bool
+            是否为买入，默认 True
+        commission_rate : float
+            佣金费率，默认万三
+        stamp_duty : float
+            印花税（仅卖出），默认千一
+        min_commission : float
+            最低佣金，默认 5 元
+        
+        Returns
+        -------
+        Dict[str, float]
+            交易成本明细:
+            - commission: 佣金
+            - stamp_duty: 印花税
+            - slippage: 滑点成本
+            - total: 总成本
+            - total_rate: 总成本率
+        """
+        # 佣金
+        commission = max(order_value * commission_rate, min_commission)
+        
+        # 印花税（仅卖出）
+        stamp = order_value * stamp_duty if not is_buy else 0
+        
+        # 滑点
+        slippage_config = self.config.get("slippage", {})
+        if slippage_config.get("mode", "dynamic") == "dynamic":
+            slippage_rate = self.calculate_dynamic_slippage(
+                order_value,
+                daily_amount,
+                avg_spread=slippage_config.get("base_slippage", 0.001),
+                impact_coefficient=slippage_config.get("impact_coefficient", 0.1)
+            )
+        else:
+            slippage_rate = slippage_config.get("fixed_slippage", 0.001)
+        
+        slippage_cost = order_value * slippage_rate
+        
+        # 总成本
+        total = commission + stamp + slippage_cost
+        total_rate = total / order_value if order_value > 0 else 0
+        
+        return {
+            'commission': commission,
+            'stamp_duty': stamp,
+            'slippage': slippage_cost,
+            'slippage_rate': slippage_rate,
+            'total': total,
+            'total_rate': total_rate
+        }
     
     def calculate_total_score(
         self,
@@ -1121,9 +1695,10 @@ class MultiFactorStrategy(BaseStrategy):
             data['_size_score'] = size_contribution
         
         # ===== 情绪进攻型策略：加入情绪分数 =====
-        # 情绪因子量纲对齐：情绪分数范围 [-1, 1]，Z-Score 通常在 [-3, 3]
-        # 乘以放大系数 3.0 使其影响力与技术因子匹配
-        SENTIMENT_SCALE_FACTOR = 3.0
+        # 情绪因子量纲对齐：使用动态 Z-Score 标准化
+        # 将情绪分数转换为横截面 Z-Score，使其与其他因子量纲一致
+        # 备用方案：如果情绪分数方差过小，回退到固定放大系数
+        SENTIMENT_FALLBACK_SCALE = 3.0  # 回退放大系数
         
         if sentiment_scores is not None and self.sentiment_weight > 0:
             # 确定股票代码列用于对齐
@@ -1132,14 +1707,6 @@ class MultiFactorStrategy(BaseStrategy):
             if stock_col in data.columns:
                 # 使用股票代码对齐情绪分数
                 aligned_sentiment = data[stock_col].map(sentiment_scores).fillna(0)
-                # 应用放大系数进行量纲对齐
-                scaled_sentiment = aligned_sentiment * SENTIMENT_SCALE_FACTOR
-                total_score += self.sentiment_weight * scaled_sentiment
-                logger.debug(
-                    f"情绪分数已加入综合得分: 权重={self.sentiment_weight}, "
-                    f"放大系数={SENTIMENT_SCALE_FACTOR}, "
-                    f"有效股票数={aligned_sentiment.notna().sum()}"
-                )
             else:
                 # 尝试使用索引对齐
                 if isinstance(data.index, pd.MultiIndex):
@@ -1148,13 +1715,33 @@ class MultiFactorStrategy(BaseStrategy):
                     stock_codes = data.index
                 aligned_sentiment = stock_codes.to_series().map(sentiment_scores).fillna(0)
                 aligned_sentiment.index = data.index
-                # 应用放大系数进行量纲对齐
-                scaled_sentiment = aligned_sentiment * SENTIMENT_SCALE_FACTOR
-                total_score += self.sentiment_weight * scaled_sentiment
+            
+            # 动态 Z-Score 标准化
+            # 计算当前横截面的均值和标准差
+            mean_sent = aligned_sentiment.mean()
+            std_sent = aligned_sentiment.std()
+            
+            if std_sent > 1e-8:
+                # 标准差足够大，使用 Z-Score 标准化
+                scaled_sentiment = (aligned_sentiment - mean_sent) / std_sent
+                scale_method = "Z-Score"
                 logger.debug(
-                    f"情绪分数已加入综合得分 (索引对齐): 权重={self.sentiment_weight}, "
-                    f"放大系数={SENTIMENT_SCALE_FACTOR}"
+                    f"情绪分数已加入综合得分: 权重={self.sentiment_weight}, "
+                    f"标准化方式={scale_method}, "
+                    f"均值={mean_sent:.3f}, 标准差={std_sent:.3f}, "
+                    f"有效股票数={aligned_sentiment.notna().sum()}"
                 )
+            else:
+                # 标准差过小（所有情绪分数几乎相同），回退到固定放大系数
+                scaled_sentiment = aligned_sentiment * SENTIMENT_FALLBACK_SCALE
+                scale_method = f"固定系数({SENTIMENT_FALLBACK_SCALE})"
+                logger.debug(
+                    f"情绪分数已加入综合得分: 权重={self.sentiment_weight}, "
+                    f"标准化方式={scale_method} (方差过小), "
+                    f"有效股票数={aligned_sentiment.notna().sum()}"
+                )
+            
+            total_score += self.sentiment_weight * scaled_sentiment
         
         return total_score
     
@@ -1517,6 +2104,24 @@ class MultiFactorStrategy(BaseStrategy):
             rsi_mask = day_data['rsi_20'] > 80
             day_data = day_data[~rsi_mask]
             filter_stats['RSI过热'] = before - len(day_data)
+        
+        # ==========================================
+        # 过滤条件 11: 路径效率过滤（震荡股剔除）
+        # 路径效率 = 净涨幅 / 累积波动幅度
+        # 低效率（< 0.3）表示股票走势震荡反复，趋势不明确
+        # ==========================================
+        PATH_EFFICIENCY_THRESHOLD = 0.3
+        if 'efficiency_20' in day_data.columns:
+            before = len(day_data)
+            inefficient_mask = day_data['efficiency_20'] < PATH_EFFICIENCY_THRESHOLD
+            day_data = day_data[~inefficient_mask]
+            filter_stats['震荡股'] = before - len(day_data)
+            
+            if filter_stats.get('震荡股', 0) > 0:
+                logger.debug(
+                    f"路径效率过滤: 剔除 {filter_stats['震荡股']} 只震荡股 "
+                    f"(efficiency_20 < {PATH_EFFICIENCY_THRESHOLD})"
+                )
 
         # ==========================================
         # 过滤条件 9: 过热熔断（Turnover Overheat Filter）

@@ -1102,6 +1102,8 @@ class AlphaFeatures(FeatureEngine):
             "alpha_001": self._alpha_001,
             "alpha_002": self._alpha_002,
             "alpha_003": self._alpha_003,
+            "alpha_004": self._alpha_004,
+            "alpha_005": self._alpha_005,
         }
     
     def calculate(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -1183,6 +1185,60 @@ class AlphaFeatures(FeatureEngine):
         volume_change = data["volume"].pct_change(5)
         
         return price_change - volume_change
+    
+    @staticmethod
+    def _alpha_004(data: pd.DataFrame) -> pd.Series:
+        """
+        Alpha#004: 成交量加速因子
+        
+        衡量近期成交量相对中期成交量的变化程度。
+        正值表示成交量放大，负值表示成交量萎缩。
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            OHLCV数据，需包含 volume 列
+        
+        Returns
+        -------
+        pd.Series
+            因子值: (vol_5d - vol_20d) / vol_20d
+        
+        Notes
+        -----
+        - 成交量加速 > 0: 资金活跃度提升，可能是趋势启动信号
+        - 成交量加速 < 0: 资金关注度下降，趋势可能减弱
+        """
+        vol_5d = data['volume'].rolling(5, min_periods=1).mean()
+        vol_20d = data['volume'].rolling(20, min_periods=5).mean()
+        return (vol_5d - vol_20d) / vol_20d.replace(0, np.nan)
+    
+    @staticmethod
+    def _alpha_005(data: pd.DataFrame) -> pd.Series:
+        """
+        Alpha#005: 尾盘强度因子 (Intraday Momentum)
+        
+        衡量收盘价在当日振幅中的位置。
+        接近 1 表示收盘价接近最高价（多头强势），接近 0 表示接近最低价（空头强势）。
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            OHLCV数据，需包含 high, low, close 列
+        
+        Returns
+        -------
+        pd.Series
+            因子值: (close - low) / (high - low)，范围 [0, 1]
+        
+        Notes
+        -----
+        - 尾盘强度 > 0.7: 收盘强势，买盘主导
+        - 尾盘强度 < 0.3: 收盘弱势，卖盘主导
+        - 连续多日尾盘强势是趋势确认信号
+        """
+        range_hl = data['high'] - data['low']
+        return (data['close'] - data['low']) / range_hl.replace(0, np.nan)
 
 
 class FactorCalculator:
@@ -2197,6 +2253,35 @@ class FactorCalculator:
             logger.warning(f"Turnover_5d 因子计算失败: {e}")
             result['turnover_5d'] = np.nan
         
+        # ========== 复合质量因子（IVOL + 换手率）==========
+        # 低波动 + 高换手 = 稳健上涨的活跃股票
+        try:
+            date_col = 'date' if 'date' in result.columns else 'trade_date'
+            
+            if 'ivol' in result.columns and 'turnover_5d' in result.columns:
+                # IVOL 取反: 低波动更好（负号使低波动股票得分更高）
+                if date_col in result.columns:
+                    ivol_zscore = result.groupby(date_col)['ivol'].transform(
+                        lambda x: -(x - x.mean()) / (x.std() + 1e-8)
+                    )
+                    turn_zscore = result.groupby(date_col)['turnover_5d'].transform(
+                        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                    )
+                else:
+                    ivol_zscore = -(result['ivol'] - result['ivol'].mean()) / (result['ivol'].std() + 1e-8)
+                    turn_zscore = (result['turnover_5d'] - result['turnover_5d'].mean()) / (result['turnover_5d'].std() + 1e-8)
+                
+                # 复合质量因子: 50% 低波动 + 50% 高换手
+                result['quality_composite_zscore'] = 0.5 * ivol_zscore.fillna(0) + 0.5 * turn_zscore.fillna(0)
+                result['quality_composite_zscore'] = result['quality_composite_zscore'].fillna(0)
+                logger.info("Quality_Composite 因子计算完成 (50% 低IVOL + 50% 高换手率)")
+            else:
+                result['quality_composite_zscore'] = 0.0
+                logger.warning("复合质量因子所需数据不完整，使用默认值 0")
+        except Exception as e:
+            logger.warning(f"Quality_Composite 因子计算失败: {e}")
+            result['quality_composite_zscore'] = 0.0
+        
         # ========== Alpha 因子（量价配合类）==========
         # 牛市进攻型策略：激活 Alpha 因子捕捉量价背离和动量加速信号
         alpha_enabled = False
@@ -2218,6 +2303,8 @@ class FactorCalculator:
             result['alpha_001'] = np.nan
             result['alpha_002'] = np.nan
             result['alpha_003'] = np.nan
+            result['alpha_004'] = np.nan
+            result['alpha_005'] = np.nan
         
         # ========== 关键修复：将 Alpha 因子纳入动量组合 ==========
         # Alpha 因子需要在 momentum_composite_zscore 计算之后才生成
@@ -2227,8 +2314,8 @@ class FactorCalculator:
                 # 日期列用于横截面标准化
                 date_col = 'date' if 'date' in result.columns else 'trade_date'
                 
-                # 对 Alpha 因子进行 Z-Score 标准化（与 ROC/Sharpe 对齐量纲）
-                for alpha_col in ['alpha_001', 'alpha_002', 'alpha_003']:
+                # 对所有 Alpha 因子进行 Z-Score 标准化（与 ROC/Sharpe 对齐量纲）
+                for alpha_col in ['alpha_001', 'alpha_002', 'alpha_003', 'alpha_004', 'alpha_005']:
                     zscore_col = f'{alpha_col}_zscore'
                     if alpha_col in result.columns and result[alpha_col].notna().any():
                         if date_col in result.columns:
@@ -2244,23 +2331,316 @@ class FactorCalculator:
                         result[zscore_col] = 0.0
                 
                 # 重新计算复合动量因子
-                # 新配方: 40% ROC (涨幅) + 30% Sharpe (稳健) + 30% Alpha001 (量价配合)
-                # Alpha001 = (Close - VWAP) / VWAP，正值表示收盘价高于均价，量价配合好
+                # 升级配方: 35% ROC + 25% Sharpe + 20% Alpha001 + 10% Alpha004 + 10% Alpha005
+                # - ROC: 价格动量
+                # - Sharpe: 风险调整后动量
+                # - Alpha001: 量价配合（收盘 vs VWAP）
+                # - Alpha004: 成交量加速
+                # - Alpha005: 尾盘强度
                 result['momentum_composite_zscore'] = (
-                    0.4 * result['roc_20_zscore'].fillna(0) + 
-                    0.3 * result['sharpe_20_zscore'].fillna(0) + 
-                    0.3 * result['alpha_001_zscore'].fillna(0)
+                    0.35 * result['roc_20_zscore'].fillna(0) + 
+                    0.25 * result['sharpe_20_zscore'].fillna(0) + 
+                    0.20 * result['alpha_001_zscore'].fillna(0) +
+                    0.10 * result['alpha_004_zscore'].fillna(0) +
+                    0.10 * result['alpha_005_zscore'].fillna(0)
                 )
                 result['momentum_composite_zscore'] = result['momentum_composite_zscore'].fillna(0)
                 
                 logger.info(
-                    "🚀 动量因子已升级: 40% ROC + 30% Sharpe + 30% Alpha001 (量价配合)"
+                    "动量因子已升级: 35% ROC + 25% Sharpe + 20% Alpha001 + 10% Alpha004 + 10% Alpha005"
                 )
             except Exception as e:
                 logger.warning(f"Alpha 因子纳入动量组合失败: {e}，保持原有动量公式")
         
+        # ========== 高级资金博弈因子（需要 TushareDataLoader）==========
+        # 这些因子需要额外的 Tushare 数据接口，可选启用
+        result = self._calculate_advanced_factors(result)
+        
         logger.info("所有因子计算完成")
         return result
+    
+    def _calculate_advanced_factors(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算高级资金博弈因子（可选）
+        
+        包含：
+        - 全息主力资金因子 (Smart Money Score)
+        - 龙头信仰因子 (Dragon Head Factor)
+        - 杠杆过热因子 (Leverage Overheat)
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            已包含基础因子的数据框
+        
+        Returns
+        -------
+        pd.DataFrame
+            添加高级因子后的数据框
+        
+        Notes
+        -----
+        - 这些因子需要 TushareDataLoader，如未配置则跳过
+        - 各因子独立计算，一个失败不影响其他
+        - 数据单位已对齐：金额统一为元，比例统一为小数
+        """
+        result = data.copy()
+        
+        # 检查是否可以获取 TushareDataLoader
+        loader = self._get_tushare_loader()
+        if loader is None:
+            logger.debug("TushareDataLoader 未配置，跳过高级资金博弈因子")
+            return result
+        
+        # 获取必要的参数
+        stock_list = self._get_stock_list(result)
+        if not stock_list:
+            logger.debug("无法获取股票列表，跳过高级因子")
+            return result
+        
+        # 获取日期范围
+        start_date, end_date = self._get_date_range(result)
+        if not start_date or not end_date:
+            logger.debug("无法获取日期范围，跳过高级因子")
+            return result
+        
+        logger.info(f"🔬 开始计算高级资金博弈因子: {len(stock_list)} 只股票, {start_date} ~ {end_date}")
+        
+        # 1. 全息主力资金因子 (Smart Money)
+        try:
+            smart_money_df = loader.calculate_smart_money_score(
+                stock_list=stock_list,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if not smart_money_df.empty:
+                # 合并到结果（使用左连接，保持原数据完整）
+                merge_cols = ['stock_code', 'smart_money_score', 'north_score', 
+                              'large_order_score', 'main_net_inflow']
+                existing_cols = [c for c in merge_cols if c in smart_money_df.columns]
+                
+                result = result.merge(
+                    smart_money_df[existing_cols],
+                    on='stock_code',
+                    how='left',
+                    suffixes=('', '_sm')
+                )
+                
+                # 填充缺失值（无数据的股票设为中性值 0.5）
+                result['smart_money_score'] = result['smart_money_score'].fillna(0.5)
+                result['north_score'] = result.get('north_score', pd.Series(0.5)).fillna(0.5)
+                result['large_order_score'] = result.get('large_order_score', pd.Series(0.5)).fillna(0.5)
+                
+                logger.info("✅ Smart Money 因子计算完成")
+            else:
+                logger.warning("Smart Money 数据为空，使用默认值")
+                result['smart_money_score'] = 0.5
+                
+        except Exception as e:
+            logger.warning(f"Smart Money 因子计算失败: {e}")
+            result['smart_money_score'] = 0.5
+        
+        # 2. 龙头信仰因子 (Dragon Head) - 仅针对涨停股票
+        try:
+            # 获取最新交易日
+            latest_date = end_date.replace("-", "")
+            dragon_df = loader.calculate_limit_strength(trade_date=latest_date)
+            
+            if not dragon_df.empty:
+                # 龙头因子只对涨停股票有效，其他股票设为 NaN（不参与排名）
+                merge_cols = ['stock_code', 'dragon_score', 'bid_strength', 
+                              'is_strong_limit']
+                existing_cols = [c for c in merge_cols if c in dragon_df.columns]
+                
+                result = result.merge(
+                    dragon_df[existing_cols],
+                    on='stock_code',
+                    how='left',
+                    suffixes=('', '_dh')
+                )
+                
+                # 注意：龙头因子对非涨停股票保持 NaN，不填充！
+                # 这样在选股时可以区分"无数据"和"非涨停"
+                logger.info(f"✅ Dragon Head 因子计算完成: {len(dragon_df)} 只涨停股")
+            else:
+                logger.debug("当日无涨停股票，Dragon Head 因子跳过")
+                result['dragon_score'] = np.nan
+                
+        except Exception as e:
+            logger.warning(f"Dragon Head 因子计算失败: {e}")
+            result['dragon_score'] = np.nan
+        
+        # 3. 杠杆过热因子 (Leverage Overheat) - 反向指标
+        try:
+            leverage_df = loader.calculate_leverage_risk(
+                stock_list=stock_list,
+                trade_date=end_date
+            )
+            
+            if not leverage_df.empty:
+                merge_cols = ['stock_code', 'leverage_heat', 'leverage_risk_score',
+                              'margin_buy_ratio', 'margin_balance_ratio']
+                existing_cols = [c for c in merge_cols if c in leverage_df.columns]
+                
+                result = result.merge(
+                    leverage_df[existing_cols],
+                    on='stock_code',
+                    how='left',
+                    suffixes=('', '_lev')
+                )
+                
+                # 杠杆因子：无融资融券数据的股票设为中性值 0
+                # 注意：leverage_heat 是 Z-Score，0 表示正常
+                result['leverage_heat'] = result['leverage_heat'].fillna(0)
+                result['leverage_risk_score'] = result.get('leverage_risk_score', pd.Series(0.5)).fillna(0.5)
+                
+                logger.info("✅ Leverage Overheat 因子计算完成")
+            else:
+                logger.warning("融资融券数据为空，使用默认值")
+                result['leverage_heat'] = 0
+                result['leverage_risk_score'] = 0.5
+                
+        except Exception as e:
+            logger.warning(f"Leverage Overheat 因子计算失败: {e}")
+            result['leverage_heat'] = 0
+            result['leverage_risk_score'] = 0.5
+        
+        # ========== 构建复合情绪因子 ==========
+        try:
+            self._calculate_sentiment_composite(result)
+        except Exception as e:
+            logger.warning(f"复合情绪因子计算失败: {e}")
+        
+        return result
+    
+    def _calculate_sentiment_composite(self, data: pd.DataFrame) -> None:
+        """
+        计算复合情绪因子
+        
+        综合主力资金、龙头信仰、杠杆风险，构建统一的市场情绪因子。
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含各子因子的数据框（原地修改）
+        
+        Notes
+        -----
+        复合情绪因子公式：
+        sentiment_composite = 0.5 * smart_money_score 
+                            + 0.3 * (1 - leverage_risk_score)  # 反向
+                            + 0.2 * dragon_score (仅涨停股)
+        
+        - 杠杆因子是反向指标，需要取反
+        - 龙头因子仅对涨停股票有效
+        """
+        # 基础情绪因子
+        smart_money = data.get('smart_money_score', pd.Series(0.5, index=data.index))
+        leverage_risk = data.get('leverage_risk_score', pd.Series(0.5, index=data.index))
+        dragon = data.get('dragon_score', pd.Series(np.nan, index=data.index))
+        
+        # 杠杆因子取反（低风险 = 高得分）
+        leverage_inverted = 1 - leverage_risk.fillna(0.5)
+        
+        # 复合情绪因子（非涨停股票不包含龙头因子）
+        has_dragon = dragon.notna()
+        
+        # 对有龙头因子的股票（涨停股）
+        data.loc[has_dragon, 'sentiment_composite'] = (
+            0.4 * smart_money.loc[has_dragon].fillna(0.5) +
+            0.3 * leverage_inverted.loc[has_dragon] +
+            0.3 * dragon.loc[has_dragon].fillna(0)
+        )
+        
+        # 对无龙头因子的股票（非涨停股）
+        data.loc[~has_dragon, 'sentiment_composite'] = (
+            0.6 * smart_money.loc[~has_dragon].fillna(0.5) +
+            0.4 * leverage_inverted.loc[~has_dragon]
+        )
+        
+        # 确保在 [0, 1] 范围内
+        data['sentiment_composite'] = data['sentiment_composite'].clip(0, 1)
+        
+        logger.info("✅ 复合情绪因子 (sentiment_composite) 计算完成")
+    
+    def _get_tushare_loader(self):
+        """
+        获取 TushareDataLoader 实例
+        
+        Returns
+        -------
+        Optional[TushareDataLoader]
+            TushareDataLoader 实例，未配置时返回 None
+        """
+        try:
+            from src.tushare_loader import TushareDataLoader
+            
+            # 检查是否有缓存的 loader
+            if hasattr(self, '_tushare_loader') and self._tushare_loader is not None:
+                return self._tushare_loader
+            
+            # 尝试创建 loader（会从配置或环境变量读取 token）
+            self._tushare_loader = TushareDataLoader()
+            return self._tushare_loader
+            
+        except (ImportError, ValueError) as e:
+            logger.debug(f"TushareDataLoader 不可用: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"TushareDataLoader 初始化失败: {e}")
+            return None
+    
+    def _get_stock_list(self, data: pd.DataFrame) -> List[str]:
+        """
+        从数据中提取股票代码列表
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            包含股票数据的 DataFrame
+        
+        Returns
+        -------
+        List[str]
+            股票代码列表（6位代码）
+        """
+        if 'stock_code' in data.columns:
+            return data['stock_code'].unique().tolist()
+        elif 'ts_code' in data.columns:
+            return data['ts_code'].str[:6].unique().tolist()
+        else:
+            return []
+    
+    def _get_date_range(self, data: pd.DataFrame) -> tuple:
+        """
+        从数据中提取日期范围
+        
+        Returns
+        -------
+        tuple
+            (start_date, end_date) 格式 YYYYMMDD
+        """
+        date_col = None
+        if 'date' in data.columns:
+            date_col = 'date'
+        elif 'trade_date' in data.columns:
+            date_col = 'trade_date'
+        elif data.index.name == 'date' or isinstance(data.index, pd.DatetimeIndex):
+            dates = pd.to_datetime(data.index)
+            return (
+                dates.min().strftime("%Y%m%d"),
+                dates.max().strftime("%Y%m%d")
+            )
+        
+        if date_col and date_col in data.columns:
+            dates = pd.to_datetime(data[date_col])
+            return (
+                dates.min().strftime("%Y%m%d"),
+                dates.max().strftime("%Y%m%d")
+            )
+        
+        return (None, None)
     
     # ==================== 标准化处理 ====================
     
@@ -3150,3 +3530,212 @@ class SentimentEngine:
             })
         
         return pd.DataFrame(records)
+
+
+# ============================================================================
+# 因子有效性监控 (Factor IC Analysis)
+# ============================================================================
+
+def calculate_factor_ic(
+    data: pd.DataFrame,
+    factor_cols: List[str],
+    return_col: str = 'forward_return_5d',
+    date_col: str = 'date',
+    stock_col: str = 'stock_code',
+    log_results: bool = True
+) -> pd.DataFrame:
+    """
+    计算因子 IC (Information Coefficient)
+    
+    IC 是因子值与未来收益的秩相关系数（Spearman），用于评估因子预测能力。
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        包含因子数据和收益率的 DataFrame
+    factor_cols : List[str]
+        需要评估的因子列名列表
+    return_col : str
+        收益率列名，默认 'forward_return_5d'（5日前瞻收益）
+    date_col : str
+        日期列名，默认 'date'
+    stock_col : str
+        股票代码列名，默认 'stock_code'
+    log_results : bool
+        是否记录日志，默认 True
+    
+    Returns
+    -------
+    pd.DataFrame
+        因子 IC 统计结果，包含以下列:
+        - factor: 因子名称
+        - ic_mean: IC 均值
+        - ic_std: IC 标准差
+        - ic_ir: IC_IR (IC均值/IC标准差)，衡量 IC 稳定性
+        - ic_positive_ratio: 正 IC 比例
+        - t_stat: t 统计量
+        - status: 有效性状态 ('有效', '边缘', '失效')
+    
+    Notes
+    -----
+    - IC > 0.03 通常被认为是有效因子
+    - IC_IR > 0.5 表示因子预测能力稳定
+    - 正 IC 比例 > 60% 表示因子方向稳定
+    
+    Examples
+    --------
+    >>> # 计算因子 IC
+    >>> factor_cols = ['momentum_composite_zscore', 'small_cap_zscore']
+    >>> ic_df = calculate_factor_ic(data, factor_cols)
+    >>> print(ic_df)
+    """
+    if data.empty:
+        logger.warning("输入数据为空，无法计算 IC")
+        return pd.DataFrame()
+    
+    # 检查收益率列是否存在
+    if return_col not in data.columns:
+        # 尝试计算前瞻收益
+        if 'close' in data.columns:
+            logger.info(f"'{return_col}' 列不存在，尝试从 close 计算 5 日前瞻收益")
+            if stock_col in data.columns:
+                data = data.copy()
+                data[return_col] = data.groupby(stock_col)['close'].transform(
+                    lambda x: x.shift(-5) / x - 1
+                )
+            else:
+                data = data.copy()
+                data[return_col] = data['close'].shift(-5) / data['close'] - 1
+        else:
+            logger.warning(f"无法计算 IC: 缺少 '{return_col}' 列且无法自动生成")
+            return pd.DataFrame()
+    
+    results = []
+    
+    for col in factor_cols:
+        if col not in data.columns:
+            logger.debug(f"因子列 '{col}' 不存在，跳过")
+            continue
+        
+        try:
+            # 按日期计算每日 IC（Spearman 秩相关）
+            if date_col in data.columns:
+                ic_by_date = data.groupby(date_col).apply(
+                    lambda x: x[col].corr(x[return_col], method='spearman')
+                    if x[col].notna().sum() > 5 and x[return_col].notna().sum() > 5
+                    else np.nan,
+                    include_groups=False
+                )
+            else:
+                # 无日期列，计算整体 IC
+                ic_value = data[col].corr(data[return_col], method='spearman')
+                ic_by_date = pd.Series([ic_value])
+            
+            # 移除 NaN
+            ic_by_date = ic_by_date.dropna()
+            
+            if len(ic_by_date) == 0:
+                logger.warning(f"因子 '{col}' 无有效 IC 数据")
+                continue
+            
+            # 计算统计量
+            ic_mean = ic_by_date.mean()
+            ic_std = ic_by_date.std()
+            ic_ir = ic_mean / (ic_std + 1e-8)
+            ic_positive_ratio = (ic_by_date > 0).mean()
+            
+            # t 统计量
+            n = len(ic_by_date)
+            t_stat = ic_mean / (ic_std / np.sqrt(n) + 1e-8) if n > 1 else 0
+            
+            # 有效性判断
+            if abs(ic_mean) >= 0.03 and ic_ir >= 0.5:
+                status = "有效"
+            elif abs(ic_mean) >= 0.02 or ic_ir >= 0.3:
+                status = "边缘"
+            else:
+                status = "失效"
+            
+            results.append({
+                'factor': col,
+                'ic_mean': ic_mean,
+                'ic_std': ic_std,
+                'ic_ir': ic_ir,
+                'ic_positive_ratio': ic_positive_ratio,
+                't_stat': t_stat,
+                'n_periods': n,
+                'status': status
+            })
+            
+        except Exception as e:
+            logger.warning(f"计算因子 '{col}' IC 失败: {e}")
+            continue
+    
+    if not results:
+        logger.warning("没有成功计算任何因子的 IC")
+        return pd.DataFrame()
+    
+    ic_df = pd.DataFrame(results)
+    
+    # 日志输出
+    if log_results:
+        logger.info("=" * 50)
+        logger.info("因子 IC 监控报告")
+        logger.info("=" * 50)
+        for _, row in ic_df.iterrows():
+            status_icon = "✅" if row['status'] == "有效" else ("⚠️" if row['status'] == "边缘" else "❌")
+            logger.info(
+                f"{status_icon} {row['factor']}: "
+                f"IC={row['ic_mean']:.4f}, IC_IR={row['ic_ir']:.2f}, "
+                f"正IC率={row['ic_positive_ratio']:.1%} [{row['status']}]"
+            )
+        logger.info("=" * 50)
+    
+    return ic_df
+
+
+def calculate_forward_returns(
+    data: pd.DataFrame,
+    periods: List[int] = [1, 5, 10, 20],
+    stock_col: str = 'stock_code',
+    price_col: str = 'close'
+) -> pd.DataFrame:
+    """
+    计算多期前瞻收益
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        价格数据
+    periods : List[int]
+        收益计算期数列表，默认 [1, 5, 10, 20]
+    stock_col : str
+        股票代码列名
+    price_col : str
+        价格列名
+    
+    Returns
+    -------
+    pd.DataFrame
+        添加了前瞻收益列的数据框
+    
+    Examples
+    --------
+    >>> data = calculate_forward_returns(data, periods=[5, 10])
+    >>> # 添加了 forward_return_5d, forward_return_10d 列
+    """
+    result = data.copy()
+    
+    for period in periods:
+        col_name = f'forward_return_{period}d'
+        
+        if stock_col in result.columns:
+            result[col_name] = result.groupby(stock_col)[price_col].transform(
+                lambda x: x.shift(-period) / x - 1
+            )
+        else:
+            result[col_name] = result[price_col].shift(-period) / result[price_col] - 1
+        
+        logger.debug(f"前瞻收益 {col_name} 计算完成")
+    
+    return result

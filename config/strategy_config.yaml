@@ -37,7 +37,7 @@ tushare:
   
   # 跳过新闻获取（新闻接口有严格限制：每小时2次）
   # 设为 true 时情绪分析会基于股票名称/行业进行，不获取实时新闻
-  skip_news: true
+  skip_news: false
 
 # ============================================================
 # 策略配置 - 牛市进攻型策略 (Bull Market Offensive)
@@ -65,10 +65,10 @@ strategy:
   top_n: 6                # 持仓6只，分散风险
   min_listing_days: 252   # 至少上市一年（次新股风险较高）
   
-  # ===== 风控熔断阈值 (牛市放宽版) =====
-  # [关键修改] 大幅放宽换手率限制，避免卖飞龙头妖股
-  turnover_threshold: 50.0   # 换手率Z-Score阈值: 50.0 (基本禁用熔断)
-  volatility_threshold: 5.0  # 波动率阈值: 5.0 (容忍高波动)
+  # ===== 风控熔断阈值 =====
+  # 恢复合理阈值，防止选入过热股
+  turnover_threshold: 3.0    # 换手率Z-Score阈值: Z > 3.0 触发熔断
+  volatility_threshold: 2.5  # 波动率阈值: 约 250% 年化波动率
   
   # ===== 板块过滤 =====
   exclude_chinext: true   # 排除创业板（300开头，波动大）
@@ -91,10 +91,18 @@ strategy:
   # ===== Alpha因子开关 (新增) =====
   enable_alpha_factors: true      # 启用 Alpha 因子 (量价配合等)
   
-  # ===== 拥挤度轮动开关 (新增) =====
+  # ===== 拥挤度轮动开关 =====
   enable_crowding_rotation: true   # 启用拥挤度板块轮动
-  crowding_exit_threshold: 0.95    # 行业拥挤度 > 95% 时分批止盈
+  crowding_exit_threshold: 0.85    # 行业拥挤度 > 85% 时分批止盈
   crowding_entry_threshold: 0.50   # 行业拥挤度回落到 50% 以下时可切入
+  
+  # ===== 市场状态自适应配置 =====
+  market_regime:
+    enabled: true                    # 启用市场状态自适应权重
+    trend_ma_period: 60              # 趋势判断: 指数 vs 60日均线
+    volatility_period: 20            # 波动率计算周期
+    high_volatility_threshold: 0.25  # 25% 年化波动率为高波动
+    low_volatility_threshold: 0.15   # 15% 年化波动率为低波动
 
 # ============================================================
 # 风险控制配置 - 牛市进攻型参数
@@ -259,3 +267,69 @@ backtest:
 
   # 回测最大股票数量
   max_stocks: 500
+
+# 因子 IC 监控配置
+ic_monitor:
+  # 是否启用IC监控
+  enabled: true
+  
+  # 前瞻收益窗口（交易日）
+  lookback_days: 5
+  
+  # 日志频率: daily, weekly
+  log_frequency: "daily"
+  
+  # 是否集成到每日报告
+  report_integration: true
+  
+  # IC有效性阈值（IC > 0.03 视为有效因子）
+  ic_threshold: 0.03
+  
+  # 因子失效熔断配置
+  circuit_breaker_enabled: true    # 是否启用因子熔断
+  circuit_breaker_ic_threshold: 0.01   # IC低于此值触发熔断
+  circuit_breaker_ir_threshold: 0.3    # IC_IR低于此值触发熔断
+  
+  # 监控的因子列表
+  monitored_factors:
+    - "momentum_composite_zscore"
+    - "small_cap_zscore"
+    - "turnover_5d_zscore"
+    - "quality_composite_zscore"
+    - "value_composite_zscore"
+
+# 交易日历配置
+trading_calendar:
+  # 是否启用交易日历校验
+  check_enabled: true
+  # 交易所代码 (XSHG=上交所, XSHE=深交所)
+  exchange: "XSHG"
+
+# 动态滑点配置
+slippage:
+  # 滑点模式: "fixed" 或 "dynamic"
+  mode: "dynamic"
+  # 固定滑点 (mode=fixed时使用)
+  fixed_slippage: 0.001
+  # 基础滑点 (mode=dynamic时使用)
+  base_slippage: 0.001
+  # 市场冲击系数 (平方根冲击模型)
+  impact_coefficient: 0.1
+  # 最大滑点上限
+  max_slippage: 0.02
+
+# 持仓偏移检测配置
+position_drift:
+  # 是否启用偏移检测
+  check_enabled: true
+  # 累计偏移阈值，超过此值强制调仓
+  max_drift: 0.15
+
+# 历史业绩记录配置
+performance_history:
+  # 是否启用历史记录
+  enabled: true
+  # 保留最近多少天
+  max_days: 365
+  # 历史记录文件路径
+  file_path: "data/processed/performance_history.json"

@@ -2223,6 +2223,152 @@ class TushareDataLoader:
         logger.info(f"批量获取涨停数据完成: {len(calendar)} 天, {len(result)} 条记录")
         return result
     
+    def check_tradability(
+        self,
+        stock_list: List[str],
+        trade_date: str,
+        check_limit_up: bool = True,
+        check_suspend: bool = True
+    ) -> pd.DataFrame:
+        """
+        检查股票的可交易性
+        
+        综合判断股票在指定交易日是否可买入，考虑：
+        - 是否涨停（一字板无法买入）
+        - 是否停牌
+        - 是否跌停（可能无法卖出）
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表（6位代码）
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        check_limit_up : bool
+            是否检查涨停，默认 True
+        check_suspend : bool
+            是否检查停牌，默认 True
+        
+        Returns
+        -------
+        pd.DataFrame
+            可交易性结果，包含：
+            - stock_code: 股票代码
+            - is_tradable: 是否可交易
+            - is_limit_up: 是否涨停
+            - is_one_word_limit: 是否一字涨停
+            - is_limit_down: 是否跌停
+            - is_suspended: 是否停牌
+            - limit_strength: 涨停强度 (0-100，仅涨停时有效)
+            - reason: 不可交易原因
+        
+        Notes
+        -----
+        一字涨停判断：
+        - open_times == 0（未开板）
+        - 或 fc_ratio > 50%（封单比极高）
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> tradability = loader.check_tradability(
+        ...     ['000001', '600519', '300750'],
+        ...     '20240115'
+        ... )
+        >>> # 筛选可买入的股票
+        >>> buyable = tradability[tradability['is_tradable']]
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        # 初始化结果
+        result = pd.DataFrame({
+            'stock_code': stock_list,
+            'is_tradable': True,
+            'is_limit_up': False,
+            'is_one_word_limit': False,
+            'is_limit_down': False,
+            'is_suspended': False,
+            'limit_strength': 0.0,
+            'reason': ''
+        })
+        
+        if not stock_list:
+            return result
+        
+        # 检查涨停
+        if check_limit_up:
+            limit_up_df = self.fetch_limit_list(trade_date, "U")
+            if limit_up_df is not None and not limit_up_df.empty:
+                limit_up_codes = set(limit_up_df['stock_code'].tolist())
+                
+                for idx, row in result.iterrows():
+                    code = row['stock_code']
+                    if code in limit_up_codes:
+                        result.at[idx, 'is_limit_up'] = True
+                        
+                        # 获取涨停详情
+                        stock_limit = limit_up_df[limit_up_df['stock_code'] == code].iloc[0]
+                        
+                        # 判断是否一字涨停
+                        open_times = stock_limit.get('open_times', 0) or 0
+                        fc_ratio = stock_limit.get('fc_ratio', 0) or 0
+                        strength = stock_limit.get('strth', 0) or 0
+                        
+                        result.at[idx, 'limit_strength'] = strength
+                        
+                        # 一字涨停判断：未开板或封单比极高
+                        if open_times == 0 or fc_ratio > 50:
+                            result.at[idx, 'is_one_word_limit'] = True
+                            result.at[idx, 'is_tradable'] = False
+                            result.at[idx, 'reason'] = f'一字涨停(开板{open_times}次,封比{fc_ratio:.0f}%)'
+                        elif fc_ratio > 30:
+                            # 封单比较高，买入难度大
+                            result.at[idx, 'reason'] = f'涨停(封比{fc_ratio:.0f}%,可能难买)'
+        
+        # 检查跌停
+        limit_down_df = self.fetch_limit_list(trade_date, "D")
+        if limit_down_df is not None and not limit_down_df.empty:
+            limit_down_codes = set(limit_down_df['stock_code'].tolist())
+            
+            for idx, row in result.iterrows():
+                if row['stock_code'] in limit_down_codes:
+                    result.at[idx, 'is_limit_down'] = True
+                    # 跌停不影响买入，但需要警示
+                    if not result.at[idx, 'reason']:
+                        result.at[idx, 'reason'] = '跌停(卖出可能受限)'
+        
+        # 检查停牌
+        if check_suspend:
+            try:
+                # 获取停牌信息
+                suspend_df = self._fetch_with_retry(
+                    self.pro.suspend_d,
+                    trade_date=trade_date,
+                    suspend_type='S'  # S=停牌
+                )
+                
+                if suspend_df is not None and not suspend_df.empty:
+                    suspend_codes = set(suspend_df['ts_code'].str[:6].tolist())
+                    
+                    for idx, row in result.iterrows():
+                        if row['stock_code'] in suspend_codes:
+                            result.at[idx, 'is_suspended'] = True
+                            result.at[idx, 'is_tradable'] = False
+                            result.at[idx, 'reason'] = '停牌'
+            except Exception as e:
+                logger.debug(f"获取停牌信息失败: {e}")
+        
+        # 统计
+        tradable_count = result['is_tradable'].sum()
+        logger.info(
+            f"可交易性检查 {trade_date}: "
+            f"总计 {len(stock_list)} 只, 可交易 {tradable_count} 只, "
+            f"涨停 {result['is_limit_up'].sum()} 只, "
+            f"一字板 {result['is_one_word_limit'].sum()} 只"
+        )
+        
+        return result
+    
     def calculate_consecutive_limits(
         self,
         stock_code: str,
@@ -2288,6 +2434,178 @@ class TushareDataLoader:
                         return 0
         
         return consecutive_count
+    
+    def fetch_delisted_stocks(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        获取退市股票信息
+        
+        用于处理幸存者偏差，确保回测时包含已退市股票的历史数据。
+        
+        Parameters
+        ----------
+        start_date : Optional[str]
+            退市日期起始，格式 YYYYMMDD
+        end_date : Optional[str]
+            退市日期结束，格式 YYYYMMDD
+        
+        Returns
+        -------
+        pd.DataFrame
+            退市股票信息，包含：
+            - ts_code: 股票代码
+            - stock_code: 6位代码
+            - name: 股票名称
+            - list_date: 上市日期
+            - delist_date: 退市日期
+            - is_delisted: 是否已退市 (True)
+        
+        Notes
+        -----
+        - 调用 Tushare stock_basic 接口，list_status='D' (退市)
+        - 退市股票的历史数据仍可用于回测
+        - 需在回测中标记退市日期后不可交易
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> delisted = loader.fetch_delisted_stocks()
+        >>> print(f"退市股票数量: {len(delisted)}")
+        """
+        logger.info("获取退市股票信息...")
+        
+        # 缓存文件
+        cache_file = self.cache_dir / "delisted_stocks.parquet"
+        
+        # 检查缓存是否足够新（7天内）
+        if cache_file.exists():
+            try:
+                cache_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+                if (datetime.now() - cache_mtime).days < 7:
+                    df = pd.read_parquet(cache_file)
+                    logger.debug(f"从缓存加载退市股票: {len(df)} 只")
+                    return df
+            except Exception:
+                pass
+        
+        # API 获取
+        try:
+            df = self._fetch_with_retry(
+                self.pro.stock_basic,
+                exchange='',
+                list_status='D',  # D=退市
+                fields='ts_code,name,list_date,delist_date'
+            )
+            
+            if df is None or df.empty:
+                logger.warning("未获取到退市股票信息")
+                return pd.DataFrame()
+            
+            # 添加 6 位代码
+            df['stock_code'] = df['ts_code'].str[:6]
+            df['is_delisted'] = True
+            
+            # 日期过滤
+            if start_date or end_date:
+                if 'delist_date' in df.columns:
+                    df['delist_date'] = pd.to_datetime(df['delist_date'])
+                    if start_date:
+                        start = pd.to_datetime(start_date)
+                        df = df[df['delist_date'] >= start]
+                    if end_date:
+                        end = pd.to_datetime(end_date)
+                        df = df[df['delist_date'] <= end]
+            
+            # 缓存
+            try:
+                df.to_parquet(cache_file)
+            except Exception as e:
+                logger.debug(f"缓存退市股票信息失败: {e}")
+            
+            logger.info(f"获取退市股票完成: {len(df)} 只")
+            return df
+            
+        except Exception as e:
+            logger.warning(f"获取退市股票失败: {e}")
+            return pd.DataFrame()
+    
+    def fetch_name_change_history(
+        self,
+        stock_code: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        获取股票更名历史
+        
+        用于处理历史数据中的股票名称变更，避免回测时的混淆。
+        
+        Parameters
+        ----------
+        stock_code : Optional[str]
+            股票代码（6位），不指定则获取全部
+        start_date : Optional[str]
+            更名日期起始
+        end_date : Optional[str]
+            更名日期结束
+        
+        Returns
+        -------
+        pd.DataFrame
+            更名历史，包含：
+            - ts_code: 股票代码
+            - stock_code: 6位代码
+            - name: 现名
+            - start_date: 使用开始日期
+            - end_date: 使用结束日期
+            - change_reason: 变更原因
+        
+        Notes
+        -----
+        常见更名原因：
+        - 更名: 纯粹改名
+        - ST: 被特别处理
+        - *ST: 退市风险警示
+        - 摘帽: ST 恢复正常
+        """
+        logger.debug(f"获取股票更名历史: {stock_code or '全部'}")
+        
+        try:
+            # 构建请求参数
+            kwargs = {}
+            if stock_code:
+                # 转换为 ts_code 格式
+                if not ('.' in stock_code):
+                    suffix = '.SH' if stock_code.startswith(('6', '9')) else '.SZ'
+                    kwargs['ts_code'] = stock_code + suffix
+                else:
+                    kwargs['ts_code'] = stock_code
+            
+            if start_date:
+                kwargs['start_date'] = start_date.replace('-', '')
+            if end_date:
+                kwargs['end_date'] = end_date.replace('-', '')
+            
+            df = self._fetch_with_retry(
+                self.pro.namechange,
+                **kwargs
+            )
+            
+            if df is None or df.empty:
+                return pd.DataFrame()
+            
+            # 添加 6 位代码
+            df['stock_code'] = df['ts_code'].str[:6]
+            
+            logger.debug(f"获取更名历史完成: {len(df)} 条")
+            return df
+            
+        except Exception as e:
+            logger.warning(f"获取更名历史失败: {e}")
+            return pd.DataFrame()
     
     def calculate_limit_strength(
         self,
@@ -3187,6 +3505,213 @@ class TushareDataLoader:
             )
         
         return warnings
+    
+    # ==================== 数据单位验证工具 ====================
+    
+    @staticmethod
+    def validate_data_units(
+        df: pd.DataFrame,
+        check_columns: Optional[List[str]] = None,
+        expected_units: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        验证数据单位一致性
+        
+        检查关键金额字段的数量级是否合理，帮助发现单位不一致的问题。
+        
+        Parameters
+        ----------
+        df : pd.DataFrame
+            待验证的数据
+        check_columns : Optional[List[str]]
+            要检查的列名列表，默认检查常见金额列
+        expected_units : Optional[Dict[str, str]]
+            列名到预期单位的映射
+        
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            每列的验证结果，包含：
+            - min: 最小值
+            - max: 最大值
+            - mean: 均值
+            - magnitude: 数量级
+            - likely_unit: 推测的单位
+            - warning: 警告信息（如有）
+        
+        Notes
+        -----
+        Tushare 各接口的常见单位：
+        - daily: amount 为千元，volume 为手
+        - daily_basic: total_mv/circ_mv 为万元
+        - moneyflow: 各金额字段为万元
+        - margin: rzye/rzmre 等为元
+        - hk_hold: vol 为股
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> flow = loader.fetch_moneyflow("000001", "20240101", "20240115")
+        >>> validation = TushareDataLoader.validate_data_units(flow)
+        >>> print(validation)
+        """
+        if check_columns is None:
+            # 默认检查的常见金额列
+            check_columns = [
+                'amount', 'volume', 'total_mv', 'circ_mv',
+                'buy_elg_amount', 'sell_elg_amount', 'buy_lg_amount', 'sell_lg_amount',
+                'net_mf_amount', 'fd_amount', 'rzye', 'rzmre', 'rqye'
+            ]
+        
+        # Tushare 标准单位参考
+        default_units = {
+            'amount': '千元(daily)/万元(moneyflow)',
+            'volume': '手',
+            'total_mv': '万元',
+            'circ_mv': '万元',
+            'buy_elg_amount': '万元',
+            'sell_elg_amount': '万元',
+            'buy_lg_amount': '万元',
+            'sell_lg_amount': '万元',
+            'net_mf_amount': '万元',
+            'fd_amount': '万元',
+            'rzye': '元',
+            'rzmre': '元',
+            'rqye': '元',
+        }
+        
+        if expected_units:
+            default_units.update(expected_units)
+        
+        results = {}
+        
+        for col in check_columns:
+            if col not in df.columns:
+                continue
+            
+            series = df[col].dropna()
+            if len(series) == 0:
+                results[col] = {"warning": "列为空"}
+                continue
+            
+            min_val = series.min()
+            max_val = series.max()
+            mean_val = series.mean()
+            
+            # 计算数量级
+            if mean_val > 0:
+                magnitude = int(np.log10(abs(mean_val)))
+            else:
+                magnitude = 0
+            
+            # 推测单位
+            likely_unit = "未知"
+            warning = None
+            
+            if col in ['amount']:
+                if magnitude >= 9:
+                    likely_unit = "元"
+                elif magnitude >= 6:
+                    likely_unit = "千元"
+                elif magnitude >= 3:
+                    likely_unit = "万元"
+                else:
+                    likely_unit = "可能有问题"
+                    warning = f"成交额数量级异常: 10^{magnitude}"
+                    
+            elif col in ['total_mv', 'circ_mv']:
+                if magnitude >= 10:
+                    likely_unit = "元"
+                    warning = "市值单位可能是元，预期为万元"
+                elif magnitude >= 6:
+                    likely_unit = "万元（正常）"
+                else:
+                    likely_unit = "可能有问题"
+                    warning = f"市值数量级异常: 10^{magnitude}"
+                    
+            elif col in ['rzye', 'rzmre']:
+                if magnitude >= 8:
+                    likely_unit = "元（正常）"
+                elif magnitude >= 5:
+                    likely_unit = "万元"
+                    warning = "融资数据单位可能是万元，预期为元"
+                else:
+                    likely_unit = "可能有问题"
+                    
+            elif 'amount' in col.lower():  # 资金流向金额
+                if magnitude >= 6:
+                    likely_unit = "元"
+                    warning = "资金流向单位可能是元，预期为万元"
+                elif magnitude >= 2:
+                    likely_unit = "万元（正常）"
+                else:
+                    likely_unit = "可能有问题"
+            
+            results[col] = {
+                "min": min_val,
+                "max": max_val,
+                "mean": mean_val,
+                "magnitude": magnitude,
+                "likely_unit": likely_unit,
+                "expected_unit": default_units.get(col, "未知"),
+                "warning": warning
+            }
+        
+        # 输出警告
+        for col, info in results.items():
+            if info.get("warning"):
+                logger.warning(f"⚠️ 数据单位警告 - {col}: {info['warning']}")
+        
+        return results
+    
+    def print_data_summary(
+        self,
+        df: pd.DataFrame,
+        title: str = "数据摘要"
+    ) -> None:
+        """
+        打印数据摘要（用于调试数据单位问题）
+        
+        Parameters
+        ----------
+        df : pd.DataFrame
+            要检查的数据
+        title : str
+            标题
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoader()
+        >>> flow = loader.fetch_moneyflow("000001", "20240101", "20240115")
+        >>> loader.print_data_summary(flow, "资金流向数据")
+        """
+        print(f"\n{'='*60}")
+        print(f"📊 {title}")
+        print(f"{'='*60}")
+        print(f"行数: {len(df)}, 列数: {len(df.columns)}")
+        print(f"\n前5行样本:")
+        print(df.head())
+        
+        # 数值列统计
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if numeric_cols:
+            print(f"\n数值列统计:")
+            for col in numeric_cols[:10]:  # 最多显示10列
+                series = df[col].dropna()
+                if len(series) > 0:
+                    print(f"  {col:25s}: min={series.min():>15,.2f}, "
+                          f"max={series.max():>15,.2f}, "
+                          f"mean={series.mean():>15,.2f}")
+        
+        # 单位验证
+        validation = self.validate_data_units(df)
+        if any(v.get("warning") for v in validation.values()):
+            print(f"\n⚠️ 单位警告:")
+            for col, info in validation.items():
+                if info.get("warning"):
+                    print(f"  {col}: {info['warning']}")
+        
+        print(f"{'='*60}\n")
 
 
 # ==================== 便捷函数 ====================

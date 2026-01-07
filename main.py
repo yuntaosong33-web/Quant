@@ -52,6 +52,13 @@ from src import (
     send_pushplus_msg,
 )
 
+# 导入因子 IC 计算函数
+try:
+    from src.features import calculate_factor_ic, calculate_forward_returns
+except ImportError:
+    calculate_factor_ic = None
+    calculate_forward_returns = None
+
 # 导入 LLM 熔断器异常（用于风控处理）
 try:
     from src.llm_client import LLMCircuitBreakerError
@@ -67,6 +74,93 @@ DATA_RAW_PATH = Path("data/raw")
 DATA_PROCESSED_PATH = Path("data/processed")
 REPORTS_PATH = Path("reports")
 LOGS_PATH = Path("logs")
+
+
+def is_trading_day(
+    date: Optional[pd.Timestamp] = None,
+    tushare_loader: Optional["TushareDataLoader"] = None,
+    config: Optional[Dict[str, Any]] = None
+) -> bool:
+    """
+    检查指定日期是否为A股交易日
+    
+    使用 Tushare 交易日历进行判断，避免周末和节假日误触发更新流程。
+    
+    Parameters
+    ----------
+    date : Optional[pd.Timestamp]
+        要检查的日期，默认为今天
+    tushare_loader : Optional[TushareDataLoader]
+        Tushare 数据加载器实例
+    config : Optional[Dict[str, Any]]
+        配置参数
+    
+    Returns
+    -------
+    bool
+        True 表示是交易日，False 表示非交易日
+    
+    Notes
+    -----
+    - 优先使用 Tushare 交易日历
+    - 如果 Tushare 不可用，使用简单的周末判断作为回退
+    """
+    logger = logging.getLogger(__name__)
+    
+    if date is None:
+        date = pd.Timestamp.now().normalize()
+    elif isinstance(date, str):
+        date = pd.Timestamp(date).normalize()
+    else:
+        date = date.normalize()
+    
+    # 检查配置是否启用交易日历校验
+    if config is not None:
+        calendar_config = config.get("trading_calendar", {})
+        if not calendar_config.get("check_enabled", True):
+            logger.debug("交易日历校验已禁用，默认视为交易日")
+            return True
+    
+    # 方法1: 使用 Tushare 交易日历
+    if tushare_loader is not None:
+        try:
+            # 获取交易日历
+            trade_date_str = date.strftime("%Y%m%d")
+            
+            # Tushare 获取交易日历 (trade_cal)
+            if hasattr(tushare_loader, 'pro') and tushare_loader.pro is not None:
+                # 获取当月的交易日历
+                start_date = date.replace(day=1).strftime("%Y%m%d")
+                end_date = (date + pd.DateOffset(months=1)).replace(day=1).strftime("%Y%m%d")
+                
+                cal_df = tushare_loader.pro.trade_cal(
+                    exchange='SSE',
+                    start_date=start_date,
+                    end_date=end_date,
+                    fields='cal_date,is_open'
+                )
+                
+                if cal_df is not None and not cal_df.empty:
+                    # 检查指定日期是否为交易日
+                    day_info = cal_df[cal_df['cal_date'] == trade_date_str]
+                    if not day_info.empty:
+                        is_open = day_info.iloc[0]['is_open'] == 1
+                        if not is_open:
+                            logger.info(f"{date.strftime('%Y-%m-%d')} 非交易日（Tushare 交易日历）")
+                        return is_open
+        except Exception as e:
+            logger.warning(f"Tushare 交易日历获取失败: {e}，使用回退判断")
+    
+    # 方法2: 回退到简单周末判断
+    # 周六=5, 周日=6
+    if date.dayofweek >= 5:
+        logger.info(f"{date.strftime('%Y-%m-%d')} 非交易日（周末）")
+        return False
+    
+    # 如果无法确定，默认视为交易日
+    logger.debug(f"{date.strftime('%Y-%m-%d')} 默认视为交易日")
+    return True
+
 
 # 确保目录存在
 for path in [DATA_RAW_PATH, DATA_PROCESSED_PATH, REPORTS_PATH, LOGS_PATH]:
@@ -1411,6 +1505,193 @@ class DailyUpdateRunner:
         
         return rsi
     
+    def calculate_and_log_factor_ic(self) -> Optional[pd.DataFrame]:
+        """
+        计算因子 IC 并记录日志
+        
+        使用前瞻收益计算各因子的 Information Coefficient，
+        评估因子的预测能力。
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            因子 IC 统计结果，如果无法计算则返回 None
+        
+        Notes
+        -----
+        - IC > 0.03 被视为有效因子
+        - IC_IR > 0.5 表示因子稳定性好
+        - 正 IC 比例 > 60% 表示方向稳定
+        """
+        if calculate_factor_ic is None:
+            self.logger.warning("calculate_factor_ic 函数未导入，跳过 IC 监控")
+            return None
+        
+        if self.factor_data is None or self.factor_data.empty:
+            self.logger.warning("factor_data 为空，无法计算因子 IC")
+            return None
+        
+        # 获取 IC 监控配置
+        ic_config = self.config.get("ic_monitor", {})
+        if not ic_config.get("enabled", True):
+            self.logger.debug("IC 监控未启用，跳过")
+            return None
+        
+        try:
+            # 计算前瞻收益（如果不存在）
+            lookback_days = ic_config.get("lookback_days", 5)
+            return_col = f'forward_return_{lookback_days}d'
+            
+            factor_df = self.factor_data.copy()
+            
+            if return_col not in factor_df.columns:
+                # 使用 calculate_forward_returns 或手动计算
+                if calculate_forward_returns is not None:
+                    factor_df = calculate_forward_returns(
+                        factor_df, 
+                        periods=[lookback_days],
+                        stock_col='stock_code',
+                        price_col='close'
+                    )
+                else:
+                    # 手动计算前瞻收益
+                    if 'stock_code' in factor_df.columns:
+                        factor_df[return_col] = factor_df.groupby('stock_code')['close'].transform(
+                            lambda x: x.shift(-lookback_days) / x - 1
+                        )
+                    else:
+                        factor_df[return_col] = factor_df['close'].shift(-lookback_days) / factor_df['close'] - 1
+            
+            # 获取要监控的因子列表
+            monitored_factors = ic_config.get("monitored_factors", [
+                "momentum_composite_zscore",
+                "small_cap_zscore",
+                "turnover_5d_zscore",
+                "quality_composite_zscore",
+                "value_composite_zscore",
+                "sharpe_20_zscore",
+                "roc_20_zscore"
+            ])
+            
+            # 过滤出实际存在的因子列
+            existing_factors = [f for f in monitored_factors if f in factor_df.columns]
+            
+            if not existing_factors:
+                self.logger.warning("没有可监控的因子列")
+                return None
+            
+            # 确定日期列
+            date_col = 'date' if 'date' in factor_df.columns else 'trade_date'
+            
+            # 计算 IC
+            ic_df = calculate_factor_ic(
+                factor_df,
+                factor_cols=existing_factors,
+                return_col=return_col,
+                date_col=date_col,
+                log_results=True  # 在函数内部输出日志
+            )
+            
+            # 缓存 IC 结果用于报告
+            self._factor_ic_results = ic_df
+            
+            return ic_df
+            
+        except Exception as e:
+            self.logger.warning(f"因子 IC 计算失败: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            return None
+    
+    def _generate_ic_report_section(self, format: str = "markdown") -> str:
+        """
+        生成因子 IC 监控报告片段
+        
+        Parameters
+        ----------
+        format : str
+            报告格式，'markdown' 或 'html'
+        
+        Returns
+        -------
+        str
+            报告片段
+        """
+        if not hasattr(self, '_factor_ic_results') or self._factor_ic_results is None:
+            return ""
+        
+        ic_df = self._factor_ic_results
+        if ic_df.empty:
+            return ""
+        
+        ic_threshold = self.config.get("ic_monitor", {}).get("ic_threshold", 0.03)
+        
+        if format == "markdown":
+            lines = [
+                "",
+                "## 因子有效性监控",
+                "",
+                "| 因子 | IC均值 | IC_IR | 正IC比例 | 状态 |",
+                "|------|--------|-------|---------|------|",
+            ]
+            
+            for _, row in ic_df.iterrows():
+                status = "有效 ✅" if row['ic_mean'] > ic_threshold else (
+                    "边缘 ⚠️" if row['ic_mean'] > ic_threshold / 2 else "失效 ❌"
+                )
+                lines.append(
+                    f"| {row['factor']} | {row['ic_mean']:.4f} | "
+                    f"{row['ic_ir']:.2f} | {row['ic_positive_ratio']:.1%} | {status} |"
+                )
+            
+            lines.append("")
+            return "\n".join(lines)
+        
+        elif format == "html":
+            rows_html = ""
+            for _, row in ic_df.iterrows():
+                if row['ic_mean'] > ic_threshold:
+                    status = '<span style="color: green;">有效 ✅</span>'
+                    row_class = 'ic-valid'
+                elif row['ic_mean'] > ic_threshold / 2:
+                    status = '<span style="color: orange;">边缘 ⚠️</span>'
+                    row_class = 'ic-marginal'
+                else:
+                    status = '<span style="color: red;">失效 ❌</span>'
+                    row_class = 'ic-invalid'
+                
+                rows_html += f"""
+                <tr class="{row_class}">
+                    <td>{row['factor']}</td>
+                    <td>{row['ic_mean']:.4f}</td>
+                    <td>{row['ic_ir']:.2f}</td>
+                    <td>{row['ic_positive_ratio']:.1%}</td>
+                    <td>{status}</td>
+                </tr>
+                """
+            
+            return f"""
+            <div class="ic-monitor-section">
+                <h2>📊 因子有效性监控</h2>
+                <table class="ic-table">
+                    <thead>
+                        <tr>
+                            <th>因子</th>
+                            <th>IC均值</th>
+                            <th>IC_IR</th>
+                            <th>正IC比例</th>
+                            <th>状态</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+            </div>
+            """
+        
+        return ""
+    
     def is_rebalance_day(self, date: Optional[pd.Timestamp] = None) -> bool:
         """
         检查是否为调仓日（月末最后一个交易日）
@@ -1893,6 +2174,16 @@ class DailyUpdateRunner:
             weight = amount / total_target
             lines.append(f"| {stock} | ¥{amount:,.0f} | {weight:.2%} |")
         
+        # 添加因子 IC 监控部分
+        ic_section = self._generate_ic_report_section(format="markdown")
+        if ic_section:
+            lines.append(ic_section)
+        
+        # 添加历史业绩统计部分
+        performance_section = self._generate_performance_report_section(format="markdown")
+        if performance_section:
+            lines.append(performance_section)
+        
         lines.extend([
             f"",
             f"---",
@@ -2060,6 +2351,36 @@ class DailyUpdateRunner:
             color: #666;
             padding: 2rem;
         }}
+        .ic-monitor-section {{
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .ic-monitor-section h2 {{
+            font-size: 1.3rem;
+            margin-bottom: 1rem;
+            color: #00d9ff;
+        }}
+        .ic-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        .ic-table th, .ic-table td {{
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .ic-valid {{
+            background: rgba(0, 255, 136, 0.1);
+        }}
+        .ic-marginal {{
+            background: rgba(255, 165, 0, 0.1);
+        }}
+        .ic-invalid {{
+            background: rgba(255, 107, 107, 0.1);
+        }}
     </style>
 </head>
 <body>
@@ -2141,6 +2462,10 @@ class DailyUpdateRunner:
             </table>
         </div>
         
+        {self._generate_ic_report_section(format="html")}
+        
+        {self._generate_performance_report_section(format="html")}
+        
         <p class="footer">本报告由 A股量化交易系统 自动生成</p>
     </div>
 </body>
@@ -2173,6 +2498,239 @@ class DailyUpdateRunner:
         
         self.logger.info(f"报告已保存至 {report_path}")
         return report_path
+    
+    def update_performance_history(self) -> None:
+        """
+        更新历史业绩记录
+        
+        记录每日的净值、持仓数量、日收益等信息，用于生成历史对比报告。
+        """
+        history_config = self.config.get("performance_history", {})
+        if not history_config.get("enabled", True):
+            self.logger.debug("历史业绩记录未启用，跳过")
+            return
+        
+        history_path = Path(history_config.get(
+            "file_path", 
+            "data/processed/performance_history.json"
+        ))
+        
+        # 加载现有历史
+        history = {}
+        if history_path.exists():
+            try:
+                with open(history_path, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except Exception as e:
+                self.logger.warning(f"加载历史业绩失败: {e}")
+        
+        # 计算今日数据
+        today_str = self.today.strftime('%Y-%m-%d')
+        total_value = sum(self.target_positions.values()) if self.target_positions else 0
+        
+        # 计算日收益（与昨日对比）
+        yesterday = (self.today - timedelta(days=1)).strftime('%Y-%m-%d')
+        yesterday_value = history.get(yesterday, {}).get('total_value', total_value)
+        daily_return = (total_value / yesterday_value - 1) if yesterday_value > 0 else 0
+        
+        # 计算净值（基于初始资金）
+        initial_capital = self.config.get("portfolio", {}).get("total_capital", 300000)
+        nav = total_value / initial_capital if initial_capital > 0 else 1.0
+        
+        # 记录今日数据
+        history[today_str] = {
+            'nav': nav,
+            'total_value': total_value,
+            'positions': len(self.target_positions),
+            'daily_return': daily_return
+        }
+        
+        # 限制历史记录数量
+        max_days = history_config.get("max_days", 365)
+        if len(history) > max_days:
+            # 按日期排序并保留最近的记录
+            sorted_dates = sorted(history.keys(), reverse=True)[:max_days]
+            history = {k: history[k] for k in sorted_dates}
+        
+        # 保存
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(history_path, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            self.logger.info(f"历史业绩已更新: NAV={nav:.4f}, 日收益={daily_return:.2%}")
+        except Exception as e:
+            self.logger.warning(f"保存历史业绩失败: {e}")
+    
+    def get_performance_stats(self, days: int = 30) -> Dict[str, Any]:
+        """
+        获取历史业绩统计
+        
+        Parameters
+        ----------
+        days : int
+            统计天数，默认 30 天
+        
+        Returns
+        -------
+        Dict[str, Any]
+            业绩统计，包含：
+            - total_return: 累计收益率
+            - max_drawdown: 最大回撤
+            - sharpe_ratio: 夏普比率（年化）
+            - win_rate: 日胜率
+            - avg_daily_return: 平均日收益
+            - volatility: 日波动率
+            - nav_series: 净值序列（用于绘图）
+        """
+        history_config = self.config.get("performance_history", {})
+        history_path = Path(history_config.get(
+            "file_path", 
+            "data/processed/performance_history.json"
+        ))
+        
+        if not history_path.exists():
+            return {}
+        
+        try:
+            with open(history_path, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        except Exception:
+            return {}
+        
+        if len(history) < 2:
+            return {}
+        
+        # 按日期排序
+        sorted_dates = sorted(history.keys())[-days:]
+        
+        # 提取数据
+        navs = [history[d].get('nav', 1.0) for d in sorted_dates]
+        returns = [history[d].get('daily_return', 0.0) for d in sorted_dates]
+        
+        returns_array = np.array(returns)
+        navs_array = np.array(navs)
+        
+        # 累计收益
+        total_return = navs_array[-1] / navs_array[0] - 1 if navs_array[0] > 0 else 0
+        
+        # 最大回撤
+        peak = np.maximum.accumulate(navs_array)
+        drawdown = (navs_array - peak) / peak
+        max_drawdown = abs(drawdown.min()) if len(drawdown) > 0 else 0
+        
+        # 平均日收益和波动率
+        avg_daily_return = returns_array.mean() if len(returns_array) > 0 else 0
+        volatility = returns_array.std() if len(returns_array) > 1 else 0
+        
+        # 夏普比率（年化）
+        risk_free = self.config.get("portfolio", {}).get("risk_free_rate", 0.02)
+        daily_rf = risk_free / 252
+        if volatility > 0:
+            sharpe_ratio = (avg_daily_return - daily_rf) / volatility * np.sqrt(252)
+        else:
+            sharpe_ratio = 0
+        
+        # 胜率
+        win_rate = (returns_array > 0).mean() if len(returns_array) > 0 else 0
+        
+        return {
+            'total_return': total_return,
+            'max_drawdown': max_drawdown,
+            'sharpe_ratio': sharpe_ratio,
+            'win_rate': win_rate,
+            'avg_daily_return': avg_daily_return,
+            'volatility': volatility,
+            'trading_days': len(sorted_dates),
+            'nav_series': {d: history[d].get('nav', 1.0) for d in sorted_dates}
+        }
+    
+    def _generate_performance_report_section(self, format: str = "markdown") -> str:
+        """
+        生成历史业绩报告片段
+        
+        Parameters
+        ----------
+        format : str
+            报告格式，'markdown' 或 'html'
+        
+        Returns
+        -------
+        str
+            报告片段
+        """
+        stats = self.get_performance_stats(30)
+        if not stats:
+            return ""
+        
+        if format == "markdown":
+            lines = [
+                "",
+                "## 历史业绩统计 (近30日)",
+                "",
+                "| 指标 | 数值 |",
+                "|------|------|",
+                f"| 累计收益 | {stats['total_return']:.2%} |",
+                f"| 最大回撤 | {stats['max_drawdown']:.2%} |",
+                f"| 夏普比率 | {stats['sharpe_ratio']:.2f} |",
+                f"| 日胜率 | {stats['win_rate']:.1%} |",
+                f"| 平均日收益 | {stats['avg_daily_return']:.3%} |",
+                f"| 日波动率 | {stats['volatility']:.3%} |",
+                f"| 交易天数 | {stats['trading_days']} |",
+                "",
+            ]
+            
+            # 添加净值走势（简化版，最近10天）
+            nav_series = stats.get('nav_series', {})
+            if nav_series:
+                lines.append("### 净值走势 (近10日)")
+                lines.append("")
+                lines.append("| 日期 | 净值 |")
+                lines.append("|------|------|")
+                recent_navs = list(nav_series.items())[-10:]
+                for date, nav in recent_navs:
+                    lines.append(f"| {date} | {nav:.4f} |")
+                lines.append("")
+            
+            return "\n".join(lines)
+        
+        elif format == "html":
+            nav_series = stats.get('nav_series', {})
+            nav_rows = ""
+            if nav_series:
+                recent_navs = list(nav_series.items())[-10:]
+                for date, nav in recent_navs:
+                    nav_rows += f"<tr><td>{date}</td><td>{nav:.4f}</td></tr>"
+            
+            return f"""
+            <div class="card">
+                <h2>📈 历史业绩统计 (近30日)</h2>
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-value">{stats['total_return']:.2%}</div>
+                        <div class="stat-label">累计收益</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">{stats['max_drawdown']:.2%}</div>
+                        <div class="stat-label">最大回撤</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">{stats['sharpe_ratio']:.2f}</div>
+                        <div class="stat-label">夏普比率</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">{stats['win_rate']:.1%}</div>
+                        <div class="stat-label">日胜率</div>
+                    </div>
+                </div>
+                <h3 style="margin-top: 1rem; color: #888;">净值走势 (近10日)</h3>
+                <table>
+                    <thead><tr><th>日期</th><th>净值</th></tr></thead>
+                    <tbody>{nav_rows}</tbody>
+                </table>
+            </div>
+            """
+        
+        return ""
 
 
 def _format_orders_for_push(
@@ -2423,6 +2981,41 @@ def run_daily_update(
         运行是否成功
     """
     logger = logging.getLogger(__name__)
+    
+    # Step 0: 交易日历校验
+    # 加载配置以检查是否启用交易日历校验
+    if config is None:
+        try:
+            config = load_config(str(CONFIG_PATH))
+        except Exception:
+            config = {}
+    
+    calendar_config = config.get("trading_calendar", {})
+    if calendar_config.get("check_enabled", True):
+        # 创建临时 Tushare loader 用于交易日历查询
+        try:
+            tushare_config = config.get("tushare", {})
+            api_token = tushare_config.get("api_token") or os.environ.get("TUSHARE_TOKEN", "")
+            if api_token:
+                temp_loader = TushareDataLoader(
+                    api_token=api_token,
+                    cache_dir=tushare_config.get("cache_dir", "data/tushare_cache")
+                )
+                if not is_trading_day(tushare_loader=temp_loader, config=config):
+                    logger.info("=" * 60)
+                    logger.info("今日非交易日，跳过每日更新流程")
+                    logger.info("=" * 60)
+                    return True  # 非交易日视为成功完成
+            else:
+                # 无 token 时使用简单周末判断
+                if not is_trading_day(config=config):
+                    logger.info("=" * 60)
+                    logger.info("今日非交易日，跳过每日更新流程")
+                    logger.info("=" * 60)
+                    return True
+        except Exception as e:
+            logger.warning(f"交易日历校验失败: {e}，继续执行更新流程")
+    
     logger.info("=" * 60)
     logger.info("开始每日更新流程")
     if no_llm:
@@ -2472,14 +3065,74 @@ def run_daily_update(
             logger.error("因子计算失败")
             return False
         
+        # Step 4.5: 计算因子 IC 监控
+        ic_config = runner.config.get("ic_monitor", {})
+        if ic_config.get("enabled", True):
+            logger.info("Step 4.5/8: 计算因子 IC 监控")
+            ic_results = runner.calculate_and_log_factor_ic()
+            
+            # 因子失效熔断检测
+            if ic_config.get("circuit_breaker_enabled", False) and ic_results is not None:
+                ic_threshold = ic_config.get("circuit_breaker_ic_threshold", 0.01)
+                ir_threshold = ic_config.get("circuit_breaker_ir_threshold", 0.3)
+                
+                breaker_result = runner.strategy.apply_factor_circuit_breaker(
+                    ic_results,
+                    ic_threshold=ic_threshold,
+                    ir_threshold=ir_threshold
+                )
+                
+                if breaker_result:
+                    logger.warning(f"因子熔断已触发: {list(breaker_result.keys())}")
+        
         # Step 5: 检查是否调仓日
         is_rebalance = force_rebalance or runner.is_rebalance_day()
+        
+        # 持仓偏移检测（非调仓日时检查是否需要强制调仓）
+        drift_config = runner.config.get("position_drift", {})
+        if not is_rebalance and drift_config.get("check_enabled", True):
+            # 加载上次的目标持仓进行对比
+            last_target_path = DATA_PROCESSED_PATH / f"target_positions_latest.json"
+            last_target_positions = {}
+            
+            if last_target_path.exists():
+                try:
+                    with open(last_target_path, 'r', encoding='utf-8') as f:
+                        last_data = json.load(f)
+                        last_target_positions = last_data.get("positions", {})
+                except Exception as e:
+                    logger.warning(f"加载上次目标持仓失败: {e}")
+            
+            if last_target_positions and runner.current_positions:
+                max_drift = drift_config.get("max_drift", 0.15)
+                force_by_drift, drift_value, _ = runner.strategy.check_position_drift(
+                    runner.current_positions,
+                    last_target_positions,
+                    max_drift=max_drift
+                )
+                
+                if force_by_drift:
+                    logger.warning(
+                        f"持仓偏移 {drift_value:.1%} 超过阈值 {max_drift:.1%}，强制触发调仓"
+                    )
+                    is_rebalance = True
         
         if is_rebalance:
             logger.info("Step 5/8: 生成目标持仓（调仓日）")
             if not runner.generate_target_positions():
                 logger.error("目标持仓生成失败")
                 return False
+            
+            # 保存最新目标持仓用于偏移检测
+            try:
+                latest_path = DATA_PROCESSED_PATH / "target_positions_latest.json"
+                with open(latest_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'date': runner.today.strftime('%Y-%m-%d'),
+                        'positions': runner.target_positions
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"保存最新目标持仓失败: {e}")
         else:
             logger.info("Step 5/8: 非调仓日，跳过持仓生成")
             runner.target_positions = runner.current_positions.copy()
@@ -2499,6 +3152,10 @@ def run_daily_update(
         # Step 7: 更新并保存持仓
         logger.info("Step 7/8: 更新持仓记录")
         runner.save_current_holdings(buy_orders, sell_orders)
+        
+        # Step 7.5: 更新历史业绩记录
+        if runner.config.get("performance_history", {}).get("enabled", True):
+            runner.update_performance_history()
         
         # Step 8: 发送微信推送通知
         logger.info("Step 8/8: 发送微信通知")
