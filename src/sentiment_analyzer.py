@@ -777,6 +777,21 @@ class AsyncNewsFetcher:
                 logger.warning(f"获取新闻失败 {stock_code}: {e}")
                 return (stock_code, "")
     
+    def _get_tushare_loader(self):
+        """
+        获取或创建 Tushare 数据加载器（单例模式）
+        
+        避免为每只股票都创建新的 loader 实例。
+        """
+        if not hasattr(self, '_tushare_loader') or self._tushare_loader is None:
+            try:
+                from .tushare_loader import TushareDataLoader
+                self._tushare_loader = TushareDataLoader()
+            except Exception as e:
+                logger.warning(f"创建 TushareDataLoader 失败: {e}")
+                return None
+        return self._tushare_loader
+    
     def _fetch_news_sync(self, stock_code: str, date: str) -> str:
         """
         同步获取新闻（在线程池中执行）
@@ -796,19 +811,16 @@ class AsyncNewsFetcher:
             新闻内容
         """
         try:
-            from .tushare_loader import TushareDataLoader
-        except ImportError:
-            logger.warning("tushare_loader 未安装")
-            return ""
-        
-        try:
             # 标准化股票代码
             clean_code = stock_code.replace(".", "").replace("SZ", "").replace("SH", "")
             if len(clean_code) > 6:
                 clean_code = clean_code[:6]
             
-            # 使用 Tushare 获取新闻
-            loader = TushareDataLoader()
+            # 使用单例 loader（避免重复创建）
+            loader = self._get_tushare_loader()
+            if loader is None:
+                return ""
+            
             news_text = loader.fetch_stock_news(clean_code, days_back=7)
             
             if not news_text:

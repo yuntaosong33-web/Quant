@@ -2258,6 +2258,40 @@ class FactorCalculator:
         try:
             date_col = 'date' if 'date' in result.columns else 'trade_date'
             
+            # 计算路径效率 efficiency_20
+            stock_col = 'stock_code' if 'stock_code' in result.columns else None
+            if 'close' in result.columns:
+                if stock_col:
+                    result['close_shift_20'] = result.groupby(stock_col)['close'].shift(20)
+                    result['direct_dist'] = (result['close'] - result['close_shift_20']).abs()
+                    result['price_diff_abs'] = result.groupby(stock_col)['close'].diff().abs()
+                    result['actual_path'] = result.groupby(stock_col)['price_diff_abs'].transform(
+                        lambda x: x.rolling(20, min_periods=10).sum()
+                    )
+                else:
+                    result['close_shift_20'] = result['close'].shift(20)
+                    result['direct_dist'] = (result['close'] - result['close_shift_20']).abs()
+                    result['price_diff_abs'] = result['close'].diff().abs()
+                    result['actual_path'] = result['price_diff_abs'].rolling(20, min_periods=10).sum()
+                
+                result['efficiency_20'] = result['direct_dist'] / result['actual_path'].replace(0, np.nan)
+                result['efficiency_20'] = result['efficiency_20'].replace([np.inf, -np.inf], np.nan).clip(0, 1)
+                result.drop(columns=['close_shift_20', 'direct_dist', 'price_diff_abs', 'actual_path'], inplace=True, errors='ignore')
+                
+                # 标准化 efficiency_20
+                if date_col in result.columns:
+                    result['efficiency_20_zscore'] = result.groupby(date_col)['efficiency_20'].transform(
+                        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                    ).fillna(0)
+                else:
+                    result['efficiency_20_zscore'] = (
+                        (result['efficiency_20'] - result['efficiency_20'].mean()) / (result['efficiency_20'].std() + 1e-8)
+                    ).fillna(0)
+                logger.info("Efficiency_20 路径效率因子计算完成")
+            else:
+                result['efficiency_20'] = np.nan
+                result['efficiency_20_zscore'] = 0.0
+            
             if 'ivol' in result.columns and 'turnover_5d' in result.columns:
                 # IVOL 取反: 低波动更好（负号使低波动股票得分更高）
                 if date_col in result.columns:
@@ -2271,10 +2305,15 @@ class FactorCalculator:
                     ivol_zscore = -(result['ivol'] - result['ivol'].mean()) / (result['ivol'].std() + 1e-8)
                     turn_zscore = (result['turnover_5d'] - result['turnover_5d'].mean()) / (result['turnover_5d'].std() + 1e-8)
                 
-                # 复合质量因子: 50% 低波动 + 50% 高换手
-                result['quality_composite_zscore'] = 0.5 * ivol_zscore.fillna(0) + 0.5 * turn_zscore.fillna(0)
+                # 升级版复合质量因子 v2: 50% 换手率 + 30% 低波动 + 20% 路径效率
+                efficiency_zscore = result['efficiency_20_zscore'] if 'efficiency_20_zscore' in result.columns else 0.0
+                result['quality_composite_zscore'] = (
+                    0.50 * turn_zscore.fillna(0) +       # 换手率/流动性
+                    0.30 * ivol_zscore.fillna(0) +       # 低波动（反向）
+                    0.20 * efficiency_zscore             # 路径效率
+                )
                 result['quality_composite_zscore'] = result['quality_composite_zscore'].fillna(0)
-                logger.info("Quality_Composite 因子计算完成 (50% 低IVOL + 50% 高换手率)")
+                logger.info("Quality_Composite v2 因子完成 (50% 换手率 + 30% 低IVOL + 20% 路径效率)")
             else:
                 result['quality_composite_zscore'] = 0.0
                 logger.warning("复合质量因子所需数据不完整，使用默认值 0")
@@ -2330,24 +2369,37 @@ class FactorCalculator:
                     else:
                         result[zscore_col] = 0.0
                 
-                # 重新计算复合动量因子
-                # 升级配方: 35% ROC + 25% Sharpe + 20% Alpha001 + 10% Alpha004 + 10% Alpha005
+                # 重新计算复合动量因子 v2
+                # 升级配方 v2: 30% ROC + 20% Sharpe + 15% α001 + 10% α002 + 10% α005 + 10% Efficiency - 5% α003
                 # - ROC: 价格动量
                 # - Sharpe: 风险调整后动量
                 # - Alpha001: 量价配合（收盘 vs VWAP）
-                # - Alpha004: 成交量加速
+                # - Alpha002: 价格振幅（高振幅=主力活跃）
+                # - Alpha003: 量价背离（反向使用，背离=危险信号）
                 # - Alpha005: 尾盘强度
+                # - Efficiency: 路径效率（趋势质量）
+                
+                # 确保 alpha_002 和 alpha_003 存在
+                if 'alpha_002_zscore' not in result.columns:
+                    result['alpha_002_zscore'] = 0.0
+                if 'alpha_003_zscore' not in result.columns:
+                    result['alpha_003_zscore'] = 0.0
+                if 'efficiency_20_zscore' not in result.columns:
+                    result['efficiency_20_zscore'] = 0.0
+                
                 result['momentum_composite_zscore'] = (
-                    0.35 * result['roc_20_zscore'].fillna(0) + 
-                    0.25 * result['sharpe_20_zscore'].fillna(0) + 
-                    0.20 * result['alpha_001_zscore'].fillna(0) +
-                    0.10 * result['alpha_004_zscore'].fillna(0) +
-                    0.10 * result['alpha_005_zscore'].fillna(0)
+                    0.30 * result['roc_20_zscore'].fillna(0) +                    # 价格动量
+                    0.20 * result['sharpe_20_zscore'].fillna(0) +                 # 风险调整
+                    0.15 * result['alpha_001_zscore'].fillna(0) +                 # VWAP 配合
+                    0.10 * result['alpha_002_zscore'].fillna(0) +                 # 价格振幅
+                    0.10 * result['alpha_005_zscore'].fillna(0) +                 # 尾盘强度
+                    0.10 * result['efficiency_20_zscore'].fillna(0) +             # 路径效率
+                    0.05 * (-result['alpha_003_zscore'].fillna(0))                # 量价背离惩罚
                 )
                 result['momentum_composite_zscore'] = result['momentum_composite_zscore'].fillna(0)
                 
                 logger.info(
-                    "动量因子已升级: 35% ROC + 25% Sharpe + 20% Alpha001 + 10% Alpha004 + 10% Alpha005"
+                    "动量因子 v2 升级: 30% ROC + 20% Sharpe + 15% α001 + 10% α002 + 10% α005 + 10% Eff - 5% α003"
                 )
             except Exception as e:
                 logger.warning(f"Alpha 因子纳入动量组合失败: {e}，保持原有动量公式")
@@ -2834,33 +2886,66 @@ def z_score_normalize(
     if isinstance(factor_cols, str):
         factor_cols = [factor_cols]
     
-    result = data.copy()
+    # 内存优化：原地修改而非复制整个 DataFrame
+    result = data
     
-    def safe_zscore(x: pd.Series) -> pd.Series:
-        """安全的 Z-Score 计算"""
-        mean_val = x.mean()
-        std_val = x.std()
-        if std_val == 0 or pd.isna(std_val):
-            return pd.Series(0.0, index=x.index)
-        return (x - mean_val) / std_val
+    # 预先获取日期分组信息，避免重复计算
+    unique_dates = result[date_col].unique() if date_col in result.columns else [None]
+    n_dates = len(unique_dates)
+    
+    logger.debug(f"Z-Score 标准化: {len(factor_cols)} 个因子, {n_dates} 个日期")
     
     for col in factor_cols:
         if col not in result.columns:
-            logger.warning(f"因子列 {col} 不存在，跳过")
+            logger.debug(f"因子列 {col} 不存在，跳过")
             continue
         
         zscore_col = f'{col}_zscore'
         
-        if industry_neutral and industry_col is not None:
-            # 行业中性化：在每天每个行业内部进行标准化
-            result[zscore_col] = result.groupby([date_col, industry_col])[col].transform(
-                safe_zscore
-            )
-        else:
-            # 普通截面标准化
-            result[zscore_col] = result.groupby(date_col)[col].transform(
-                safe_zscore
-            )
+        try:
+            # 内存优化：使用向量化操作替代 groupby().transform()
+            # 这种方法内存占用更小
+            if industry_neutral and industry_col is not None and industry_col in result.columns:
+                # 行业中性化：分日期分行业计算
+                zscore_values = np.zeros(len(result))
+                for date_val in unique_dates:
+                    date_mask = result[date_col] == date_val
+                    for ind_val in result.loc[date_mask, industry_col].unique():
+                        mask = date_mask & (result[industry_col] == ind_val)
+                        if mask.sum() > 1:
+                            vals = result.loc[mask, col].values
+                            # 检查是否有足够的有效值（非 NaN）
+                            valid_count = np.sum(~np.isnan(vals))
+                            if valid_count >= 2:
+                                mean_val = np.nanmean(vals)
+                                std_val = np.nanstd(vals)
+                                if std_val > 1e-10:
+                                    zscore_values[mask] = (vals - mean_val) / std_val
+                            # 否则保持 0
+                result[zscore_col] = zscore_values
+            else:
+                # 普通截面标准化：按日期分批计算
+                zscore_values = np.zeros(len(result))
+                for date_val in unique_dates:
+                    mask = result[date_col] == date_val
+                    if mask.sum() > 1:
+                        vals = result.loc[mask, col].values
+                        # 检查是否有足够的有效值（非 NaN）
+                        valid_count = np.sum(~np.isnan(vals))
+                        if valid_count >= 2:
+                            mean_val = np.nanmean(vals)
+                            std_val = np.nanstd(vals)
+                            if std_val > 1e-10:
+                                zscore_values[mask] = (vals - mean_val) / std_val
+                        # 否则保持 0
+                result[zscore_col] = zscore_values
+            
+            # 处理 NaN
+            result[zscore_col] = result[zscore_col].fillna(0.0)
+            
+        except Exception as e:
+            logger.warning(f"因子 {col} Z-Score 标准化失败: {e}，设为 0")
+            result[zscore_col] = 0.0
     
     return result
 
@@ -3180,11 +3265,38 @@ class SentimentEngine:
         # 新闻获取缓存（避免重复获取）
         self._news_cache: Dict[str, str] = {}
         
+        # Tushare loader 单例缓存
+        self._tushare_loader = None
+        
         logger.info(
             f"SentimentEngine 初始化完成: "
             f"model={self.config.get('model', 'deepseek-chat')}, "
             f"max_concurrent={self.config.get('max_concurrent', 5)}"
         )
+    
+    def _get_tushare_loader(self):
+        """
+        获取 Tushare 数据加载器（单例模式）
+        
+        Returns
+        -------
+        TushareDataLoader or None
+            Tushare 数据加载器实例，不可用时返回 None
+        """
+        try:
+            if self._tushare_loader is not None:
+                return self._tushare_loader
+            
+            from .tushare_loader import TushareDataLoader
+            self._tushare_loader = TushareDataLoader()
+            return self._tushare_loader
+            
+        except (ImportError, ValueError) as e:
+            logger.debug(f"TushareDataLoader 不可用: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"TushareDataLoader 初始化失败: {e}")
+            return None
     
     def _create_llm_client(self) -> Any:
         """
@@ -3249,19 +3361,16 @@ class SentimentEngine:
             return self._news_cache[cache_key]
         
         try:
-            from .tushare_loader import TushareDataLoader
-        except ImportError:
-            logger.warning("tushare_loader 未安装，无法获取新闻")
-            return ""
-        
-        try:
             # 标准化股票代码（去除前缀后缀）
             clean_code = stock_code.replace(".", "").replace("SZ", "").replace("SH", "")
             if len(clean_code) > 6:
                 clean_code = clean_code[:6]
             
-            # 使用 Tushare 获取股票新闻
-            loader = TushareDataLoader()
+            # 使用单例 loader 获取股票新闻（避免重复创建）
+            loader = self._get_tushare_loader()
+            if loader is None:
+                return ""
+            
             combined_news = loader.fetch_stock_news(clean_code, days_back=7)
             
             if not combined_news:

@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 # 全局变量：追踪新闻 API 最后调用时间（跨实例共享）
 _GLOBAL_NEWS_API_LAST_CALL = 0.0
 _GLOBAL_NEWS_RATE_LIMIT_COUNT = 0
+# 全局新闻缓存（跨实例共享，避免重复调用 API）
+_GLOBAL_NEWS_CACHE: Dict[str, pd.DataFrame] = {}
 
 
 class TushareDataLoader:
@@ -126,6 +128,15 @@ class TushareDataLoader:
                 self._skip_news = tushare_config.get("skip_news", False)
                 if self._skip_news:
                     logger.info("📰 新闻获取已禁用 (tushare.skip_news=true)")
+                
+                # 读取 news_source 配置
+                self._news_source = tushare_config.get("news_source", "auto")
+                if self._news_source == "akshare":
+                    logger.info("📰 新闻数据源: AKShare (免费无限制)")
+                elif self._news_source == "tushare":
+                    logger.info("📰 新闻数据源: Tushare")
+                else:
+                    logger.debug("📰 新闻数据源: 自动切换 (Tushare -> AKShare)")
         except Exception as e:
             logger.debug(f"从配置文件读取配置失败: {e}")
         
@@ -198,6 +209,9 @@ class TushareDataLoader:
         Optional[pd.DataFrame]
             返回数据，失败返回 None
         """
+        rate_limit_count = 0  # 频率限制重试计数
+        MAX_RATE_LIMIT_RETRIES = 2  # 频率限制最大重试次数
+        
         for attempt in range(self.MAX_RETRIES):
             try:
                 self._rate_limit()
@@ -210,11 +224,36 @@ class TushareDataLoader:
             except Exception as e:
                 error_msg = str(e)
                 error_msg_lower = error_msg.lower()
+                
                 # 检查是否触发频率限制（多种错误格式）
-                rate_limit_keywords = ["每分钟最多访问", "抱歉", "频率", "rate limit", "too many", "限制"]
-                if any(kw in error_msg or kw in error_msg_lower for kw in rate_limit_keywords):
-                    logger.warning(f"触发 API 频率限制，等待 {self.RATE_LIMIT_DELAY} 秒后重试... 错误: {error_msg[:100]}")
+                rate_limit_keywords = ["每分钟最多访问", "每天最多访问", "每小时最多访问", 
+                                       "抱歉", "频率", "rate limit", "too many", "限制"]
+                is_rate_limit = any(kw in error_msg or kw in error_msg_lower for kw in rate_limit_keywords)
+                
+                if is_rate_limit:
+                    rate_limit_count += 1
+                    if rate_limit_count > MAX_RATE_LIMIT_RETRIES:
+                        logger.warning(
+                            f"API 频率限制重试次数超限 ({rate_limit_count} 次)，跳过该请求。"
+                            f"错误: {error_msg[:80]}"
+                        )
+                        return None
+                    
+                    # 检查是否为每天/每小时限制（无法通过等待解决）
+                    if "每天最多访问" in error_msg or "每小时最多访问" in error_msg:
+                        logger.warning(
+                            f"触发 Tushare 每日/每小时配额限制，无法继续请求。"
+                            f"错误: {error_msg[:80]}"
+                        )
+                        return None
+                    
+                    logger.warning(
+                        f"触发 API 频率限制 (重试 {rate_limit_count}/{MAX_RATE_LIMIT_RETRIES})，"
+                        f"等待 {self.RATE_LIMIT_DELAY} 秒... 错误: {error_msg[:80]}"
+                    )
                     time.sleep(self.RATE_LIMIT_DELAY)
+                    continue  # 频率限制重试不消耗 attempt 次数
+                
                 # 网络超时：使用指数退避
                 elif "timeout" in error_msg_lower or "timed out" in error_msg_lower:
                     wait_time = self.RETRY_DELAY * (2 ** attempt)  # 指数退避: 2, 4, 8 秒
@@ -823,8 +862,19 @@ class TushareDataLoader:
         if not all_data:
             return pd.DataFrame()
         
-        # 过滤掉全空的 DataFrame，避免 FutureWarning
-        valid_data = [df for df in all_data if not df.isna().all().all()]
+        # 过滤掉空的 DataFrame，避免 FutureWarning
+        # 1. 过滤掉完全为空的 DataFrame
+        # 2. 过滤掉只有 NaN 的 DataFrame
+        # 3. 对每个 DataFrame 删除全为 NaN 的列
+        valid_data = []
+        for df in all_data:
+            if df is None or df.empty:
+                continue
+            # 删除全为 NaN 的列
+            df_cleaned = df.dropna(axis=1, how='all')
+            if not df_cleaned.empty and not df_cleaned.isna().all().all():
+                valid_data.append(df_cleaned)
+        
         if not valid_data:
             return pd.DataFrame()
         
@@ -1062,7 +1112,12 @@ class TushareDataLoader:
         
         # 检查是否应该跳过新闻获取（频率限制保护）
         if _GLOBAL_NEWS_RATE_LIMIT_COUNT >= 3:
-            logger.warning("新闻接口频繁触发限制，本次跳过（需要更高积分权限）")
+            if _GLOBAL_NEWS_RATE_LIMIT_COUNT >= 100:
+                logger.debug("新闻接口今日配额已用完，跳过")
+            elif _GLOBAL_NEWS_RATE_LIMIT_COUNT >= 10:
+                logger.debug("新闻接口本小时配额已用完，跳过")
+            else:
+                logger.warning("新闻接口频繁触发限制，本次跳过（需要更高积分权限）")
             return pd.DataFrame()
         
         # 尝试缓存（新闻按日期和来源缓存）
@@ -1103,12 +1158,33 @@ class TushareDataLoader:
                 end_date=end_date
             )
             
-            # 成功则重置全局计数器
-            _GLOBAL_NEWS_RATE_LIMIT_COUNT = 0
+            if df is None:
+                # _fetch_with_retry 返回 None 说明可能遇到限流
+                # 增加计数器避免后续重复尝试
+                _GLOBAL_NEWS_RATE_LIMIT_COUNT += 1
+                logger.warning(
+                    f"新闻接口请求失败 (累计 {_GLOBAL_NEWS_RATE_LIMIT_COUNT} 次)，"
+                    "可能触发配额限制，使用缓存或跳过"
+                )
+                
+                # 尝试返回过期缓存作为回退
+                if cache_file.exists():
+                    try:
+                        df = pd.read_parquet(cache_file)
+                        if not df.empty:
+                            logger.info(f"使用过期缓存回退: {len(df)} 条新闻")
+                            return df
+                    except Exception:
+                        pass
+                
+                return pd.DataFrame()
             
-            if df is None or df.empty:
+            if df.empty:
                 logger.debug("无新闻数据")
                 return pd.DataFrame()
+            
+            # 成功则重置全局计数器
+            _GLOBAL_NEWS_RATE_LIMIT_COUNT = 0
             
             # 如果指定了股票代码，尝试过滤相关新闻
             if stock_code:
@@ -1133,10 +1209,16 @@ class TushareDataLoader:
             
         except Exception as e:
             error_msg = str(e)
-            # 记录频率限制（使用全局变量）
-            if "每小时" in error_msg:
+            # 记录频率限制（使用全局变量，已在函数开头声明）
+            if "每天" in error_msg:
+                # 每天限制 - 今天不再尝试
+                _GLOBAL_NEWS_RATE_LIMIT_COUNT = 100
+                logger.warning(f"⚠️ 新闻接口每天配额已用完，今日跳过新闻获取")
+                logger.warning(f"   提示：Tushare 新闻接口需要较高积分（2000+）才能解除限制")
+                logger.warning(f"   提示：可在配置中设置 llm.enable_sentiment_filter: false 暂时禁用情绪分析")
+            elif "每小时" in error_msg:
                 # 每小时限制 - 本次会话内不再尝试
-                _GLOBAL_NEWS_RATE_LIMIT_COUNT = 10  # 设置高值直接跳过
+                _GLOBAL_NEWS_RATE_LIMIT_COUNT = 10
                 logger.warning(f"⚠️ 新闻接口每小时限制已达上限，本次跳过新闻获取")
                 logger.warning(f"   提示：可在配置中设置 llm.enable_sentiment_filter: false 暂时禁用情绪分析")
             elif "每分钟" in error_msg or "频率" in error_msg.lower() or "抱歉" in error_msg:
@@ -1145,6 +1227,175 @@ class TushareDataLoader:
             else:
                 logger.warning(f"获取新闻失败: {e}")
             return pd.DataFrame()
+    
+    def _fetch_news_akshare(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        使用 AKShare 获取财经新闻（备选数据源）
+        
+        AKShare 是免费开源的数据接口，无配额限制。
+        
+        Parameters
+        ----------
+        start_date : Optional[str]
+            开始日期，格式 YYYYMMDD
+        end_date : Optional[str]
+            结束日期，格式 YYYYMMDD
+        
+        Returns
+        -------
+        pd.DataFrame
+            新闻数据，包含 datetime, title, content 列
+        
+        Notes
+        -----
+        AKShare 新闻接口:
+        - stock_news_em(): 东方财富股票新闻
+        - news_cctv(): CCTV 财经新闻
+        - stock_zh_a_alerts_cls(): 财联社快讯
+        """
+        try:
+            import akshare as ak
+        except ImportError:
+            logger.warning("AKShare 未安装，无法使用备选新闻源。安装: pip install akshare")
+            return pd.DataFrame()
+        
+        all_news = []
+        
+        # 方法1: 财联社快讯（最及时）
+        try:
+            logger.info("📰 尝试获取财联社快讯 (AKShare)...")
+            df_cls = ak.stock_zh_a_alerts_cls()
+            if df_cls is not None and not df_cls.empty:
+                # 标准化列名
+                df_cls = df_cls.rename(columns={
+                    '时间': 'datetime',
+                    '标题': 'title', 
+                    '内容': 'content'
+                })
+                
+                # 确保有必要的列
+                if 'title' not in df_cls.columns and 'content' in df_cls.columns:
+                    df_cls['title'] = df_cls['content'].str[:50]
+                if 'content' not in df_cls.columns and 'title' in df_cls.columns:
+                    df_cls['content'] = df_cls['title']
+                
+                df_cls['source'] = '财联社'
+                all_news.append(df_cls)
+                logger.info(f"财联社快讯获取成功: {len(df_cls)} 条")
+        except Exception as e:
+            logger.debug(f"财联社快讯获取失败: {e}")
+        
+        # 方法2: 东方财富股票新闻
+        try:
+            logger.info("📰 尝试获取东方财富新闻 (AKShare)...")
+            df_em = ak.stock_news_em(symbol="全部")
+            if df_em is not None and not df_em.empty:
+                df_em = df_em.rename(columns={
+                    '发布时间': 'datetime',
+                    '新闻标题': 'title',
+                    '新闻内容': 'content',
+                    '文章来源': 'source'
+                })
+                
+                if 'source' not in df_em.columns:
+                    df_em['source'] = '东方财富'
+                    
+                all_news.append(df_em)
+                logger.info(f"东方财富新闻获取成功: {len(df_em)} 条")
+        except Exception as e:
+            logger.debug(f"东方财富新闻获取失败: {e}")
+        
+        # 合并所有新闻
+        if not all_news:
+            logger.warning("AKShare 所有新闻源均获取失败")
+            return pd.DataFrame()
+        
+        result = pd.concat(all_news, ignore_index=True)
+        
+        # 标准化日期时间
+        if 'datetime' in result.columns:
+            try:
+                result['datetime'] = pd.to_datetime(result['datetime'], errors='coerce')
+                
+                # 日期过滤
+                if start_date:
+                    start_dt = pd.to_datetime(start_date)
+                    result = result[result['datetime'] >= start_dt]
+                if end_date:
+                    end_dt = pd.to_datetime(end_date) + timedelta(days=1)
+                    result = result[result['datetime'] < end_dt]
+            except Exception:
+                pass
+        
+        # 去重
+        if 'title' in result.columns:
+            result = result.drop_duplicates(subset=['title'], keep='first')
+        
+        logger.info(f"AKShare 新闻获取完成: {len(result)} 条 (合并后)")
+        return result
+    
+    def fetch_news_multi_source(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        prefer_akshare: bool = False
+    ) -> pd.DataFrame:
+        """
+        多数据源新闻获取（自动切换）
+        
+        根据配置和可用性选择数据源：
+        - tushare: 仅使用 Tushare（需要积分）
+        - akshare: 仅使用 AKShare（免费无限制）
+        - auto: 优先 Tushare，限流时自动切换到 AKShare
+        
+        Parameters
+        ----------
+        start_date : Optional[str]
+            开始日期
+        end_date : Optional[str]
+            结束日期
+        prefer_akshare : bool
+            是否优先使用 AKShare，默认 False
+        
+        Returns
+        -------
+        pd.DataFrame
+            新闻数据
+        """
+        global _GLOBAL_NEWS_RATE_LIMIT_COUNT
+        
+        # 读取配置的新闻数据源
+        news_source = getattr(self, '_news_source', 'auto')
+        
+        # 如果配置为仅使用 AKShare
+        if news_source == 'akshare':
+            logger.info("配置指定使用 AKShare 作为新闻数据源")
+            return self._fetch_news_akshare(start_date, end_date)
+        
+        # 如果配置为仅使用 Tushare
+        if news_source == 'tushare':
+            return self.fetch_news(start_date=start_date, end_date=end_date)
+        
+        # 自动模式 (auto)
+        # 如果 Tushare 已触发过任何限流（计数器 > 0），直接使用 AKShare
+        # 这样可以避免重复触发限流
+        if _GLOBAL_NEWS_RATE_LIMIT_COUNT > 0 or prefer_akshare:
+            logger.debug(f"Tushare 新闻接口已限流 (计数={_GLOBAL_NEWS_RATE_LIMIT_COUNT})，使用 AKShare")
+            return self._fetch_news_akshare(start_date, end_date)
+        
+        # 尝试 Tushare
+        df = self.fetch_news(start_date=start_date, end_date=end_date)
+        
+        # 如果 Tushare 失败，回退到 AKShare
+        if df.empty:
+            logger.info("Tushare 新闻获取失败，切换到 AKShare")
+            return self._fetch_news_akshare(start_date, end_date)
+        
+        return df
     
     def fetch_all_news_once(
         self,
@@ -1169,32 +1420,93 @@ class TushareDataLoader:
         pd.DataFrame
             所有新闻数据
         """
+        global _GLOBAL_NEWS_CACHE
+        
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
         
-        # 使用实例变量缓存，避免重复调用
-        cache_key = f"_cached_all_news_{src}_{start_date}_{end_date}"
-        if hasattr(self, cache_key):
-            cached = getattr(self, cache_key)
-            if cached is not None:
-                logger.debug(f"使用内存缓存的新闻数据: {len(cached)} 条")
+        # 使用全局缓存（跨实例共享），避免重复调用 API
+        cache_key = f"all_news_{start_date}_{end_date}"
+        if cache_key in _GLOBAL_NEWS_CACHE:
+            cached = _GLOBAL_NEWS_CACHE[cache_key]
+            if cached is not None and not cached.empty:
+                logger.debug(f"使用全局缓存的新闻数据: {len(cached)} 条")
                 return cached
         
-        # 获取所有新闻（不带股票代码过滤）
-        df = self.fetch_news(
-            stock_code=None,  # 不过滤，获取全部
+        # 获取所有新闻（使用多数据源方法，自动切换）
+        df = self.fetch_news_multi_source(
             start_date=start_date,
-            end_date=end_date,
-            src=src
+            end_date=end_date
         )
         
-        # 缓存到实例变量
-        setattr(self, cache_key, df if df is not None else pd.DataFrame())
+        # 缓存到全局变量（跨实例共享）
+        _GLOBAL_NEWS_CACHE[cache_key] = df if df is not None else pd.DataFrame()
         
         if df is not None and not df.empty:
             logger.info(f"📰 一次性获取新闻完成: {len(df)} 条，可供所有股票使用")
         
         return df if df is not None else pd.DataFrame()
+    
+    def _load_all_stock_names(self) -> None:
+        """
+        一次性加载所有股票名称到全局缓存
+        
+        避免为每只股票单独查询 API。
+        """
+        global _GLOBAL_NEWS_CACHE
+        
+        # 检查是否已加载
+        if '_stock_names_loaded' in _GLOBAL_NEWS_CACHE:
+            return
+        
+        logger.info("📋 批量加载股票名称...")
+        
+        try:
+            # 一次性获取所有上市股票
+            df = self._fetch_with_retry(
+                self.pro.stock_basic,
+                exchange='',
+                list_status='L',  # L=上市
+                fields='ts_code,name'
+            )
+            
+            if df is not None and not df.empty:
+                # 缓存所有股票名称
+                for _, row in df.iterrows():
+                    code = row['ts_code'][:6]  # 取6位代码
+                    name = row['name']
+                    _GLOBAL_NEWS_CACHE[f"stock_name_{code}"] = name
+                
+                logger.info(f"📋 股票名称加载完成: {len(df)} 只")
+            
+            _GLOBAL_NEWS_CACHE['_stock_names_loaded'] = True
+            
+        except Exception as e:
+            logger.warning(f"批量加载股票名称失败: {e}")
+            _GLOBAL_NEWS_CACHE['_stock_names_loaded'] = True  # 避免重复尝试
+    
+    def _get_stock_name(self, stock_code: str) -> Optional[str]:
+        """
+        获取股票名称（用于新闻匹配）
+        
+        Parameters
+        ----------
+        stock_code : str
+            股票代码（6位）
+        
+        Returns
+        -------
+        Optional[str]
+            股票名称，如"贵州茅台"，获取失败返回 None
+        """
+        global _GLOBAL_NEWS_CACHE
+        
+        # 确保股票名称已批量加载
+        if '_stock_names_loaded' not in _GLOBAL_NEWS_CACHE:
+            self._load_all_stock_names()
+        
+        cache_key = f"stock_name_{stock_code}"
+        return _GLOBAL_NEWS_CACHE.get(cache_key)
     
     def fetch_stock_news(
         self,
@@ -1230,17 +1542,31 @@ class TushareDataLoader:
         # 从全量新闻中筛选与该股票相关的
         stock_code_clean = stock_code.replace(".", "")[:6]
         
-        # 在标题或内容中搜索股票代码
-        mask = pd.Series([False] * len(all_news_df))
-        if "title" in all_news_df.columns:
-            mask = mask | all_news_df["title"].str.contains(stock_code_clean, na=False)
-        if "content" in all_news_df.columns:
-            mask = mask | all_news_df["content"].str.contains(stock_code_clean, na=False)
+        # 获取股票名称用于匹配（通用财经新闻通常包含名称而非代码）
+        stock_name = self._get_stock_name(stock_code_clean)
         
-        filtered_df = all_news_df[mask]
+        # 在标题或内容中搜索股票代码或名称
+        # 使用 DataFrame 的 index 创建 mask，避免 index 不匹配警告
+        mask = pd.Series(False, index=all_news_df.index)
+        
+        # 匹配条件列表
+        search_terms = [stock_code_clean]
+        if stock_name:
+            search_terms.append(stock_name)
+            # 添加简称（如"贵州茅台" -> "茅台"）
+            if len(stock_name) > 2:
+                search_terms.append(stock_name[-2:])  # 后两字
+        
+        for term in search_terms:
+            if "title" in all_news_df.columns:
+                mask = mask | all_news_df["title"].str.contains(term, na=False, regex=False)
+            if "content" in all_news_df.columns:
+                mask = mask | all_news_df["content"].str.contains(term, na=False, regex=False)
+        
+        filtered_df = all_news_df.loc[mask]
         
         if filtered_df.empty:
-            logger.debug(f"股票 {stock_code} 无相关新闻")
+            logger.debug(f"股票 {stock_code} ({stock_name or '未知'}) 无相关新闻")
             return ""
         
         # 提取标题和内容

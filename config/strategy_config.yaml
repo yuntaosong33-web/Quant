@@ -38,6 +38,13 @@ tushare:
   # 跳过新闻获取（新闻接口有严格限制：每小时2次）
   # 设为 true 时情绪分析会基于股票名称/行业进行，不获取实时新闻
   skip_news: false
+  
+  # 新闻数据源优先级（当 Tushare 不可用时自动切换）
+  # 可选值: "tushare", "akshare", "auto"
+  # - tushare: 仅使用 Tushare（需要积分）
+  # - akshare: 仅使用 AKShare（免费无限制）
+  # - auto: 优先 Tushare，限流时自动切换到 AKShare
+  news_source: "auto"
 
 # ============================================================
 # 策略配置 - 牛市进攻型策略 (Bull Market Offensive)
@@ -53,13 +60,15 @@ strategy:
   # 策略名称
   name: "Bull Market Offensive"
   
-  # ===== 因子权重配置 (牛市进攻型) =====
-  # 核心公式: Score = 0.4*Momentum + 0.3*Sentiment + 0.2*SmallCap + 0.1*Turnover
-  value_weight: 0.0       # 价值因子 - 0% (牛市不看估值)
-  quality_weight: 0.1     # 流动性因子 - 10% (高换手=高人气)
-  momentum_weight: 0.4    # 动量因子 - 40% (核心驱动)
-  size_weight: 0.2        # 小市值因子 - 20% (弹性来源)
-  sentiment_weight: 0.3   # 情绪因子 - 30% (故事驱动)
+  # ===== 因子权重配置 (大盘领涨牛市 - 2026年初) =====
+  # IC监控结果: turnover=+0.107(有效), momentum=-0.06(反向), size=-0.08(反向)
+  # 策略: 重仓换手率, 反向使用小盘因子(选大盘), 降低动量
+  # 权重绝对值之和 = 0.50 + 0.20 + 0.30 = 1.0
+  value_weight: 0.0       # 价值因子 - 0% (成长跑赢价值)
+  quality_weight: 0.50    # 换手率因子 - 50% (IC=+0.107，当前最有效)
+  momentum_weight: 0.20   # 动量因子 - 20% (IC为负，降权但不弃用)
+  size_weight: -0.30      # 市值因子 - 负30% (反向！选大盘股)
+  sentiment_weight: 0.20  # 情绪因子 - 20% (配合热点，独立加分)
   
   # ===== 选股参数 =====
   top_n: 6                # 持仓6只，分散风险
@@ -75,11 +84,11 @@ strategy:
   exclude_star: true      # 排除科创板（688开头，门槛高/流动性差）
   
   # ===== 因子列名映射 =====
-  # [牛市进攻] 使用合成动量因子 (0.6*ROC + 0.4*Sharpe)
-  value_col: "value_composite_zscore"     # 复合估值因子（权重为0，实际不使用）
-  quality_col: "turnover_5d_zscore"       # 换手率作为正向因子（高人气）
-  momentum_col: "momentum_composite_zscore"  # 合成动量因子 (0.6*ROC + 0.4*Sharpe)
-  size_col: "small_cap_zscore"            # 小市值因子
+  # [牛市进攻 v2] 使用升级版复合因子
+  value_col: "value_composite_zscore"       # 复合估值因子（权重为0，实际不使用）
+  quality_col: "quality_composite_zscore"   # 升级版质量因子 (50%换手率 + 30%低波动 + 20%路径效率)
+  momentum_col: "momentum_composite_zscore" # 升级版动量因子 (含 alpha_002/003/005 + efficiency)
+  size_col: "small_cap_zscore"              # 小市值因子
   
   # ===== 调仓配置 =====
   rebalance_frequency: "weekly"  # 周度调仓（牛市轮动快）
@@ -276,6 +285,9 @@ ic_monitor:
   # 前瞻收益窗口（交易日）
   lookback_days: 5
   
+  # IC 采样天数（减少内存占用，默认30天）
+  sample_days: 30
+  
   # 日志频率: daily, weekly
   log_frequency: "daily"
   
@@ -286,9 +298,10 @@ ic_monitor:
   ic_threshold: 0.03
   
   # 因子失效熔断配置
+  # 注意: 使用绝对值判断，IC为负表示因子方向相反，仍有预测力
   circuit_breaker_enabled: true    # 是否启用因子熔断
-  circuit_breaker_ic_threshold: 0.01   # IC低于此值触发熔断
-  circuit_breaker_ir_threshold: 0.3    # IC_IR低于此值触发熔断
+  circuit_breaker_ic_threshold: 0.005  # |IC| 低于此值触发熔断（接近无预测力）
+  circuit_breaker_ir_threshold: 0.2    # |IC_IR| 低于此值触发熔断（不稳定）
   
   # 监控的因子列表
   monitored_factors:

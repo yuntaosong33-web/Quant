@@ -947,10 +947,20 @@ class MultiFactorStrategy(BaseStrategy):
         
         # 验证权重之和（包含新增的 size_weight）
         # 注意：sentiment_weight 是额外的 Alpha 因子权重，不计入基础权重归一化
-        # 由用户配置保证合理性
+        # 支持负权重：使用绝对值之和验证
         weight_sum = self.value_weight + self.quality_weight + self.momentum_weight + self.size_weight
-        if abs(weight_sum - 1.0) > 1e-6:
-            logger.warning(f"基础因子权重之和为 {weight_sum}，建议权重之和为 1.0")
+        abs_weight_sum = abs(self.value_weight) + abs(self.quality_weight) + abs(self.momentum_weight) + abs(self.size_weight)
+        
+        # 只在绝对值之和也不为1时警告（负权重场景下代数和可能不为1）
+        if abs(weight_sum - 1.0) > 1e-6 and abs(abs_weight_sum - 1.0) > 1e-6:
+            # 如果有负权重，这是正常的（反向使用因子）
+            if self.size_weight < 0 or self.momentum_weight < 0 or self.value_weight < 0:
+                logger.info(
+                    f"因子权重配置: 代数和={weight_sum:.2f}, 绝对值和={abs_weight_sum:.2f} "
+                    f"(包含反向因子)"
+                )
+            else:
+                logger.warning(f"基础因子权重之和为 {weight_sum}，建议权重之和为 1.0")
         
         # ===== LLM 情绪分析配置 =====
         # 从配置中获取 LLM 设置
@@ -1278,24 +1288,36 @@ class MultiFactorStrategy(BaseStrategy):
         }
         
         breaker_triggered = {}
+        factor_warnings = []
         
         for _, row in ic_results.iterrows():
             factor_name = row['factor']
             ic_mean = row.get('ic_mean', 0)
             ic_ir = row.get('ic_ir', 0)
             
-            # 检查是否满足熔断条件
-            if ic_mean < ic_threshold and ic_ir < ir_threshold:
-                # 提取因子基础名称（移除 _zscore 后缀）
-                base_name = factor_name.replace('_zscore', '')
-                
-                # 查找对应的权重属性
-                weight_attr = None
-                for prefix, attr in factor_weight_mapping.items():
-                    if base_name.startswith(prefix) or base_name == prefix:
-                        weight_attr = attr
-                        break
-                
+            # 使用绝对值判断因子有效性
+            # IC 为负表示因子方向相反，仍然有预测能力，只需反向使用
+            abs_ic = abs(ic_mean)
+            abs_ir = abs(ic_ir)
+            
+            # 提取因子基础名称（移除 _zscore 后缀）
+            base_name = factor_name.replace('_zscore', '')
+            
+            # 查找对应的权重属性
+            weight_attr = None
+            for prefix, attr in factor_weight_mapping.items():
+                if base_name.startswith(prefix) or base_name == prefix:
+                    weight_attr = attr
+                    break
+            
+            # IC 为负时记录警告，建议检查因子方向
+            if ic_mean < -0.03 and weight_attr is not None:
+                factor_warnings.append(
+                    f"{factor_name}: IC={ic_mean:.4f} 为负，建议检查因子方向或反向使用"
+                )
+            
+            # 熔断条件：绝对IC < 阈值 且 绝对IR < 阈值（表示因子真正失效）
+            if abs_ic < ic_threshold and abs_ir < ir_threshold:
                 if weight_attr is not None and hasattr(self, weight_attr):
                     old_weight = getattr(self, weight_attr)
                     
@@ -1306,9 +1328,13 @@ class MultiFactorStrategy(BaseStrategy):
                         
                         logger.warning(
                             f"因子熔断触发: {factor_name} 权重 {old_weight:.0%} -> 0% "
-                            f"(IC={ic_mean:.4f} < {ic_threshold}, "
-                            f"IR={ic_ir:.2f} < {ir_threshold})"
+                            f"(|IC|={abs_ic:.4f} < {ic_threshold}, "
+                            f"|IR|={abs_ir:.2f} < {ir_threshold})"
                         )
+        
+        # 输出因子方向警告
+        for warning in factor_warnings:
+            logger.warning(f"因子方向警告: {warning}")
         
         if breaker_triggered:
             # 重新归一化剩余权重
@@ -1629,12 +1655,15 @@ class MultiFactorStrategy(BaseStrategy):
         score_components = {}
         
         # ===== 价值因子 =====
+        # 支持负权重：成长股跑赢价值股时可使用负权重
         value_contribution = pd.Series(0.0, index=data.index)
-        if self.value_col in data.columns and self.value_weight > 0:
+        if self.value_col in data.columns and self.value_weight != 0:
             value_contribution = self.value_weight * data[self.value_col].fillna(0)
             total_score += value_contribution
             score_components['value'] = data[self.value_col].fillna(0)
-        elif self.value_weight > 0:
+            if self.value_weight < 0:
+                logger.debug(f"价值因子使用反向权重: {self.value_weight:.0%} (选成长股)")
+        elif self.value_weight != 0:
             logger.warning(f"未找到价值因子列: {self.value_col}")
         
         # ===== 质量因子 =====
@@ -1642,7 +1671,7 @@ class MultiFactorStrategy(BaseStrategy):
         quality_contribution = pd.Series(0.0, index=data.index)
         is_turnover_factor = 'turnover' in self.quality_col.lower()
         
-        if self.quality_col in data.columns and self.quality_weight > 0:
+        if self.quality_col in data.columns and self.quality_weight != 0:
             raw_quality = data[self.quality_col].fillna(0)
             
             if is_turnover_factor:
@@ -1666,25 +1695,31 @@ class MultiFactorStrategy(BaseStrategy):
             quality_contribution = self.quality_weight * quality_score
             total_score += quality_contribution
             score_components['quality'] = pd.Series(quality_score, index=data.index)
-        elif self.quality_weight > 0:
+        elif self.quality_weight != 0:
             logger.warning(f"未找到质量因子列: {self.quality_col}")
         
         # ===== 动量因子 =====
+        # 支持负权重：动量反转期可使用负权重
         momentum_contribution = pd.Series(0.0, index=data.index)
-        if self.momentum_col in data.columns and self.momentum_weight > 0:
+        if self.momentum_col in data.columns and self.momentum_weight != 0:
             momentum_contribution = self.momentum_weight * data[self.momentum_col].fillna(0)
             total_score += momentum_contribution
             score_components['momentum'] = data[self.momentum_col].fillna(0)
-        elif self.momentum_weight > 0:
+            if self.momentum_weight < 0:
+                logger.debug(f"动量因子使用反向权重: {self.momentum_weight:.0%} (动量反转)")
+        elif self.momentum_weight != 0:
             logger.warning(f"未找到动量因子列: {self.momentum_col}")
         
         # ===== 市值因子 =====
+        # 支持负权重：负权重表示反向使用因子（如选大盘股而非小盘股）
         size_contribution = pd.Series(0.0, index=data.index)
-        if self.size_col in data.columns and self.size_weight > 0:
+        if self.size_col in data.columns and self.size_weight != 0:
             size_contribution = self.size_weight * data[self.size_col].fillna(0)
             total_score += size_contribution
             score_components['size'] = data[self.size_col].fillna(0)
-        elif self.size_weight > 0:
+            if self.size_weight < 0:
+                logger.debug(f"市值因子使用反向权重: {self.size_weight:.0%} (选大盘股)")
+        elif self.size_weight != 0:
             logger.warning(f"未找到市值因子列: {self.size_col}")
         
         # 存储分量供后续 Debug 使用

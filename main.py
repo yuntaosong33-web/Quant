@@ -1410,50 +1410,112 @@ class DailyUpdateRunner:
                 factor_data['value_composite_zscore'] = 0.0
                 self.logger.warning("缺少 ep_ratio_zscore/bp_ratio_zscore，复合价值因子为 0")
             
-            # ==================== 计算 Alpha 因子（量价配合）====================
-            # 牛市进攻型策略核心因子
+            # ==================== 计算 Alpha 因子（量价配合 + 振幅 + 背离 + 波动率 + 效率）====================
+            # 升级版 Alpha 因子组
             alpha_enabled = False
+            date_col = 'date' if 'date' in factor_data.columns else 'trade_date'
+            
             try:
                 # Alpha_001: (Close - VWAP) / VWAP，正值表示收盘价高于均价
                 if 'amount' in factor_data.columns and 'volume' in factor_data.columns:
                     vwap = factor_data['amount'] / factor_data['volume'].replace(0, np.nan)
                     factor_data['alpha_001'] = (factor_data['close'] - vwap) / vwap.replace(0, np.nan)
                     factor_data['alpha_001'] = factor_data['alpha_001'].replace([np.inf, -np.inf], np.nan)
-                    
-                    # 对 Alpha_001 进行 Z-Score 标准化（横截面）
-                    if 'date' in factor_data.columns:
-                        factor_data['alpha_001_zscore'] = factor_data.groupby('date')['alpha_001'].transform(
-                            lambda x: (x - x.mean()) / (x.std() + 1e-8)
-                        ).fillna(0)
-                    else:
-                        factor_data['alpha_001_zscore'] = (
-                            (factor_data['alpha_001'] - factor_data['alpha_001'].mean()) / 
-                            (factor_data['alpha_001'].std() + 1e-8)
-                        ).fillna(0)
-                    
                     alpha_enabled = True
-                    self.logger.info("Alpha_001 因子（量价配合）计算完成")
                 else:
-                    factor_data['alpha_001_zscore'] = 0.0
-                    self.logger.warning("缺少 amount/volume 列，Alpha_001 因子设为 0")
+                    factor_data['alpha_001'] = np.nan
+                
+                # Alpha_002: 价格振幅 = (High - Low) / Close
+                if 'high' in factor_data.columns and 'low' in factor_data.columns:
+                    factor_data['alpha_002'] = (factor_data['high'] - factor_data['low']) / factor_data['close'].replace(0, np.nan)
+                    factor_data['alpha_002'] = factor_data['alpha_002'].replace([np.inf, -np.inf], np.nan)
+                else:
+                    factor_data['alpha_002'] = np.nan
+                
+                # Alpha_003: 量价背离 = 价格变化5日 - 成交量变化5日
+                if 'close' in factor_data.columns and 'volume' in factor_data.columns:
+                    factor_data['price_change_5d'] = factor_data.groupby('stock_code')['close'].pct_change(5)
+                    factor_data['volume_change_5d'] = factor_data.groupby('stock_code')['volume'].pct_change(5)
+                    factor_data['alpha_003'] = factor_data['price_change_5d'] - factor_data['volume_change_5d']
+                    factor_data['alpha_003'] = factor_data['alpha_003'].replace([np.inf, -np.inf], np.nan)
+                    factor_data.drop(columns=['price_change_5d', 'volume_change_5d'], inplace=True, errors='ignore')
+                else:
+                    factor_data['alpha_003'] = np.nan
+                
+                # Alpha_005: 尾盘强度 = (Close - Low) / (High - Low)
+                if 'high' in factor_data.columns and 'low' in factor_data.columns:
+                    range_hl = factor_data['high'] - factor_data['low']
+                    factor_data['alpha_005'] = (factor_data['close'] - factor_data['low']) / range_hl.replace(0, np.nan)
+                    factor_data['alpha_005'] = factor_data['alpha_005'].replace([np.inf, -np.inf], np.nan).clip(0, 1)
+                else:
+                    factor_data['alpha_005'] = np.nan
+                
+                # IVOL_20: 特质波动率 = 20日收益率标准差（年化）
+                if 'close' in factor_data.columns:
+                    factor_data['returns'] = factor_data.groupby('stock_code')['close'].pct_change()
+                    factor_data['ivol_20'] = factor_data.groupby('stock_code')['returns'].transform(
+                        lambda x: x.rolling(20, min_periods=10).std() * np.sqrt(252)
+                    )
+                    factor_data['ivol_20'] = factor_data['ivol_20'].replace([np.inf, -np.inf], np.nan)
+                    factor_data.drop(columns=['returns'], inplace=True, errors='ignore')
+                else:
+                    factor_data['ivol_20'] = np.nan
+                
+                # Efficiency_20: 路径效率 = |直线距离| / 实际路径
+                if 'close' in factor_data.columns:
+                    factor_data['close_shift_20'] = factor_data.groupby('stock_code')['close'].shift(20)
+                    factor_data['direct_distance'] = (factor_data['close'] - factor_data['close_shift_20']).abs()
+                    factor_data['price_diff'] = factor_data.groupby('stock_code')['close'].diff().abs()
+                    factor_data['actual_path'] = factor_data.groupby('stock_code')['price_diff'].transform(
+                        lambda x: x.rolling(20, min_periods=10).sum()
+                    )
+                    factor_data['efficiency_20'] = factor_data['direct_distance'] / factor_data['actual_path'].replace(0, np.nan)
+                    factor_data['efficiency_20'] = factor_data['efficiency_20'].replace([np.inf, -np.inf], np.nan).clip(0, 1)
+                    factor_data.drop(columns=['close_shift_20', 'direct_distance', 'price_diff', 'actual_path'], inplace=True, errors='ignore')
+                else:
+                    factor_data['efficiency_20'] = np.nan
+                
+                # 对所有 Alpha 因子进行 Z-Score 标准化（横截面）
+                for col in ['alpha_001', 'alpha_002', 'alpha_003', 'alpha_005', 'ivol_20', 'efficiency_20']:
+                    zscore_col = f'{col}_zscore'
+                    if col in factor_data.columns and factor_data[col].notna().any():
+                        if date_col in factor_data.columns:
+                            factor_data[zscore_col] = factor_data.groupby(date_col)[col].transform(
+                                lambda x: (x - x.mean()) / (x.std() + 1e-8)
+                            ).fillna(0)
+                        else:
+                            factor_data[zscore_col] = (
+                                (factor_data[col] - factor_data[col].mean()) / 
+                                (factor_data[col].std() + 1e-8)
+                            ).fillna(0)
+                    else:
+                        factor_data[zscore_col] = 0.0
+                
+                self.logger.info("Alpha 因子计算完成: α001(VWAP), α002(振幅), α003(背离), α005(尾盘), IVOL, Efficiency")
+                
             except Exception as e:
-                factor_data['alpha_001_zscore'] = 0.0
-                self.logger.warning(f"Alpha_001 因子计算失败: {e}")
+                for col in ['alpha_001', 'alpha_002', 'alpha_003', 'alpha_005', 'ivol_20', 'efficiency_20']:
+                    factor_data[f'{col}_zscore'] = 0.0
+                self.logger.warning(f"Alpha 因子计算失败: {e}")
             
             # ==================== 计算复合动量因子 momentum_composite_zscore ====================
-            # 牛市进攻型配方: 40% ROC (涨幅) + 30% Sharpe (稳健) + 30% Alpha001 (量价配合)
+            # 升级版配方 v2: 
+            # 30% ROC + 20% Sharpe + 15% α001 + 10% α002 + 10% α005 + 10% Efficiency - 5% α003(背离)
             roc_col = 'roc_20_zscore' if 'roc_20_zscore' in factor_data.columns else None
             sharpe_col = 'sharpe_20_zscore' if 'sharpe_20_zscore' in factor_data.columns else None
-            alpha_col = 'alpha_001_zscore' if alpha_enabled else None
             
-            if roc_col and sharpe_col and alpha_col:
-                # 完整配方: 40% ROC + 30% Sharpe + 30% Alpha001
+            if roc_col and sharpe_col and alpha_enabled:
+                # 升级版完整配方 v2
                 factor_data['momentum_composite_zscore'] = (
-                    0.4 * factor_data[roc_col].fillna(0) +
-                    0.3 * factor_data[sharpe_col].fillna(0) +
-                    0.3 * factor_data[alpha_col].fillna(0)
+                    0.30 * factor_data[roc_col].fillna(0) +                           # 价格动量
+                    0.20 * factor_data[sharpe_col].fillna(0) +                        # 风险调整动量
+                    0.15 * factor_data['alpha_001_zscore'].fillna(0) +                # VWAP 配合
+                    0.10 * factor_data['alpha_002_zscore'].fillna(0) +                # 价格振幅
+                    0.10 * factor_data['alpha_005_zscore'].fillna(0) +                # 尾盘强度
+                    0.10 * factor_data['efficiency_20_zscore'].fillna(0) +            # 路径效率
+                    0.05 * (-factor_data['alpha_003_zscore'].fillna(0))               # 量价背离惩罚（反向）
                 )
-                self.logger.info("🚀 复合动量因子计算完成: 40% ROC + 30% Sharpe + 30% Alpha001")
+                self.logger.info("🚀 复合动量因子 v2 完成: 30% ROC + 20% Sharpe + 15% α001 + 10% α002 + 10% α005 + 10% Eff - 5% α003")
             elif roc_col and sharpe_col:
                 # 备选配方: 60% ROC + 40% Sharpe
                 factor_data['momentum_composite_zscore'] = (
@@ -1467,6 +1529,27 @@ class DailyUpdateRunner:
             else:
                 factor_data['momentum_composite_zscore'] = 0.0
                 self.logger.warning("无法计算复合动量因子（缺少必要因子）")
+            
+            # ==================== 计算复合质量因子 quality_composite_zscore ====================
+            # 升级版配方: 50% 换手率 + 30% 低波动 (IVOL反向) + 20% 路径效率
+            turnover_col = 'turnover_5d_zscore'
+            if turnover_col in factor_data.columns and factor_data[turnover_col].notna().any():
+                turnover_component = factor_data[turnover_col].fillna(0)
+            else:
+                turnover_component = 0.0
+            
+            # IVOL 反向使用（低波动更好）
+            ivol_component = -factor_data['ivol_20_zscore'].fillna(0) if 'ivol_20_zscore' in factor_data.columns else 0.0
+            
+            # 路径效率（高效率更好）
+            efficiency_component = factor_data['efficiency_20_zscore'].fillna(0) if 'efficiency_20_zscore' in factor_data.columns else 0.0
+            
+            factor_data['quality_composite_zscore'] = (
+                0.50 * turnover_component +      # 换手率/流动性
+                0.30 * ivol_component +           # 低波动异象（反向）
+                0.20 * efficiency_component       # 路径效率
+            )
+            self.logger.info("📊 复合质量因子计算完成: 50% 换手率 + 30% 低波动(反向) + 20% 路径效率")
             
             for alias, source in factor_alias_mapping.items():
                 if source in factor_data.columns and alias not in factor_data.columns:
@@ -1542,26 +1625,6 @@ class DailyUpdateRunner:
             lookback_days = ic_config.get("lookback_days", 5)
             return_col = f'forward_return_{lookback_days}d'
             
-            factor_df = self.factor_data.copy()
-            
-            if return_col not in factor_df.columns:
-                # 使用 calculate_forward_returns 或手动计算
-                if calculate_forward_returns is not None:
-                    factor_df = calculate_forward_returns(
-                        factor_df, 
-                        periods=[lookback_days],
-                        stock_col='stock_code',
-                        price_col='close'
-                    )
-                else:
-                    # 手动计算前瞻收益
-                    if 'stock_code' in factor_df.columns:
-                        factor_df[return_col] = factor_df.groupby('stock_code')['close'].transform(
-                            lambda x: x.shift(-lookback_days) / x - 1
-                        )
-                    else:
-                        factor_df[return_col] = factor_df['close'].shift(-lookback_days) / factor_df['close'] - 1
-            
             # 获取要监控的因子列表
             monitored_factors = ic_config.get("monitored_factors", [
                 "momentum_composite_zscore",
@@ -1573,15 +1636,43 @@ class DailyUpdateRunner:
                 "roc_20_zscore"
             ])
             
+            # 确定日期列
+            date_col = 'date' if 'date' in self.factor_data.columns else 'trade_date'
+            
             # 过滤出实际存在的因子列
-            existing_factors = [f for f in monitored_factors if f in factor_df.columns]
+            existing_factors = [f for f in monitored_factors if f in self.factor_data.columns]
             
             if not existing_factors:
                 self.logger.warning("没有可监控的因子列")
                 return None
             
-            # 确定日期列
-            date_col = 'date' if 'date' in factor_df.columns else 'trade_date'
+            # 内存优化：只提取 IC 计算所需的列，避免复制整个 DataFrame
+            required_cols = ['stock_code', date_col, 'close'] + existing_factors
+            required_cols = [c for c in required_cols if c in self.factor_data.columns]
+            factor_df = self.factor_data[required_cols].copy()
+            
+            self.logger.debug(f"IC 计算数据: {len(factor_df)} 行, {len(required_cols)} 列（内存优化）")
+            
+            if return_col not in factor_df.columns:
+                # 手动计算前瞻收益（内存优化版）
+                if 'stock_code' in factor_df.columns and 'close' in factor_df.columns:
+                    factor_df[return_col] = factor_df.groupby('stock_code')['close'].transform(
+                        lambda x: x.shift(-lookback_days) / x - 1
+                    )
+                elif 'close' in factor_df.columns:
+                    factor_df[return_col] = factor_df['close'].shift(-lookback_days) / factor_df['close'] - 1
+                else:
+                    self.logger.warning("缺少 close 列，无法计算前瞻收益")
+                    return None
+            
+            # 进一步优化：只保留最近 N 个交易日的数据（默认30天）
+            ic_sample_days = ic_config.get("sample_days", 30)
+            if date_col in factor_df.columns:
+                unique_dates = factor_df[date_col].dropna().unique()
+                if len(unique_dates) > ic_sample_days:
+                    recent_dates = sorted(unique_dates)[-ic_sample_days:]
+                    factor_df = factor_df[factor_df[date_col].isin(recent_dates)]
+                    self.logger.debug(f"IC 采样: 最近 {ic_sample_days} 个交易日, {len(factor_df)} 条记录")
             
             # 计算 IC
             ic_df = calculate_factor_ic(
@@ -1591,6 +1682,9 @@ class DailyUpdateRunner:
                 date_col=date_col,
                 log_results=True  # 在函数内部输出日志
             )
+            
+            # 释放内存
+            del factor_df
             
             # 缓存 IC 结果用于报告
             self._factor_ic_results = ic_df
@@ -3468,10 +3562,15 @@ def _generate_backtest_factor_data(
             # 20日变动率 = (Today - 20DaysAgo) / 20DaysAgo * 100
             roc_20 = df['close'].pct_change(20) * 100
         
-        # 计算 5 日平均换手率
+        # 计算 5 日平均换手率（支持多种列名）
         turnover_5d = pd.Series(np.nan, index=df.index)
-        if 'turnover' in df.columns:
-            turnover_5d = df['turnover'].rolling(5, min_periods=1).mean()
+        turnover_col = None
+        for col_name in ['turn', 'turnover', 'turnover_rate']:
+            if col_name in df.columns:
+                turnover_col = col_name
+                break
+        if turnover_col is not None:
+            turnover_5d = df[turnover_col].rolling(5, min_periods=1).mean()
         
         # [Added] 预计算 IVOL_20 (特质波动率)
         ivol_20 = pd.Series(np.nan, index=df.index)
@@ -3490,13 +3589,13 @@ def _generate_backtest_factor_data(
         # 公式: estimated_circ_mv = amount / (turnover / 100)
         # 含义: 换手率 = 成交量 / 流通股本，成交额 ≈ 成交量 * 当日均价
         #       所以: 流通市值 ≈ 成交额 / 换手率
-        has_turnover = 'turnover' in df.columns
+        has_turnover = turnover_col is not None
         has_amount = 'amount' in df.columns
         
         estimated_circ_mv_series = pd.Series(np.nan, index=df.index)
         if has_turnover and has_amount:
             # 换手率转为小数 (turnover 单位是百分比，如 3.5 表示 3.5%)
-            turnover_pct = df['turnover'] / 100.0
+            turnover_pct = df[turnover_col] / 100.0
             # 避免除以零或极小值
             safe_turnover = turnover_pct.replace(0, np.nan)
             safe_turnover = safe_turnover.where(safe_turnover >= 0.0001, np.nan)
@@ -3681,64 +3780,142 @@ def _generate_backtest_factor_data(
             "回测结果将仅基于动量因子（RSI），无法体现小市值策略效果。"
         )
     
-    # 质量因子（需要更多财务数据，暂时设为 NaN）
-    factor_df['quality_zscore'] = np.nan
+    # 质量因子：使用换手率作为质量因子（高换手率 = 高活跃度 = 高质量）
+    # 回测模式下优先使用 turnover_5d_zscore
+    if 'turnover_5d_zscore' in factor_df.columns and factor_df['turnover_5d_zscore'].notna().any():
+        factor_df['quality_zscore'] = factor_df['turnover_5d_zscore']
+        logger.info(f"quality_zscore 使用 turnover_5d_zscore，有效率: {factor_df['quality_zscore'].notna().mean():.1%}")
+    else:
+        # 回测数据中没有换手率（Tushare daily 接口不含 turnover）
+        # 设为 0 而非 NaN，避免评分失效
+        factor_df['quality_zscore'] = 0.0
+        logger.warning(
+            "回测模式下 quality_zscore 设为 0（日线数据不含换手率）。"
+            "建议：1) 降低 quality_weight 权重；2) 或使用 daily_update 模式获取完整数据"
+        )
     
     # 填充动量因子的 NaN
     factor_df['momentum_zscore'] = factor_df['momentum_zscore'].fillna(0.0)
     
-    # ==================== 计算 Alpha 因子（量价配合）====================
-    # 用于回测的 Alpha_001 因子
-    # Alpha_001 = (Close - VWAP) / VWAP
+    # ==================== 计算 Alpha 因子（量价配合 + 振幅 + 背离）====================
+    # Alpha_001 = (Close - VWAP) / VWAP (量价配合)
+    # Alpha_002 = (High - Low) / Close (价格振幅)
+    # Alpha_003 = price_change_5d - volume_change_5d (量价背离)
+    # IVOL_20 = 20日收益率标准差（特质波动率）
+    # Efficiency_20 = 路径效率（直线距离/实际路径）
     alpha_enabled = False
     alpha_records = []
     
     try:
         for stock_code, stock_df in price_data_dict.items():
+            # Alpha_001: VWAP 动量
+            alpha_001 = pd.Series(np.nan, index=stock_df.index)
             if 'amount' in stock_df.columns and 'volume' in stock_df.columns:
                 vwap = stock_df['amount'] / stock_df['volume'].replace(0, np.nan)
                 alpha_001 = (stock_df['close'] - vwap) / vwap.replace(0, np.nan)
                 alpha_001 = alpha_001.replace([np.inf, -np.inf], np.nan)
-                
-                for date in stock_df.index:
-                    if pd.notna(alpha_001.get(date)):
-                        alpha_records.append({
-                            'date': date,
-                            'stock_code': stock_code,
-                            'alpha_001': alpha_001[date]
-                        })
+            
+            # Alpha_002: 价格振幅
+            alpha_002 = (stock_df['high'] - stock_df['low']) / stock_df['close'].replace(0, np.nan)
+            alpha_002 = alpha_002.replace([np.inf, -np.inf], np.nan)
+            
+            # Alpha_003: 量价背离（价格变化 - 成交量变化）
+            price_change_5d = stock_df['close'].pct_change(5)
+            volume_change_5d = stock_df['volume'].pct_change(5)
+            alpha_003 = price_change_5d - volume_change_5d
+            alpha_003 = alpha_003.replace([np.inf, -np.inf], np.nan)
+            
+            # IVOL_20: 特质波动率（20日收益率标准差，年化）
+            returns = stock_df['close'].pct_change()
+            ivol_20 = returns.rolling(20, min_periods=10).std() * np.sqrt(252)
+            ivol_20 = ivol_20.replace([np.inf, -np.inf], np.nan)
+            
+            # Efficiency_20: 路径效率
+            # 路径效率 = |直线距离| / 实际路径距离
+            close = stock_df['close']
+            direct_distance = (close - close.shift(20)).abs()
+            actual_path = close.diff().abs().rolling(20, min_periods=10).sum()
+            efficiency_20 = direct_distance / actual_path.replace(0, np.nan)
+            efficiency_20 = efficiency_20.replace([np.inf, -np.inf], np.nan)
+            # 限制范围到 [0, 1]
+            efficiency_20 = efficiency_20.clip(0, 1)
+            
+            for date in stock_df.index:
+                record = {
+                    'date': date,
+                    'stock_code': stock_code,
+                    'alpha_001': alpha_001.get(date, np.nan),
+                    'alpha_002': alpha_002.get(date, np.nan),
+                    'alpha_003': alpha_003.get(date, np.nan),
+                    'ivol_20': ivol_20.get(date, np.nan),
+                    'efficiency_20': efficiency_20.get(date, np.nan),
+                }
+                alpha_records.append(record)
         
         if alpha_records:
             alpha_df = pd.DataFrame(alpha_records)
             factor_df = factor_df.merge(alpha_df, on=['date', 'stock_code'], how='left')
             
-            # Z-Score 标准化
-            factor_df['alpha_001_zscore'] = factor_df.groupby('date', group_keys=False).apply(
-                lambda g: zscore_by_date(g, 'alpha_001'), include_groups=False
-            ).reset_index(level=0, drop=True).fillna(0)
+            # Z-Score 标准化（按日期横截面）
+            for col in ['alpha_001', 'alpha_002', 'alpha_003', 'ivol_20', 'efficiency_20']:
+                zscore_col = f'{col}_zscore'
+                if col in factor_df.columns and factor_df[col].notna().any():
+                    factor_df[zscore_col] = factor_df.groupby('date', group_keys=False).apply(
+                        lambda g: zscore_by_date(g, col), include_groups=False
+                    ).reset_index(level=0, drop=True).fillna(0)
+                else:
+                    factor_df[zscore_col] = 0.0
             
             alpha_enabled = True
-            logger.info("Alpha_001 因子（量价配合）计算完成")
+            logger.info("Alpha 因子计算完成: alpha_001(VWAP), alpha_002(振幅), alpha_003(背离), ivol_20(波动率), efficiency_20(路径效率)")
         else:
-            factor_df['alpha_001_zscore'] = 0.0
-            logger.warning("无法计算 Alpha_001 因子：缺少 amount/volume 数据")
+            for col in ['alpha_001', 'alpha_002', 'alpha_003', 'ivol_20', 'efficiency_20']:
+                factor_df[f'{col}_zscore'] = 0.0
+            logger.warning("无法计算 Alpha 因子：缺少 OHLCV 数据")
     except Exception as e:
-        factor_df['alpha_001_zscore'] = 0.0
-        logger.warning(f"Alpha_001 因子计算失败: {e}")
+        for col in ['alpha_001', 'alpha_002', 'alpha_003', 'ivol_20', 'efficiency_20']:
+            factor_df[f'{col}_zscore'] = 0.0
+        logger.warning(f"Alpha 因子计算失败: {e}")
     
     # ==================== 计算复合动量因子 momentum_composite_zscore ====================
-    # 牛市进攻型配方: 40% ROC + 30% Sharpe + 30% Alpha001
+    # 升级版配方 v2: 
+    # 30% ROC (价格动量) + 20% Sharpe (风险调整) + 15% Alpha001 (VWAP配合)
+    # + 10% Alpha002 (振幅) + 10% Alpha005 (尾盘强度) + 10% Efficiency (路径效率)
+    # + 5% Alpha003 反向 (量价背离惩罚)
     roc_col = 'roc_20_zscore' if 'roc_20_zscore' in factor_df.columns else None
     sharpe_col = 'sharpe_20_zscore' if 'sharpe_20_zscore' in factor_df.columns else None
-    alpha_col = 'alpha_001_zscore' if alpha_enabled else None
     
-    if roc_col and sharpe_col and alpha_col:
+    if roc_col and sharpe_col and alpha_enabled:
+        # 计算 Alpha_005 (尾盘强度) 如果存在
+        if 'alpha_005_zscore' not in factor_df.columns:
+            # 计算 alpha_005
+            alpha_005_records = []
+            for stock_code, stock_df in price_data_dict.items():
+                range_hl = stock_df['high'] - stock_df['low']
+                alpha_005 = (stock_df['close'] - stock_df['low']) / range_hl.replace(0, np.nan)
+                for date in stock_df.index:
+                    if pd.notna(alpha_005.get(date)):
+                        alpha_005_records.append({'date': date, 'stock_code': stock_code, 'alpha_005': alpha_005[date]})
+            if alpha_005_records:
+                alpha_005_df = pd.DataFrame(alpha_005_records)
+                factor_df = factor_df.merge(alpha_005_df, on=['date', 'stock_code'], how='left')
+                factor_df['alpha_005_zscore'] = factor_df.groupby('date', group_keys=False).apply(
+                    lambda g: zscore_by_date(g, 'alpha_005'), include_groups=False
+                ).reset_index(level=0, drop=True).fillna(0)
+            else:
+                factor_df['alpha_005_zscore'] = 0.0
+        
+        # 升级版复合动量因子
         factor_df['momentum_composite_zscore'] = (
-            0.4 * factor_df[roc_col].fillna(0) +
-            0.3 * factor_df[sharpe_col].fillna(0) +
-            0.3 * factor_df[alpha_col].fillna(0)
+            0.30 * factor_df[roc_col].fillna(0) +                           # 价格动量
+            0.20 * factor_df[sharpe_col].fillna(0) +                        # 风险调整动量
+            0.15 * factor_df['alpha_001_zscore'].fillna(0) +                # VWAP 配合
+            0.10 * factor_df['alpha_002_zscore'].fillna(0) +                # 价格振幅
+            0.10 * factor_df.get('alpha_005_zscore', pd.Series(0, index=factor_df.index)).fillna(0) +  # 尾盘强度
+            0.10 * factor_df['efficiency_20_zscore'].fillna(0) +            # 路径效率
+            0.05 * (-factor_df['alpha_003_zscore'].fillna(0))               # 量价背离惩罚（反向）
         )
-        logger.info("🚀 复合动量因子计算完成: 40% ROC + 30% Sharpe + 30% Alpha001")
+        logger.info("🚀 复合动量因子 v2 计算完成: 30% ROC + 20% Sharpe + 15% α001 + 10% α002 + 10% α005 + 10% Efficiency - 5% α003(背离)")
     elif roc_col and sharpe_col:
         factor_df['momentum_composite_zscore'] = (
             0.6 * factor_df[roc_col].fillna(0) +
@@ -3751,6 +3928,26 @@ def _generate_backtest_factor_data(
     else:
         factor_df['momentum_composite_zscore'] = factor_df['momentum_zscore'].fillna(0)
         logger.warning("复合动量因子使用 RSI 作为后备")
+    
+    # ==================== 计算复合质量因子 quality_composite_zscore ====================
+    # 升级版配方: 50% 换手率 + 30% 低波动 (IVOL反向) + 20% 路径效率
+    if 'turnover_5d_zscore' in factor_df.columns and factor_df['turnover_5d_zscore'].notna().any():
+        turnover_component = factor_df['turnover_5d_zscore'].fillna(0)
+    else:
+        turnover_component = pd.Series(0.0, index=factor_df.index)
+    
+    # IVOL 反向使用（低波动更好）
+    ivol_component = -factor_df['ivol_20_zscore'].fillna(0) if 'ivol_20_zscore' in factor_df.columns else pd.Series(0.0, index=factor_df.index)
+    
+    # 路径效率（高效率更好）
+    efficiency_component = factor_df['efficiency_20_zscore'].fillna(0) if 'efficiency_20_zscore' in factor_df.columns else pd.Series(0.0, index=factor_df.index)
+    
+    factor_df['quality_composite_zscore'] = (
+        0.50 * turnover_component +      # 换手率/流动性
+        0.30 * ivol_component +           # 低波动异象（反向）
+        0.20 * efficiency_component       # 路径效率
+    )
+    logger.info("📊 复合质量因子计算完成: 50% 换手率 + 30% 低波动(反向) + 20% 路径效率")
     
     # 统计有效的小市值因子数量
     valid_small_cap = factor_df['small_cap_zscore'].notna().sum()
@@ -4008,6 +4205,57 @@ def run_backtest(
         logger.info(f"价格矩阵: {close_df.shape[0]} 天 x {close_df.shape[1]} 只股票")
         
         # ========================================
+        # Step 2.5: 获取换手率数据（quality 因子需要）
+        # ========================================
+        logger.info("Step 2.5/7: 获取换手率数据（daily_basic 接口）")
+        
+        try:
+            # 获取回测期间内的所有交易日
+            trading_dates = close_df.index.strftime('%Y%m%d').tolist()
+            
+            # 从 daily_basic 接口批量获取换手率
+            turnover_data = {}
+            from src.tushare_loader import TushareDataLoader
+            ts_loader = TushareDataLoader()
+            
+            # 按日期批量获取（避免频繁 API 调用）
+            sample_dates = trading_dates[::5]  # 每5天采样一次，减少API调用
+            logger.info(f"采样获取 {len(sample_dates)} 个交易日的换手率数据...")
+            
+            for trade_date in sample_dates:
+                try:
+                    basic_df = ts_loader.fetch_daily_basic(trade_date=trade_date)
+                    if basic_df is not None and not basic_df.empty:
+                        # 提取换手率 (turn 列)
+                        if 'turn' in basic_df.columns and 'ts_code' in basic_df.columns:
+                            for _, row in basic_df.iterrows():
+                                ts_code = row['ts_code']
+                                stock_code = ts_code.split('.')[0] if '.' in ts_code else ts_code
+                                if stock_code in price_data_dict:
+                                    if stock_code not in turnover_data:
+                                        turnover_data[stock_code] = {}
+                                    date_key = pd.to_datetime(trade_date)
+                                    turnover_data[stock_code][date_key] = row.get('turn', np.nan)
+                except Exception as e:
+                    logger.debug(f"获取 {trade_date} 换手率失败: {e}")
+                    continue
+            
+            # 将换手率合并到 price_data_dict
+            turnover_merged_count = 0
+            for stock_code, df in price_data_dict.items():
+                if stock_code in turnover_data:
+                    turn_series = pd.Series(turnover_data[stock_code])
+                    # 将换手率添加为新列，并用前向填充补全
+                    df['turn'] = turn_series.reindex(df.index).ffill().bfill()
+                    if df['turn'].notna().any():
+                        turnover_merged_count += 1
+            
+            logger.info(f"换手率数据合并完成: {turnover_merged_count}/{len(price_data_dict)} 只股票有换手率")
+            
+        except Exception as e:
+            logger.warning(f"获取换手率数据失败，quality 因子将不可用: {e}")
+        
+        # ========================================
         # Step 3: 加载历史财务数据（关键：小市值因子需要 circ_mv）
         # ========================================
         logger.info("Step 3/7: 加载历史财务数据（流通市值 circ_mv）")
@@ -4100,6 +4348,18 @@ def run_backtest(
             quality_weight = strategy_config.get("quality_weight", 0.0)
             momentum_weight = strategy_config.get("momentum_weight", 1.0)
             size_weight = strategy_config.get("size_weight", 0.0)
+            
+            # [NEW] 检测 quality_zscore 数据可用性（回测模式下可能全为 0）
+            if 'quality_zscore' in factor_data.columns:
+                quality_valid_rate = (factor_data['quality_zscore'] != 0).mean()
+                if quality_valid_rate < 0.01 and quality_weight > 0:
+                    logger.warning(
+                        f"⚠️ 回测数据缺少换手率，quality_zscore 全为 0。"
+                        f"自动调整: quality_weight {quality_weight:.0%} -> 0%，"
+                        f"momentum_weight {momentum_weight:.0%} -> {momentum_weight + quality_weight:.0%}"
+                    )
+                    momentum_weight += quality_weight  # 将 quality 权重转移到 momentum
+                    quality_weight = 0.0
             
             # 根据财务数据可用性调整策略配置
             if has_financial_data:
