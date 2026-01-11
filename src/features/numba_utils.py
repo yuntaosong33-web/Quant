@@ -9,10 +9,23 @@ Performance Notes
 - 所有函数使用 @jit(nopython=True, cache=True) 装饰器
 - 并行函数使用 @jit(nopython=True, parallel=True, cache=True)
 - 缓存编译结果以加速后续调用
+- 如果 numba 未安装，将使用纯 Python 实现（较慢）
 """
 
 import numpy as np
-from numba import jit, prange
+
+# Numba 可选依赖
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # 创建无操作装饰器
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
 
 @jit(nopython=True, cache=True)
