@@ -24,11 +24,8 @@ data:
 
 # Tushare 配置
 # 获取 Token: https://tushare.pro/register
-# 也可通过环境变量 TUSHARE_TOKEN 设置
 tushare:
-  # API Token (请通过环境变量 TUSHARE_TOKEN 设置，切勿在此明文存储！)
-  # api_token: "${TUSHARE_TOKEN}"  # 从环境变量读取
-  api_token: ""  # 留空，系统将自动从环境变量 TUSHARE_TOKEN 读取
+  api_token: "ff84a15bbffab89a99667b3e99fce8aa915077e3b735a5c0b57ff454"
   
   # 缓存目录
   cache_dir: "data/tushare_cache"
@@ -172,8 +169,8 @@ llm:
   # 提供商: qwen (阿里云通义千问)
   provider: "qwen"
   
-  # 主模型名称 (qwen-max 是通义千问旗舰版)
-  model: "qwen-max"
+  # 主模型名称
+  model: "qwen3-max"
   
   # 备用模型（主模型失败时自动降级）
   fallback_model: "qwen-turbo"
@@ -181,9 +178,8 @@ llm:
   # API 端点 (阿里云 DashScope OpenAI 兼容模式)
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   
-  # API Key (请通过环境变量 QWEN_API_KEY 或 DASHSCOPE_API_KEY 设置)
-  # 切勿在配置文件中明文存储密钥！
-  api_key: ""  # 留空，系统将自动从环境变量读取
+  # API Key
+  api_key: "sk-a4eee1b50b9341c4a3f4f9abefe7460d"
   
   # 是否启用情绪分析
   enable_sentiment_filter: true
@@ -245,8 +241,7 @@ report:
 # 消息推送配置
 notification:
   # PushPlus 微信推送 (http://www.pushplus.plus/)
-  # 请通过环境变量 PUSHPLUS_TOKEN 设置
-  pushplus_token: ""  # 留空，系统将自动从环境变量读取
+  pushplus_token: "c71a6a03122e41e3b0b691693748c0ce"
   
   # 是否启用推送
   enabled: true

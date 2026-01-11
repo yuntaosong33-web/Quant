@@ -44,12 +44,9 @@ def _lazy_import():
     
     if TushareDataLoader is None:
         try:
-            from .tushare import TushareClient as TushareDataLoader
+            from .tushare import TushareDataLoader
         except ImportError:
-            try:
-                from tushare_loader import TushareDataLoader
-            except ImportError:
-                TushareDataLoader = None
+            TushareDataLoader = None
 
 
 def generate_factor_data(

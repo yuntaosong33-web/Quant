@@ -35,21 +35,15 @@ def _lazy_import():
     
     if TushareDataLoader is None:
         try:
-            from .tushare import TushareClient as TushareDataLoader
+            from .tushare import TushareDataLoader
         except ImportError:
-            from tushare_loader import TushareDataLoader
+            TushareDataLoader = None
     
     if AShareDataCleaner is None:
         try:
-            from .data_cleaner import AShareDataCleaner
+            from .data_loader import AShareDataCleaner
         except ImportError:
-            from data_cleaner import AShareDataCleaner
-    
-    if DataLoader is None:
-        try:
-            from .data_loader import DataLoader
-        except ImportError:
-            from data_loader import DataLoader
+            AShareDataCleaner = None
 
 
 class DailyUpdateRunner:

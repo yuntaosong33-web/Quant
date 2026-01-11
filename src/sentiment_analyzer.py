@@ -785,7 +785,7 @@ class AsyncNewsFetcher:
         """
         if not hasattr(self, '_tushare_loader') or self._tushare_loader is None:
             try:
-                from .tushare_loader import TushareDataLoader
+                from .tushare import TushareDataLoader
                 self._tushare_loader = TushareDataLoader()
             except Exception as e:
                 logger.warning(f"创建 TushareDataLoader 失败: {e}")

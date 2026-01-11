@@ -1059,7 +1059,7 @@ def fetch_sw_industry_mapping(
     - 网络请求可能失败，建议缓存结果
     """
     try:
-        from .tushare_loader import TushareDataLoader
+        from .tushare import TushareDataLoader
     except ImportError:
         raise ImportError("需要安装 tushare: pip install tushare")
     
