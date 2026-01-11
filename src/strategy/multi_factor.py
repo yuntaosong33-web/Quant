@@ -4,7 +4,7 @@
 本模块实现 MultiFactorStrategy，基于价值、质量、动量和市值因子的综合打分进行选股。
 支持情绪分析加成、自适应权重、拥挤度轮动等高级功能。
 """
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 import logging
 import pandas as pd
 import numpy as np
@@ -150,6 +150,26 @@ class MultiFactorStrategy(BaseStrategy):
         # 过热熔断阈值
         self.turnover_threshold: float = self.config.get("turnover_threshold", 50.0)
         self.volatility_threshold: float = self.config.get("volatility_threshold", 5.0)
+
+        # 可配置过滤阈值（偏进攻时可放宽/关闭）
+        self.min_daily_amount: float = float(self.config.get("min_daily_amount", self.MIN_DAILY_AMOUNT))
+        self.max_price: Optional[float] = self.config.get("max_price", 100.0)
+        self.max_rsi: Optional[float] = self.config.get("max_rsi", 80.0)
+        self.min_efficiency: Optional[float] = self.config.get("min_efficiency", 0.3)
+        self.overheat_check_col: str = self.config.get("overheat_check_col", self.quality_col)
+        self.min_circ_mv: Optional[float] = self.config.get("min_circ_mv", None)
+
+        # 趋势过滤（提高“看起来更合理”的持仓：高波动但要求趋势向上）
+        trend_cfg = self.config.get("trend_filter", {})
+        self._trend_filter_enabled: bool = bool(trend_cfg.get("enabled", False))
+        self._require_positive_return_20: bool = bool(trend_cfg.get("require_positive_return_20", True))
+
+        # 行业分散与黑名单（抑制集中押注）
+        industry_cfg = self.config.get("industry_constraints", {})
+        self._industry_constraints_enabled: bool = bool(industry_cfg.get("enabled", False))
+        self._industry_col: str = str(industry_cfg.get("industry_col", "industry"))
+        self._max_per_industry: int = int(industry_cfg.get("max_per_industry", 2))
+        self._excluded_industries: List[str] = [str(x) for x in industry_cfg.get("excluded_industries", [])]
         
         # 拥挤度板块轮动配置
         self._enable_crowding_rotation: bool = self.config.get("enable_crowding_rotation", False)
@@ -165,6 +185,17 @@ class MultiFactorStrategy(BaseStrategy):
         self._market_regime_config = self.config.get("market_regime", {})
         self._enable_adaptive_weights: bool = self._market_regime_config.get("enabled", False)
         self._current_market_regime: str = "sideways"
+        self._current_market_volatility: Optional[float] = None
+        self._current_position_scale: float = 1.0
+
+        # 因子方向（用于负 IC 自动反向）
+        # 约定：+1 表示“因子越大越好”；-1 表示“因子越小越好（反向使用）”
+        self._factor_directions: Dict[str, int] = {
+            'value': 1,
+            'quality': 1,
+            'momentum': 1,
+            'size': 1,
+        }
         
         # 初始化情绪分析引擎
         if self._enable_sentiment_filter:
@@ -225,6 +256,7 @@ class MultiFactorStrategy(BaseStrategy):
             
             returns = index_data['close'].pct_change()
             volatility = returns.rolling(vol_period, min_periods=vol_period//2).std().iloc[-1] * np.sqrt(252)
+            self._current_market_volatility = float(volatility) if pd.notna(volatility) else None
             
             if pd.isna(volatility):
                 return 'sideways'
@@ -248,11 +280,36 @@ class MultiFactorStrategy(BaseStrategy):
         """根据市场状态返回因子权重"""
         if market_regime is None:
             market_regime = self._current_market_regime
-        
+
+        # 允许从配置覆盖（推荐在 strategy_config.yaml 中显式配置，避免硬编码与当前行情不一致）
+        user_regime_weights = self._market_regime_config.get("regime_weights")
+        if isinstance(user_regime_weights, dict) and user_regime_weights:
+            fallback = user_regime_weights.get("sideways", {})
+            return user_regime_weights.get(market_regime, fallback)
+
+        # 默认值（保守基线，避免过度进攻）
         regime_weights = {
-            'bull': {'momentum_weight': 0.4, 'sentiment_weight': 0.3, 'size_weight': 0.2, 'quality_weight': 0.1, 'value_weight': 0.0},
-            'bear': {'momentum_weight': 0.1, 'sentiment_weight': 0.1, 'size_weight': 0.0, 'quality_weight': 0.3, 'value_weight': 0.5},
-            'sideways': {'momentum_weight': 0.3, 'sentiment_weight': 0.2, 'size_weight': 0.1, 'quality_weight': 0.2, 'value_weight': 0.2}
+            'bull': {
+                'momentum_weight': 0.20,
+                'sentiment_weight': 0.15,
+                'size_weight': -0.20,
+                'quality_weight': 0.55,
+                'value_weight': 0.10
+            },
+            'sideways': {
+                'momentum_weight': 0.15,
+                'sentiment_weight': 0.10,
+                'size_weight': -0.10,
+                'quality_weight': 0.45,
+                'value_weight': 0.30
+            },
+            'bear': {
+                'momentum_weight': 0.05,
+                'sentiment_weight': 0.00,
+                'size_weight': -0.05,
+                'quality_weight': 0.35,
+                'value_weight': 0.65
+            }
         }
         return regime_weights.get(market_regime, regime_weights['sideways'])
     
@@ -269,8 +326,99 @@ class MultiFactorStrategy(BaseStrategy):
         self.size_weight = weights['size_weight']
         self.quality_weight = weights['quality_weight']
         self.value_weight = weights['value_weight']
-        
-        logger.info(f"自适应权重已应用 ({regime})")
+
+        # 动态仓位系数（高波动自动降仓）
+        pos_scale_cfg = self._market_regime_config.get("position_scale", {})
+        base_scale = float(pos_scale_cfg.get(regime, 1.0)) if isinstance(pos_scale_cfg, dict) else 1.0
+
+        hv_scale = 1.0
+        if self._current_market_volatility is not None:
+            high_vol_threshold = float(self._market_regime_config.get('high_volatility_threshold', 0.25))
+            if self._current_market_volatility >= high_vol_threshold:
+                hv_scale = float(self._market_regime_config.get("high_volatility_position_scale", 0.75))
+
+        self._current_position_scale = float(np.clip(base_scale * hv_scale, 0.0, 1.0))
+
+        logger.info(f"自适应权重已应用 ({regime}), position_scale={self._current_position_scale:.0%}")
+
+    def get_position_scale(self) -> float:
+        """
+        获取当前动态仓位系数（0~1）。
+
+        Returns
+        -------
+        float
+            当前仓位系数，值越小表示越保守（留更多现金）。
+        """
+        return float(self._current_position_scale)
+
+    def apply_factor_direction_from_ic(
+        self,
+        ic_results: pd.DataFrame,
+        abs_ic_threshold: float = 0.02,
+        ir_threshold: float = 0.3,
+        positive_ratio_threshold: float = 0.55
+    ) -> Dict[str, int]:
+        """
+        基于 IC 结果自动校准因子方向（负 IC 反向使用）。
+
+        Parameters
+        ----------
+        ic_results : pd.DataFrame
+            因子 IC 统计结果（来自 calculate_factor_ic），至少包含:
+            - factor, ic_mean, ic_ir, ic_positive_ratio
+        abs_ic_threshold : float
+            触发方向校准的 |IC| 阈值。
+        ir_threshold : float
+            触发方向校准的稳定性阈值（|IC_IR|）。
+        positive_ratio_threshold : float
+            方向稳定性辅助阈值（正 IC 占比）。
+
+        Returns
+        -------
+        Dict[str, int]
+            实际被更新的方向映射（key 为组件名 value/quality/momentum/size）。
+        """
+        if ic_results is None or ic_results.empty:
+            return {}
+
+        factor_to_component: Dict[str, str] = {
+            self.value_col: 'value',
+            self.quality_col: 'quality',
+            self.momentum_col: 'momentum',
+            self.size_col: 'size',
+        }
+
+        updated: Dict[str, int] = {}
+        for _, row in ic_results.iterrows():
+            factor = str(row.get("factor", ""))
+            if factor not in factor_to_component:
+                continue
+
+            ic_mean = float(row.get("ic_mean", 0.0))
+            ic_ir = float(row.get("ic_ir", 0.0))
+            pos_ratio = float(row.get("ic_positive_ratio", row.get("positive_ratio", 0.5)))
+
+            if abs(ic_mean) < abs_ic_threshold or abs(ic_ir) < ir_threshold:
+                continue
+
+            component = factor_to_component[factor]
+            # 使用 IC 符号作为方向：IC<0 => 反向
+            direction = 1 if ic_mean >= 0 else -1
+
+            # 用正 IC 占比做轻约束：若方向不稳定则不改
+            if direction == 1 and pos_ratio < positive_ratio_threshold:
+                continue
+            if direction == -1 and pos_ratio > (1.0 - positive_ratio_threshold):
+                continue
+
+            old = self._factor_directions.get(component, 1)
+            if old != direction:
+                self._factor_directions[component] = direction
+                updated[component] = direction
+                logger.warning(f"因子方向校准: {component} ({factor}) direction {old} -> {direction}")
+
+        return updated
     
     def apply_factor_circuit_breaker(
         self,
@@ -409,21 +557,49 @@ class MultiFactorStrategy(BaseStrategy):
         data: pd.DataFrame,
         sentiment_scores: Optional[pd.Series] = None,
         return_components: bool = False
-    ) -> pd.Series:
-        """计算综合因子得分"""
+    ) -> Union[pd.Series, Tuple[pd.Series, Dict[str, pd.Series]]]:
+        """
+        计算综合因子得分
+        
+        Parameters
+        ----------
+        data : pd.DataFrame
+            当日横截面数据（建议已完成 Z-Score 标准化）
+        sentiment_scores : Optional[pd.Series]
+            情绪分数（index=stock_code），可选
+        return_components : bool
+            是否返回分项贡献（用于报告可解释性）
+        
+        Returns
+        -------
+        Union[pd.Series, Tuple[pd.Series, Dict[str, pd.Series]]]
+            - return_components=False: total_score
+            - return_components=True: (total_score, components)
+        """
         total_score = pd.Series(0.0, index=data.index)
-        score_components = {}
+        score_components: Dict[str, pd.Series] = {}
+
+        # 可选：用“绝对权重和”归一化，避免出现负权重时总权重缩小导致信号幅度偏低
+        normalize_cfg = self.config.get("score_normalization", {})
+        normalize_by_abs: bool = bool(normalize_cfg.get("normalize_by_abs_weight_sum", True))
+        base_weights = np.array([self.value_weight, self.quality_weight, self.momentum_weight, self.size_weight], dtype=float)
+        abs_sum = float(np.abs(base_weights).sum())
+        scale = 1.0
+        if normalize_by_abs and abs_sum > 1e-12:
+            scale = 1.0 / abs_sum
         
         # 价值因子
         if self.value_col in data.columns and self.value_weight != 0:
-            value_contribution = self.value_weight * data[self.value_col].fillna(0)
+            direction = self._factor_directions.get('value', 1)
+            value_contribution = (self.value_weight * scale) * (direction * data[self.value_col].fillna(0))
             total_score += value_contribution
-            score_components['value'] = data[self.value_col].fillna(0)
+            score_components['value'] = value_contribution
         
         # 质量因子（含换手率过热惩罚）
         is_turnover_factor = 'turnover' in self.quality_col.lower()
         if self.quality_col in data.columns and self.quality_weight != 0:
-            raw_quality = data[self.quality_col].fillna(0)
+            direction = self._factor_directions.get('quality', 1)
+            raw_quality = direction * data[self.quality_col].fillna(0)
             if is_turnover_factor:
                 TURNOVER_PENALTY_THRESHOLD = 3.5
                 quality_score = np.where(
@@ -433,18 +609,23 @@ class MultiFactorStrategy(BaseStrategy):
                 )
             else:
                 quality_score = raw_quality
-            total_score += self.quality_weight * quality_score
-            score_components['quality'] = pd.Series(quality_score, index=data.index)
+            quality_contribution = (self.quality_weight * scale) * pd.Series(quality_score, index=data.index)
+            total_score += quality_contribution
+            score_components['quality'] = quality_contribution
         
         # 动量因子
         if self.momentum_col in data.columns and self.momentum_weight != 0:
-            total_score += self.momentum_weight * data[self.momentum_col].fillna(0)
-            score_components['momentum'] = data[self.momentum_col].fillna(0)
+            direction = self._factor_directions.get('momentum', 1)
+            momentum_contribution = (self.momentum_weight * scale) * (direction * data[self.momentum_col].fillna(0))
+            total_score += momentum_contribution
+            score_components['momentum'] = momentum_contribution
         
         # 市值因子
         if self.size_col in data.columns and self.size_weight != 0:
-            total_score += self.size_weight * data[self.size_col].fillna(0)
-            score_components['size'] = data[self.size_col].fillna(0)
+            direction = self._factor_directions.get('size', 1)
+            size_contribution = (self.size_weight * scale) * (direction * data[self.size_col].fillna(0))
+            total_score += size_contribution
+            score_components['size'] = size_contribution
         
         # 情绪因子加成
         if sentiment_scores is not None and self.sentiment_weight > 0:
@@ -467,8 +648,12 @@ class MultiFactorStrategy(BaseStrategy):
             else:
                 scaled_sentiment = aligned_sentiment * 3.0
             
-            total_score += self.sentiment_weight * scaled_sentiment
+            sentiment_contribution = self.sentiment_weight * scaled_sentiment
+            total_score += sentiment_contribution
+            score_components['sentiment'] = sentiment_contribution
         
+        if return_components:
+            return total_score, score_components
         return total_score
     
     def get_month_end_dates(self, dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -537,8 +722,18 @@ class MultiFactorStrategy(BaseStrategy):
             before = len(day_data)
             amount_values = day_data['amount'].copy()
             amount_in_yuan = amount_values * 10000 if amount_values.max() < 1_000_000 else amount_values
-            day_data = day_data[amount_in_yuan >= self.MIN_DAILY_AMOUNT]
+            day_data = day_data[amount_in_yuan >= float(self.min_daily_amount)]
             filter_stats['流动性不足'] = before - len(day_data)
+
+        # 过滤微盘股（用流通市值下限控制“过于小盘”的暴露）
+        if self.min_circ_mv is not None and 'circ_mv' in day_data.columns:
+            try:
+                before = len(day_data)
+                circ_mv = pd.to_numeric(day_data['circ_mv'], errors='coerce')
+                day_data = day_data[circ_mv >= float(self.min_circ_mv)]
+                filter_stats['流通市值过小'] = before - len(day_data)
+            except Exception:
+                pass
         
         # 过滤ST股
         name_col = next((c for c in ['name', 'stock_name', '股票名称', 'sec_name'] if c in day_data.columns), None)
@@ -550,9 +745,9 @@ class MultiFactorStrategy(BaseStrategy):
         
         # 过滤高价股
         price_col = 'close' if 'close' in day_data.columns else next((c for c in ['price', 'close_price'] if c in day_data.columns), None)
-        if price_col:
+        if price_col and self.max_price is not None:
             before = len(day_data)
-            day_data = day_data[day_data[price_col] <= 100.0]
+            day_data = day_data[day_data[price_col] <= float(self.max_price)]
             filter_stats['高价股'] = before - len(day_data)
         
         # 过滤次新股
@@ -584,19 +779,25 @@ class MultiFactorStrategy(BaseStrategy):
                 filter_stats['科创板'] = before - len(day_data)
         
         # 过滤RSI过热
-        if 'rsi_20' in day_data.columns:
+        if 'rsi_20' in day_data.columns and self.max_rsi is not None:
             before = len(day_data)
-            day_data = day_data[day_data['rsi_20'] <= 80]
+            day_data = day_data[day_data['rsi_20'] <= float(self.max_rsi)]
             filter_stats['RSI过热'] = before - len(day_data)
         
         # 过滤震荡股
-        if 'efficiency_20' in day_data.columns:
+        if 'efficiency_20' in day_data.columns and self.min_efficiency is not None:
             before = len(day_data)
-            day_data = day_data[day_data['efficiency_20'] >= 0.3]
+            day_data = day_data[day_data['efficiency_20'] >= float(self.min_efficiency)]
             filter_stats['震荡股'] = before - len(day_data)
+
+        # 趋势过滤：要求 20 日收益为正（偏动量进攻）
+        if self._trend_filter_enabled and self._require_positive_return_20 and 'return_20' in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[pd.to_numeric(day_data['return_20'], errors='coerce') > 0]
+            filter_stats['趋势过滤(return_20>0)'] = before - len(day_data)
         
         # 过热熔断
-        check_col = self.quality_col
+        check_col = self.overheat_check_col
         if check_col in day_data.columns:
             before = len(day_data)
             overheat_mask = day_data[check_col] > self.turnover_threshold
@@ -612,6 +813,63 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"日期 {date.strftime('%Y-%m-%d')}: 过滤 {total_filtered} 只 ({filter_detail})")
         
         return day_data
+
+    def _apply_industry_constraints(
+        self,
+        ranked_df: pd.DataFrame,
+        stock_col: str,
+        n: int
+    ) -> List[str]:
+        """
+        对已按分数排序的候选集合应用行业分散/黑名单。
+
+        Parameters
+        ----------
+        ranked_df : pd.DataFrame
+            已按分数降序排列，且包含 stock_col 与 industry_col（可选）
+        stock_col : str
+            股票代码列名
+        n : int
+            目标数量
+
+        Returns
+        -------
+        List[str]
+            应用约束后的股票列表
+        """
+        if not self._industry_constraints_enabled:
+            return ranked_df[stock_col].astype(str).tolist()[:n]
+
+        if self._max_per_industry <= 0:
+            return ranked_df[stock_col].astype(str).tolist()[:n]
+
+        if self._industry_col not in ranked_df.columns:
+            return ranked_df[stock_col].astype(str).tolist()[:n]
+
+        counts: Dict[str, int] = {}
+        selected: List[str] = []
+
+        for _, row in ranked_df.iterrows():
+            code = str(row.get(stock_col, "")).strip()
+            if not code:
+                continue
+
+            ind = row.get(self._industry_col, None)
+            industry = str(ind).strip() if ind is not None and str(ind).strip() != "" else "UNKNOWN"
+
+            if industry in self._excluded_industries:
+                continue
+
+            cnt = counts.get(industry, 0)
+            if cnt >= self._max_per_industry:
+                continue
+
+            selected.append(code)
+            counts[industry] = cnt + 1
+            if len(selected) >= n:
+                break
+
+        return selected
     
     def _apply_sentiment_filter(self, candidates: List[str], date: pd.Timestamp) -> List[str]:
         """对预选候选股票应用 LLM 情绪分析过滤（Fail-Closed 策略）"""
@@ -708,12 +966,16 @@ class MultiFactorStrategy(BaseStrategy):
         
         if not should_use_sentiment:
             if stock_col not in valid_data.columns:
+                # 兜底：无显式股票列时直接按 index 取
                 if isinstance(valid_data.index, pd.MultiIndex):
-                    top_stocks = valid_data.nlargest(n, 'base_score').index.get_level_values(-1).tolist()
+                    top_stocks = valid_data.nlargest(n, 'base_score').index.get_level_values(-1).astype(str).tolist()
                 else:
-                    top_stocks = valid_data.nlargest(n, 'base_score').index.tolist()
-            else:
-                top_stocks = valid_data.nlargest(n, 'base_score')[stock_col].tolist()
+                    top_stocks = valid_data.nlargest(n, 'base_score').index.astype(str).tolist()
+                return list(dict.fromkeys(top_stocks))[:n]
+
+            ranked = valid_data.sort_values('base_score', ascending=False, kind='mergesort')
+            ranked = ranked.drop_duplicates(subset=[stock_col], keep='first')
+            top_stocks = self._apply_industry_constraints(ranked_df=ranked, stock_col=stock_col, n=n)
             return list(dict.fromkeys(top_stocks))[:n]
         
         # 第二阶段：情绪面加成
@@ -750,8 +1012,15 @@ class MultiFactorStrategy(BaseStrategy):
                 
                 pre_candidates = [s for s in pre_candidates if s not in vetoed_stocks]
                 
-                raw_scores = pd.Series(sentiment_df['score'].values, index=sentiment_df['stock_code'].values)
-                sentiment_scores = raw_scores.clip(lower=0)
+                # 情绪分用于“加分项”：用置信度做衰减，且低置信度直接置零，避免噪声放大
+                score_series = pd.Series(sentiment_df['score'].values, index=sentiment_df['stock_code'].values).astype(float)
+                conf_series = pd.Series(
+                    sentiment_df['confidence'].values, index=sentiment_df['stock_code'].values
+                ).astype(float) if 'confidence' in sentiment_df.columns else pd.Series(1.0, index=score_series.index)
+
+                conf_series = conf_series.clip(lower=0.0, upper=1.0)
+                conf_series = conf_series.where(conf_series >= self._min_confidence, 0.0)
+                sentiment_scores = (score_series.clip(lower=0.0) * conf_series).astype(float)
         
         except LLMCircuitBreakerError:
             raise
@@ -773,12 +1042,14 @@ class MultiFactorStrategy(BaseStrategy):
         
         if stock_col not in candidate_data.columns:
             if isinstance(candidate_data.index, pd.MultiIndex):
-                top_stocks = candidate_data.nlargest(n, 'final_score').index.get_level_values(-1).tolist()
+                top_stocks = candidate_data.nlargest(n, 'final_score').index.get_level_values(-1).astype(str).tolist()
             else:
-                top_stocks = candidate_data.nlargest(n, 'final_score').index.tolist()
-        else:
-            top_stocks = candidate_data.nlargest(n, 'final_score')[stock_col].tolist()
-        
+                top_stocks = candidate_data.nlargest(n, 'final_score').index.astype(str).tolist()
+            return list(dict.fromkeys(top_stocks))[:n]
+
+        ranked = candidate_data.sort_values('final_score', ascending=False, kind='mergesort')
+        ranked = ranked.drop_duplicates(subset=[stock_col], keep='first')
+        top_stocks = self._apply_industry_constraints(ranked_df=ranked, stock_col=stock_col, n=n)
         return list(dict.fromkeys(top_stocks))[:n]
     
     def generate_target_positions(
@@ -1041,6 +1312,13 @@ class MultiFactorStrategy(BaseStrategy):
                 continue
             
             if date in rebalance_dates:
+                # 回测与实盘一致：调仓日按当日市场状态应用自适应权重与动态仓位系数
+                try:
+                    if hasattr(self, 'apply_adaptive_weights') and benchmark_data is not None:
+                        self.apply_adaptive_weights(index_data=benchmark_data, date=date)
+                except Exception as e:
+                    logger.warning(f"回测自适应权重应用失败（忽略并降级）: {e}")
+
                 filtered_data = self.filter_stocks(factor_data, date)
                 
                 if not filtered_data.empty:
@@ -1102,9 +1380,11 @@ class MultiFactorStrategy(BaseStrategy):
                 else:
                     current_weights = {}
             
+            # 动态仓位系数：留现金以降低高波动/弱市阶段回撤
+            position_scale = self.get_position_scale() if hasattr(self, "get_position_scale") else 1.0
             for stock, weight in current_weights.items():
                 if stock in target_weights.columns:
-                    target_weights.loc[date, stock] = weight
+                    target_weights.loc[date, stock] = weight * position_scale
         
         return target_weights
     

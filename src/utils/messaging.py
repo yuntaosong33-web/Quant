@@ -5,18 +5,23 @@
 """
 
 import logging
+from typing import Optional, Dict, Any
 
 
 def send_pushplus_msg(
     token: str,
     title: str,
     content: str,
-    template: str = "html"
+    template: str = "html",
+    topic: Optional[str] = None,
+    channel: Optional[str] = None,
+    timeout: float = 30.0,
+    max_retries: int = 3
 ) -> bool:
     """
     使用 PushPlus 发送微信消息
     
-    通过 PushPlus (http://www.pushplus.plus/) 将消息推送到微信。
+    通过 PushPlus (https://www.pushplus.plus/) 将消息推送到微信。
     支持 HTML、Markdown 等多种格式。
     
     Parameters
@@ -33,6 +38,14 @@ def send_pushplus_msg(
         - 'txt': 纯文本
         - 'json': JSON 格式
         - 'markdown': Markdown 格式
+    topic : Optional[str]
+        群组编码（如使用 PushPlus 的 topic 群组推送）
+    channel : Optional[str]
+        推送通道（PushPlus 支持的 channel 参数）
+    timeout : float
+        请求超时（秒）
+    max_retries : int
+        最大重试次数（网络异常/5xx 时重试）
     
     Returns
     -------
@@ -58,26 +71,63 @@ def send_pushplus_msg(
         logging.warning("PushPlus token 未配置，跳过消息推送")
         return False
     
-    url = "http://www.pushplus.plus/send"
-    
-    payload = {
+    # 优先 https；部分网络环境会屏蔽/重定向 http
+    urls = [
+        "https://www.pushplus.plus/send",
+        "http://www.pushplus.plus/send",
+    ]
+
+    payload: Dict[str, Any] = {
         "token": token.strip(),
         "title": title,
         "content": content,
         "template": template
     }
+    if topic:
+        payload["topic"] = topic
+    if channel:
+        payload["channel"] = channel
     
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        result = response.json()
-        
-        if result.get("code") == 200:
-            logging.info(f"PushPlus 消息发送成功: {title}")
-            return True
-        else:
-            error_msg = result.get("msg", "未知错误")
-            logging.error(f"PushPlus 消息发送失败: {error_msg}")
-            return False
+        session = requests.Session()
+        headers = {
+            "User-Agent": "QuantBot/1.0",
+        }
+
+        last_err: Optional[str] = None
+        for attempt in range(1, max(1, int(max_retries)) + 1):
+            for url in urls:
+                try:
+                    # PushPlus 支持 application/json；如遇网关兼容问题可改为 data=payload
+                    response = session.post(url, json=payload, headers=headers, timeout=float(timeout))
+                    if response.status_code >= 500:
+                        last_err = f"HTTP {response.status_code}"
+                        continue
+
+                    try:
+                        result = response.json()
+                    except Exception:
+                        text = (response.text or "").strip()
+                        last_err = f"响应非JSON (HTTP {response.status_code}): {text[:200]}"
+                        continue
+
+                    if result.get("code") == 200:
+                        logging.info(f"PushPlus 消息发送成功: {title}")
+                        return True
+
+                    error_msg = result.get("msg", "未知错误")
+                    last_err = f"{error_msg} (code={result.get('code')})"
+                except requests.exceptions.Timeout:
+                    last_err = "请求超时"
+                except requests.exceptions.RequestException as e:
+                    last_err = f"网络异常: {e}"
+
+            # 重试
+            if attempt < max(1, int(max_retries)):
+                continue
+
+        logging.error(f"PushPlus 消息发送失败: {last_err or '未知错误'}")
+        return False
             
     except requests.exceptions.Timeout:
         logging.error("PushPlus 请求超时")

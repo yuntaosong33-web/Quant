@@ -21,6 +21,25 @@ data:
   # 数据存储路径
   raw_data_path: "data/raw"
   processed_data_path: "data/processed"
+  
+  # ===== API调用优化配置（降低超限风险）=====
+  # 数据获取模式:
+  #   - by_date: 按交易日获取全市场（高效，推荐用于日更）
+  #              每个交易日1次API调用，30天数据≈30次调用
+  #   - by_stock: 按股票逐只获取（适合回测，需要更长历史）
+  #              每只股票2次API调用，5000只股票=10000次调用
+  fetch_mode: "by_date"
+  
+  # 跳过财务指标获取（fina_indicator 接口是逐只股票获取的）
+  # 设为 true 时仅使用 daily_basic 的估值数据（PE/PB/市值/换手率）
+  # daily_basic 是全市场一次获取，非常高效
+  # 如果不需要 ROE 等深层财务指标，建议设为 true 以减少 API 调用
+  skip_fina_indicator: false
+  
+  # 财务指标获取参数（仅当 skip_fina_indicator=false 时生效）
+  # 财务指标有7天本地缓存，缓存命中时不调用API
+  fina_batch_size: 300      # 每批次处理股票数（越大越快，但超限风险越高）
+  fina_batch_sleep: 0.0     # 每批次休息秒数（0=不休息，越小越快，但超限风险越高）
 
 # Tushare 配置
 # 获取 Token: https://tushare.pro/register
@@ -58,15 +77,13 @@ strategy:
   # 策略名称
   name: "Bull Market Offensive"
   
-  # ===== 因子权重配置 (大盘领涨牛市 - 2026年初) =====
-  # IC监控结果: turnover=+0.107(有效), momentum=-0.06(反向), size=-0.08(反向)
-  # 策略: 重仓换手率, 反向使用小盘因子(选大盘), 降低动量
-  # 权重绝对值之和 = 0.50 + 0.20 + 0.30 = 1.0
-  value_weight: 0.0       # 价值因子 - 0% (成长跑赢价值)
-  quality_weight: 0.50    # 换手率因子 - 50% (IC=+0.107，当前最有效)
-  momentum_weight: 0.20   # 动量因子 - 20% (IC为负，降权但不弃用)
-  size_weight: -0.30      # 市值因子 - 负30% (反向！选大盘股)
-  sentiment_weight: 0.20  # 情绪因子 - 20% (配合热点，独立加分)
+  # ===== 因子权重配置（高波动进攻版）=====
+  # 目标：提高组合波动与弹性（偏小盘 + 高波动 + 趋势/情绪），与“银行/低波”反向
+  value_weight: 0.0
+  quality_weight: 0.35     # 波动率暴露（高波动）
+  momentum_weight: 0.55    # 趋势/动量（复合动量）
+  size_weight: 0.10        # 降低小盘暴露，避免“过于小盘”
+  sentiment_weight: 0.10   # 情绪作为加速器（LLM不稳时会自动降级）
   
   # ===== 选股参数 =====
   top_n: 6                # 持仓6只，分散风险
@@ -77,16 +94,38 @@ strategy:
   turnover_threshold: 3.0    # 换手率Z-Score阈值: Z > 3.0 触发熔断
   volatility_threshold: 2.5  # 波动率阈值: 约 250% 年化波动率
   
-  # ===== 板块过滤 =====
-  exclude_chinext: true   # 排除创业板（300开头，波动大）
-  exclude_star: true      # 排除科创板（688开头，门槛高/流动性差）
+  # ===== 板块过滤（账户限制：暂不交易创业板/科创板）=====
+  exclude_chinext: true
+  exclude_star: true
+
+  # ===== 实盘可交易性过滤（高波动策略：放宽约束）=====
+  min_daily_amount: 50000000   # 成交额门槛（元）：抬高以避免微盘/流动性风险
+  min_circ_mv: 3000000000      # 流通市值下限（元）：30亿，抑制“过于小盘”
+  max_price: null              # 高价股过滤：null=关闭
+  max_rsi: 95                  # RSI过滤放宽（或设为 null 关闭）
+  min_efficiency: 0.15         # 允许更震荡的票（提高波动）
+  overheat_check_col: "turnover_5d_zscore"  # 过热熔断只看换手，避免误用“波动率列”
   
-  # ===== 因子列名映射 =====
-  # [牛市进攻 v2] 使用升级版复合因子
-  value_col: "value_composite_zscore"       # 复合估值因子（权重为0，实际不使用）
-  quality_col: "quality_composite_zscore"   # 升级版质量因子 (50%换手率 + 30%低波动 + 20%路径效率)
-  momentum_col: "momentum_composite_zscore" # 升级版动量因子 (含 alpha_002/003/005 + efficiency)
-  size_col: "small_cap_zscore"              # 小市值因子
+  # ===== 趋势过滤（让持仓更“看得过去”：高波动但要求上行趋势）=====
+  trend_filter:
+    enabled: true
+    require_positive_return_20: true
+
+  # ===== 行业分散与黑名单（降低“押错赛道”与持仓观感）=====
+  industry_constraints:
+    enabled: true
+    # 行业来源：tushare_industry / sw (申万)
+    source: "tushare_industry"
+    sw_level: 1
+    industry_col: "industry"
+    max_per_industry: 2
+    excluded_industries: []
+
+  # ===== 因子列名映射（高波动进攻）=====
+  value_col: "value_composite_zscore"
+  quality_col: "volatility_20_zscore"       # 高波动：波动率越高越好（与原“低波”相反）
+  momentum_col: "momentum_composite_zscore"
+  size_col: "small_cap_zscore"
   
   # ===== 调仓配置 =====
   rebalance_frequency: "weekly"  # 周度调仓（牛市轮动快）
@@ -110,6 +149,38 @@ strategy:
     volatility_period: 20            # 波动率计算周期
     high_volatility_threshold: 0.25  # 25% 年化波动率为高波动
     low_volatility_threshold: 0.15   # 15% 年化波动率为低波动
+    # === 自适应权重表（强烈建议显式配置，避免代码默认值与当前行情不一致）===
+    # 说明：下面的 bull 配置与本策略“2026年初大盘领涨、换手有效、动量IC为负”的结论对齐
+    regime_weights:
+      bull:
+        value_weight: 0.0
+        quality_weight: 0.35
+        momentum_weight: 0.55
+        size_weight: 0.10
+        sentiment_weight: 0.10
+      sideways:
+        value_weight: 0.05
+        quality_weight: 0.35
+        momentum_weight: 0.50
+        size_weight: 0.10
+        sentiment_weight: 0.15
+      bear:
+        value_weight: 0.10
+        quality_weight: 0.25
+        momentum_weight: 0.20
+        size_weight: 0.45
+        sentiment_weight: 0.05
+    # === 动态仓位系数（留现金）===
+    # bull 也保留“高波动降仓”开关，避免放量后波动扩张导致回撤超预期
+    position_scale:
+      bull: 1.0
+      sideways: 1.0
+      bear: 0.70
+    high_volatility_position_scale: 1.0
+
+  # ===== 打分归一化（负权重/反向使用时保持信号幅度稳定）=====
+  score_normalization:
+    normalize_by_abs_weight_sum: true
 
 # ============================================================
 # 风险控制配置 - 牛市进攻型参数
@@ -218,6 +289,12 @@ trading:
   
   # 最小交易单位（股）
   min_trade_unit: 100
+  
+  # 最小交易金额（低于此金额的订单会被过滤，减少不必要交易）
+  min_trade_amount: 10000
+  
+  # 最大冲击比率（订单金额/日成交额，超过则标记为不可执行）
+  max_impact_ratio: 0.05
 
 # 报告配置
 report:
@@ -245,6 +322,13 @@ notification:
   
   # 是否启用推送
   enabled: true
+  # 可选：群组/topic（PushPlus 群组推送时使用）
+  topic: ""
+  # 可选：通道（PushPlus 支持的 channel 参数）
+  channel: ""
+  # 请求超时与重试
+  timeout: 30
+  max_retries: 3
 
 # 日志配置
 logging:
@@ -300,14 +384,21 @@ ic_monitor:
   circuit_breaker_enabled: true    # 是否启用因子熔断
   circuit_breaker_ic_threshold: 0.005  # |IC| 低于此值触发熔断（接近无预测力）
   circuit_breaker_ir_threshold: 0.2    # |IC_IR| 低于此值触发熔断（不稳定）
+
+  # ===== 方向校准（IC为负时反向使用）=====
+  directional_adjustment:
+    enabled: true
+    abs_ic_threshold: 0.02
+    ir_threshold: 0.3
+    positive_ratio_threshold: 0.55
   
   # 监控的因子列表
   monitored_factors:
+    # 高波动策略：优先监控“技术面可用且无前视偏差”的因子
     - "momentum_composite_zscore"
-    - "small_cap_zscore"
+    - "volatility_20_zscore"
     - "turnover_5d_zscore"
-    - "quality_composite_zscore"
-    - "value_composite_zscore"
+    - "efficiency_20_zscore"
 
 # 交易日历配置
 trading_calendar:

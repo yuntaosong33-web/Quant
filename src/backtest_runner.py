@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 
 from .strategy import MultiFactorStrategy
+from .features import calculate_factor_ic, calculate_forward_returns
 
 # 延迟导入
 BacktestEngine = None
@@ -394,8 +395,56 @@ def run_backtest(
                 "momentum_col": strategy_config.get("momentum_col", "sharpe_20_zscore"),
                 "size_col": strategy_config.get("size_col", "small_cap_zscore"),
                 "rebalance_frequency": strategy_config.get("rebalance_frequency", "monthly"),
+                "market_regime": strategy_config.get("market_regime", {}),
+                "score_normalization": strategy_config.get("score_normalization", {}),
+                "min_daily_amount": strategy_config.get("min_daily_amount", 50_000_000),
+                "min_circ_mv": strategy_config.get("min_circ_mv", None),
+                "max_price": strategy_config.get("max_price", 100.0),
+                "max_rsi": strategy_config.get("max_rsi", 80.0),
+                "min_efficiency": strategy_config.get("min_efficiency", 0.3),
+                "overheat_check_col": strategy_config.get("overheat_check_col", strategy_config.get("quality_col", "turnover_5d_zscore")),
             }
         )
+
+        # IC 监控（可选）：用于回测时的“方向校准/因子熔断”（与实盘对齐）
+        try:
+            ic_cfg = config.get("ic_monitor", {}) if config is not None else {}
+            if ic_cfg.get("enabled", False) and factor_data is not None and not factor_data.empty:
+                lookback_days = int(ic_cfg.get("lookback_days", 5))
+                monitored_factors: List[str] = list(ic_cfg.get("monitored_factors", []))
+                if monitored_factors:
+                    ic_src = calculate_forward_returns(
+                        data=factor_data,
+                        periods=[lookback_days],
+                        stock_col='stock_code' if 'stock_code' in factor_data.columns else 'symbol',
+                        price_col='close'
+                    )
+                    ic_df = calculate_factor_ic(
+                        data=ic_src,
+                        factor_cols=monitored_factors,
+                        return_col=f'forward_return_{lookback_days}d',
+                        date_col='date' if 'date' in ic_src.columns else 'trade_date',
+                        stock_col='stock_code' if 'stock_code' in ic_src.columns else 'symbol',
+                        log_results=False
+                    )
+
+                    if ic_cfg.get("circuit_breaker_enabled", False) and not ic_df.empty:
+                        strategy.apply_factor_circuit_breaker(
+                            ic_results=ic_df,
+                            ic_threshold=float(ic_cfg.get("circuit_breaker_ic_threshold", 0.005)),
+                            ir_threshold=float(ic_cfg.get("circuit_breaker_ir_threshold", 0.2))
+                        )
+
+                    dir_cfg = ic_cfg.get("directional_adjustment", {})
+                    if dir_cfg.get("enabled", True) and not ic_df.empty:
+                        strategy.apply_factor_direction_from_ic(
+                            ic_results=ic_df,
+                            abs_ic_threshold=float(dir_cfg.get("abs_ic_threshold", 0.02)),
+                            ir_threshold=float(dir_cfg.get("ir_threshold", 0.3)),
+                            positive_ratio_threshold=float(dir_cfg.get("positive_ratio_threshold", 0.55))
+                        )
+        except Exception as e:
+            logger.warning(f"回测 IC 监控/自适应失败（忽略并降级）: {e}")
         
         # 生成目标权重
         target_weights = strategy.generate_target_weights(

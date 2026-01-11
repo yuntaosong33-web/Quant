@@ -400,7 +400,7 @@ class ReportGenerator:
                 ic_mean = row.get('ic_mean', 0)
                 ic_std = row.get('ic_std', 0)
                 ic_ir = row.get('ic_ir', 0)
-                positive_ratio = row.get('positive_ratio', 0)
+                positive_ratio = row.get('ic_positive_ratio', row.get('positive_ratio', 0))
                 
                 if abs(ic_mean) >= 0.03:
                     status = "✅ 有效"
@@ -422,7 +422,7 @@ class ReportGenerator:
                 ic_mean = row.get('ic_mean', 0)
                 ic_std = row.get('ic_std', 0)
                 ic_ir = row.get('ic_ir', 0)
-                positive_ratio = row.get('positive_ratio', 0)
+                positive_ratio = row.get('ic_positive_ratio', row.get('positive_ratio', 0))
                 
                 if abs(ic_mean) >= 0.03:
                     status_class = "ic-valid"

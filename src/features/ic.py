@@ -4,7 +4,7 @@
 提供因子 IC (Information Coefficient) 计算和前瞻收益计算功能。
 """
 
-from typing import List
+from typing import List, Optional
 import logging
 
 import pandas as pd
@@ -80,6 +80,28 @@ def calculate_factor_ic(
     
     results = []
     
+    def _safe_spearman_ic(x: pd.DataFrame, factor: str, ret: str) -> float:
+        """
+        安全计算 Spearman 相关，避免常数输入触发警告并污染结果。
+        """
+        if factor not in x.columns or ret not in x.columns:
+            return float('nan')
+
+        a = x[factor]
+        b = x[ret]
+        mask = a.notna() & b.notna()
+        if mask.sum() <= 5:
+            return float('nan')
+
+        a = a[mask]
+        b = b[mask]
+
+        # 常数序列（或全相同 rank）会导致 Spearman 不定义
+        if a.nunique(dropna=True) <= 1 or b.nunique(dropna=True) <= 1:
+            return float('nan')
+
+        return float(a.corr(b, method='spearman'))
+
     for col in factor_cols:
         if col not in data.columns:
             logger.debug(f"因子列 '{col}' 不存在，跳过")
@@ -89,13 +111,11 @@ def calculate_factor_ic(
             # 按日期计算每日 IC（Spearman 秩相关）
             if date_col in data.columns:
                 ic_by_date = data.groupby(date_col).apply(
-                    lambda x: x[col].corr(x[return_col], method='spearman')
-                    if x[col].notna().sum() > 5 and x[return_col].notna().sum() > 5
-                    else np.nan,
+                    lambda x: _safe_spearman_ic(x, col, return_col),
                     include_groups=False
                 )
             else:
-                ic_value = data[col].corr(data[return_col], method='spearman')
+                ic_value = _safe_spearman_ic(data, col, return_col)
                 ic_by_date = pd.Series([ic_value])
             
             ic_by_date = ic_by_date.dropna()
@@ -164,7 +184,8 @@ def calculate_forward_returns(
     data: pd.DataFrame,
     periods: List[int] = None,
     stock_col: str = 'stock_code',
-    price_col: str = 'close'
+    price_col: str = 'close',
+    date_col: Optional[str] = None
 ) -> pd.DataFrame:
     """
     计算多期前瞻收益
@@ -189,6 +210,20 @@ def calculate_forward_returns(
         periods = [1, 5, 10, 20]
     
     result = data.copy()
+
+    # 关键：前瞻收益必须按日期排序，否则 shift(-N) 会错位，导致 IC 失真/全 NaN
+    if stock_col in result.columns:
+        _date_col = date_col
+        if _date_col is None:
+            _date_col = 'trade_date' if 'trade_date' in result.columns else ('date' if 'date' in result.columns else None)
+
+        if _date_col is not None and _date_col in result.columns:
+            try:
+                result[_date_col] = pd.to_datetime(result[_date_col])
+                result = result.sort_values([stock_col, _date_col], kind='mergesort')
+            except Exception:
+                # 排序失败则降级（不抛错），但可能影响结果精度
+                pass
     
     for period in periods:
         col_name = f'forward_return_{period}d'

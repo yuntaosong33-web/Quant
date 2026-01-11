@@ -25,8 +25,17 @@ import time
 
 import pandas as pd
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
+
+# 可选导入 torch（情绪分析需要，但不阻止模块加载）
+try:
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    Dataset = object  # 占位符
+    DataLoader = None
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -1507,3 +1516,261 @@ if __name__ == "__main__":
     print("测试完成")
     print("=" * 60)
 
+
+# ============================================================================
+# SentimentEngine - 策略层适配器（支持 qwen/finbert 双模式）
+# ============================================================================
+
+class SentimentEngine:
+    """
+    情绪分析引擎 - 策略层适配器
+    
+    支持两种模式：
+    1. qwen 模式：使用阿里云通义千问 API（推荐，无需本地 GPU）
+    2. finbert 模式：使用本地 FinBERT 模型（需要 torch/transformers）
+    
+    Parameters
+    ----------
+    config : Dict[str, Any]
+        配置字典，包含：
+        - provider: 'qwen' 或 'finbert'，默认根据配置自动选择
+        - model: qwen 模型名称（如 'qwen3-max'）
+        - base_url: API 端点
+        - api_key: API 密钥（或从环境变量 DASHSCOPE_API_KEY 读取）
+    
+    Examples
+    --------
+    >>> # qwen 模式
+    >>> config = {"provider": "qwen", "model": "qwen3-max"}
+    >>> engine = SentimentEngine(config)
+    >>> result = engine.calculate_sentiment(["000001", "600519"], "2024-01-15")
+    """
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        """
+        初始化情绪分析引擎
+        
+        Parameters
+        ----------
+        config : Optional[Dict[str, Any]]
+            配置字典
+        """
+        import os
+        config = config or {}
+        
+        # 确定使用哪种模式
+        self._provider = config.get("provider", "qwen").lower()
+        
+        if self._provider == "qwen":
+            # qwen API 模式
+            self._model = config.get("model", "qwen3-max")
+            self._fallback_model = config.get("fallback_model", "qwen-turbo")
+            self._base_url = config.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+            self._api_key = config.get("api_key") or os.environ.get("DASHSCOPE_API_KEY")
+            self._timeout = config.get("timeout", 30)
+            self._max_retries = config.get("max_retries", 3)
+            
+            if not self._api_key:
+                raise ValueError("qwen 模式需要 API 密钥。请设置环境变量 DASHSCOPE_API_KEY 或在配置中提供 api_key")
+            
+            self._client = None
+            self._initialized = False
+            
+            logger.info(f"SentimentEngine 配置完成 (qwen): model={self._model}")
+            
+        else:
+            # finbert 本地模式
+            if not TORCH_AVAILABLE:
+                raise ImportError(
+                    "finbert 模式需要 PyTorch。请安装: pip install torch transformers\n"
+                    "或使用 qwen 模式（推荐）: 设置 provider: qwen"
+                )
+            
+            self._model_name = config.get("model_name", "ProsusAI/finbert")
+            self._device = config.get("device", "auto")
+            self._batch_size = config.get("batch_size", 16)
+            self._cache_dir = config.get("cache_dir", "data/cache/sentiment")
+            self._pipeline: Optional[SentimentPipeline] = None
+            self._initialized = False
+            
+            logger.info(f"SentimentEngine 配置完成 (finbert): model={self._model_name}")
+    
+    def _ensure_initialized(self) -> None:
+        """确保引擎已初始化"""
+        if self._initialized:
+            return
+            
+        if self._provider == "qwen":
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                    timeout=self._timeout
+                )
+                self._initialized = True
+                logger.info("SentimentEngine (qwen) 初始化成功")
+            except ImportError:
+                raise ImportError("请安装 openai 库: pip install openai")
+            except Exception as e:
+                logger.error(f"SentimentEngine 初始化失败: {e}")
+                raise
+        else:
+            try:
+                self._pipeline = SentimentPipeline(
+                    model_name=self._model_name,
+                    device=self._device,
+                    batch_size=self._batch_size,
+                    cache_dir=self._cache_dir
+                )
+                self._initialized = True
+                logger.info("SentimentEngine (finbert) 初始化成功")
+            except Exception as e:
+                logger.error(f"SentimentEngine 管道初始化失败: {e}")
+                raise
+    
+    def _analyze_with_qwen(self, stock_code: str, stock_name: str = "") -> Dict[str, Any]:
+        """
+        使用 qwen API 分析单只股票的情绪
+        
+        Returns
+        -------
+        Dict with keys: score, confidence, reasoning
+        """
+        prompt = f"""你是一位专业的A股市场分析师。请分析股票 {stock_code} {stock_name} 的当前市场情绪。
+
+请基于你对该股票的了解，从以下维度评估：
+1. 近期市场热度和关注度
+2. 行业景气度和政策面
+3. 技术面趋势强度
+4. 资金面流向判断
+
+请返回JSON格式的评估结果：
+{{
+    "score": <情绪分数，范围-1.0到1.0，正值看多，负值看空>,
+    "confidence": <置信度，范围0.0到1.0>,
+    "category": <"positive"/"negative"/"neutral">,
+    "reasoning": <简要理由，20字以内>
+}}
+
+只返回JSON，不要其他内容。"""
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "你是专业的A股情绪分析师，返回严格的JSON格式。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200
+            )
+            
+            content = response.choices[0].message.content.strip()
+            
+            # 解析 JSON
+            import re
+            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                return {
+                    'score': float(result.get('score', 0.0)),
+                    'confidence': float(result.get('confidence', 0.5)),
+                    'category': result.get('category', 'neutral'),
+                    'reasoning': result.get('reasoning', '')
+                }
+            else:
+                logger.warning(f"无法解析 qwen 响应: {content[:100]}")
+                return {'score': 0.0, 'confidence': 0.3, 'category': 'neutral', 'reasoning': '解析失败'}
+                
+        except Exception as e:
+            logger.error(f"qwen API 调用失败 ({stock_code}): {e}")
+            return {'score': 0.0, 'confidence': 0.3, 'category': 'neutral', 'reasoning': str(e)[:20]}
+    
+    def calculate_sentiment(
+        self, 
+        stock_list: List[str], 
+        date: str
+    ) -> pd.DataFrame:
+        """
+        计算股票列表的情绪分数
+        
+        Parameters
+        ----------
+        stock_list : List[str]
+            股票代码列表
+        date : str
+            日期字符串 (YYYY-MM-DD 或 YYYYMMDD)
+        
+        Returns
+        -------
+        pd.DataFrame
+            包含以下列的 DataFrame:
+            - stock_code: 股票代码
+            - score: 情绪分数 [-1.0, 1.0]
+            - confidence: 置信度 [0.0, 1.0]
+            - news_count: 新闻数量（qwen 模式为 1）
+        """
+        self._ensure_initialized()
+        
+        if not stock_list:
+            return pd.DataFrame(columns=['stock_code', 'score', 'confidence', 'news_count'])
+        
+        # 标准化日期格式
+        if '-' not in date:
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+        
+        if self._provider == "qwen":
+            # qwen API 模式
+            results = []
+            for stock in stock_list:
+                result = self._analyze_with_qwen(stock)
+                results.append({
+                    'stock_code': stock,
+                    'score': result['score'],
+                    'confidence': result['confidence'],
+                    'news_count': 1,
+                    'reasoning': result.get('reasoning', '')
+                })
+            return pd.DataFrame(results)
+        
+        else:
+            # finbert 本地模式
+            try:
+                result_df = self._pipeline.analyze_daily(stock_list, date)
+                
+                if result_df.empty:
+                    logger.warning(f"情绪分析返回空结果: {date}, {len(stock_list)} 只股票")
+                    return pd.DataFrame({
+                        'stock_code': stock_list,
+                        'score': [0.0] * len(stock_list),
+                        'confidence': [0.5] * len(stock_list),
+                        'news_count': [0] * len(stock_list)
+                    })
+                
+                return pd.DataFrame({
+                    'stock_code': result_df['stock_code'],
+                    'score': result_df.get('sentiment_score', result_df.get('score', 0.0)),
+                    'confidence': result_df.get('avg_confidence', result_df.get('confidence', 0.5)),
+                    'news_count': result_df.get('news_count', 0)
+                })
+                
+            except Exception as e:
+                logger.error(f"情绪分析失败: {e}")
+                return pd.DataFrame({
+                    'stock_code': stock_list,
+                    'score': [0.0] * len(stock_list),
+                    'confidence': [0.5] * len(stock_list),
+                    'news_count': [0] * len(stock_list)
+                })
+    
+    def is_available(self) -> bool:
+        """检查引擎是否可用"""
+        try:
+            self._ensure_initialized()
+            if self._provider == "qwen":
+                return self._initialized and self._client is not None
+            else:
+                return self._initialized and self._pipeline is not None
+        except Exception:
+            return False

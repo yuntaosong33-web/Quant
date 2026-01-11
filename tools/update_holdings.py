@@ -268,6 +268,209 @@ def parse_stock_amount_pairs(args: argparse.Namespace) -> List[tuple]:
     return list(zip(stocks, amounts))
 
 
+def import_from_csv(data: Dict[str, Any], csv_path: str, clear_existing: bool = False) -> bool:
+    """
+    从 CSV 文件导入持仓
+    
+    Parameters
+    ----------
+    data : Dict[str, Any]
+        持仓数据字典
+    csv_path : str
+        CSV 文件路径
+    clear_existing : bool
+        是否清空现有持仓
+    
+    Returns
+    -------
+    bool
+        导入是否成功
+    """
+    import pandas as pd
+    import re
+    
+    try:
+        # 尝试多种编码
+        for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig']:
+            try:
+                df = pd.read_csv(csv_path, encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            print(f"❌ 无法读取 CSV 文件（编码问题）")
+            return False
+        
+        print(f"📄 读取 CSV: {csv_path}")
+        print(f"   列名: {list(df.columns)}")
+        print(f"   行数: {len(df)}")
+        
+        # 识别列名
+        stock_col = None
+        amount_col = None
+        cash_col = None
+        
+        # 常见的股票代码列名
+        stock_candidates = ['股票代码', '证券代码', 'stock_code', 'symbol', '代码', '证券名称']
+        for col in stock_candidates:
+            if col in df.columns:
+                stock_col = col
+                break
+        
+        # 常见的市值列名
+        amount_candidates = ['持仓市值', '市值', '参考市值', '市值（元）', 'amount', 'value', 
+                           '最新市值', '股票市值', '持股市值']
+        for col in amount_candidates:
+            if col in df.columns:
+                amount_col = col
+                break
+        
+        if stock_col is None or amount_col is None:
+            print(f"❌ 无法识别列名")
+            print(f"   请确保 CSV 包含以下列之一:")
+            print(f"   - 股票代码: {stock_candidates}")
+            print(f"   - 市值: {amount_candidates}")
+            return False
+        
+        print(f"   识别列: 股票={stock_col}, 市值={amount_col}")
+        
+        if clear_existing:
+            data["positions"] = {}
+            print("🗑️  已清空现有持仓")
+        
+        imported_count = 0
+        for _, row in df.iterrows():
+            stock = str(row[stock_col]).strip()
+            
+            # 提取6位股票代码
+            match = re.search(r'\d{6}', stock)
+            if match:
+                stock = match.group()
+            else:
+                continue
+            
+            try:
+                amount = float(str(row[amount_col]).replace(',', '').replace('，', ''))
+            except ValueError:
+                continue
+            
+            if amount > 0:
+                old_amount = data["positions"].get(stock, 0)
+                data["positions"][stock] = amount
+                if old_amount > 0:
+                    diff = amount - old_amount
+                    print(f"  📝 {stock}: ¥{old_amount:,.0f} → ¥{amount:,.0f} ({'+' if diff >= 0 else ''}{diff:,.0f})")
+                else:
+                    print(f"  ➕ {stock}: ¥{amount:,.0f}")
+                imported_count += 1
+        
+        print(f"\n✅ 成功导入 {imported_count} 只股票持仓")
+        return True
+        
+    except Exception as e:
+        print(f"❌ CSV 导入失败: {e}")
+        return False
+
+
+def record_execution(
+    data: Dict[str, Any],
+    stock: str,
+    side: str,
+    planned_amount: float,
+    actual_amount: float,
+    reason: str = ""
+) -> None:
+    """
+    记录执行偏差（部分成交）
+    
+    Parameters
+    ----------
+    data : Dict[str, Any]
+        持仓数据字典
+    stock : str
+        股票代码
+    side : str
+        方向: 'BUY' 或 'SELL'
+    planned_amount : float
+        计划金额
+    actual_amount : float
+        实际成交金额
+    reason : str
+        未完全成交原因
+    """
+    import re
+    from datetime import datetime
+    
+    # 标准化股票代码
+    match = re.search(r'\d{6}', stock)
+    if match:
+        stock = match.group()
+    
+    # 初始化执行记录
+    if "execution_log" not in data:
+        data["execution_log"] = []
+    
+    diff = actual_amount - planned_amount
+    fill_rate = actual_amount / planned_amount if planned_amount > 0 else 0
+    
+    record = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "stock": stock,
+        "side": side.upper(),
+        "planned": planned_amount,
+        "actual": actual_amount,
+        "diff": diff,
+        "fill_rate": fill_rate,
+        "reason": reason,
+    }
+    
+    data["execution_log"].append(record)
+    
+    # 更新持仓
+    current = data["positions"].get(stock, 0)
+    if side.upper() == "BUY":
+        data["positions"][stock] = current + actual_amount
+        print(f"📈 买入记录: {stock} 计划 ¥{planned_amount:,.0f}, 实际 ¥{actual_amount:,.0f} ({fill_rate:.0%})")
+    else:
+        new_amount = max(0, current - actual_amount)
+        if new_amount > 0:
+            data["positions"][stock] = new_amount
+        else:
+            data["positions"].pop(stock, None)
+        print(f"📉 卖出记录: {stock} 计划 ¥{planned_amount:,.0f}, 实际 ¥{actual_amount:,.0f} ({fill_rate:.0%})")
+    
+    if reason:
+        print(f"   原因: {reason}")
+    
+    # 只保留最近30条记录
+    if len(data["execution_log"]) > 30:
+        data["execution_log"] = data["execution_log"][-30:]
+
+
+def show_execution_log(data: Dict[str, Any]) -> None:
+    """显示执行记录"""
+    log = data.get("execution_log", [])
+    
+    if not log:
+        print("\n📋 无执行记录")
+        return
+    
+    print("\n" + "=" * 70)
+    print("📋 最近执行记录")
+    print("=" * 70)
+    print(f"{'日期':<12} {'股票':<8} {'方向':<6} {'计划':>12} {'实际':>12} {'成交率':>8}")
+    print("-" * 70)
+    
+    for record in log[-10:]:  # 显示最近10条
+        print(
+            f"{record['date']:<12} {record['stock']:<8} {record['side']:<6} "
+            f"¥{record['planned']:>10,.0f} ¥{record['actual']:>10,.0f} {record['fill_rate']:>7.0%}"
+        )
+    
+    print("=" * 70)
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
@@ -292,6 +495,18 @@ def main():
     
     # 清空所有持仓
     python tools/update_holdings.py --clear
+    
+    # 从券商 CSV 导入持仓（日终对账）
+    python tools/update_holdings.py --import broker_export.csv
+    
+    # 导入并覆盖现有持仓
+    python tools/update_holdings.py --import broker_export.csv --overwrite
+    
+    # 记录部分成交（买入）
+    python tools/update_holdings.py --exec 600519 --side BUY --planned 50000 --actual 30000 --reason "涨停封单"
+    
+    # 查看执行记录
+    python tools/update_holdings.py --log
         """
     )
     
@@ -329,6 +544,58 @@ def main():
         help="仅显示当前持仓（不做修改）"
     )
     
+    # CSV 导入参数
+    parser.add_argument(
+        "--import", "-i",
+        dest="import_csv",
+        metavar="CSV_PATH",
+        help="从券商导出的 CSV 文件导入持仓"
+    )
+    
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="导入时覆盖现有持仓（与 --import 配合使用）"
+    )
+    
+    # 执行记录参数
+    parser.add_argument(
+        "--exec", "-e",
+        dest="exec_stock",
+        metavar="CODE",
+        help="记录执行情况的股票代码"
+    )
+    
+    parser.add_argument(
+        "--side",
+        choices=["BUY", "SELL", "buy", "sell"],
+        help="交易方向（与 --exec 配合使用）"
+    )
+    
+    parser.add_argument(
+        "--planned",
+        type=float,
+        help="计划交易金额（与 --exec 配合使用）"
+    )
+    
+    parser.add_argument(
+        "--actual",
+        type=float,
+        help="实际成交金额（与 --exec 配合使用）"
+    )
+    
+    parser.add_argument(
+        "--reason",
+        default="",
+        help="未完全成交原因（可选）"
+    )
+    
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="显示执行记录"
+    )
+    
     args = parser.parse_args()
     
     # 如果没有任何参数，显示帮助
@@ -341,6 +608,37 @@ def main():
     
     # 仅显示模式
     if args.show:
+        print_holdings(data)
+        return
+    
+    # 显示执行记录
+    if args.log:
+        show_execution_log(data)
+        return
+    
+    # CSV 导入模式
+    if args.import_csv:
+        if import_from_csv(data, args.import_csv, clear_existing=args.overwrite):
+            save_holdings(data)
+            print_holdings(data)
+        return
+    
+    # 记录执行情况
+    if args.exec_stock:
+        if not args.side or args.planned is None or args.actual is None:
+            print("❌ --exec 需要配合 --side, --planned, --actual 使用")
+            print("   示例: --exec 600519 --side BUY --planned 50000 --actual 30000")
+            return
+        
+        record_execution(
+            data,
+            args.exec_stock,
+            args.side,
+            args.planned,
+            args.actual,
+            args.reason
+        )
+        save_holdings(data)
         print_holdings(data)
         return
     

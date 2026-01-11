@@ -786,11 +786,14 @@ class TushareDataLoaderBase:
         self,
         stock_list: List[str],
         show_progress: bool = True,
-        batch_size: int = 150,
-        batch_sleep: float = 8.0
+        batch_size: int = 300,
+        batch_sleep: float = 0.0
     ) -> pd.DataFrame:
         """
         批量获取财务指标（带限流保护）
+        
+        注意：财务指标有7天本地缓存，缓存命中时不调用API。
+        实际API调用次数 = 未命中缓存的股票数量。
         
         Parameters
         ----------
@@ -799,9 +802,9 @@ class TushareDataLoaderBase:
         show_progress : bool
             是否显示进度
         batch_size : int
-            每批次处理的股票数量（默认 150）
+            每批次处理的股票数量（默认 300，有缓存保护）
         batch_sleep : float
-            每批次之间的休息时间（秒）
+            每批次之间的休息时间（秒，默认 0 不休息）
         
         Returns
         -------
@@ -832,8 +835,9 @@ class TushareDataLoaderBase:
         for i, stock in iterator:
             df = self.fetch_financial_indicator(stock)
             if df is not None and not df.empty:
-                # 只取最新一期
-                df = df.sort_values("end_date", ascending=False).head(1)
+                # 只取最新一期，并强制重置索引
+                df = df.sort_values("end_date", ascending=False).head(1).copy()
+                df.index = pd.RangeIndex(len(df))
                 df["stock_code"] = stock
                 all_data.append(df)
                 success_count += 1
@@ -842,8 +846,8 @@ class TushareDataLoaderBase:
             if show_progress and hasattr(iterator, 'set_postfix'):
                 iterator.set_postfix({"成功": success_count, "当前": stock})
             
-            # 批次休息（避免触发频率限制）
-            if (i + 1) % batch_size == 0 and (i + 1) < total:
+            # 批次休息（避免触发频率限制）- 仅在 batch_sleep > 0 时休息
+            if batch_sleep > 0 and (i + 1) % batch_size == 0 and (i + 1) < total:
                 if show_progress and hasattr(iterator, 'set_description'):
                     iterator.set_description(f"📈 休息{batch_sleep}s")
                 time.sleep(batch_sleep)
@@ -861,13 +865,261 @@ class TushareDataLoaderBase:
             # 删除全为 NaN 的列
             df_cleaned = df.dropna(axis=1, how='all')
             if not df_cleaned.empty and not df_cleaned.isna().all().all():
+                # 强制重置索引，避免 concat 时的索引问题
+                df_cleaned = df_cleaned.copy()
+                df_cleaned.index = pd.RangeIndex(len(df_cleaned))
                 valid_data.append(df_cleaned)
         
         if not valid_data:
             return pd.DataFrame()
         
+        # 使用 ignore_index=True 并在之后再次强制设置 RangeIndex
         result = pd.concat(valid_data, ignore_index=True)
+        # 强制使用 RangeIndex 确保索引唯一性
+        result.index = pd.RangeIndex(len(result))
         logger.info(f"批量获取财务指标完成: {success_count}/{total} 只股票成功, {len(result)} 条记录")
+        return result
+    
+    # ==================== 按日期全市场获取（高效模式）====================
+    
+    def fetch_daily_by_date(
+        self,
+        trade_date: str,
+        stock_list: Optional[List[str]] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        按交易日获取全市场日线数据（高效：1次API调用）
+        
+        这是获取日线数据最高效的方式，一次请求获取当日所有股票数据。
+        相比 fetch_daily_data_batch 逐只股票获取，API调用次数从 N 降到 1。
+        
+        Parameters
+        ----------
+        trade_date : str
+            交易日期，格式 YYYYMMDD 或 YYYY-MM-DD
+        stock_list : Optional[List[str]]
+            股票列表，用于过滤结果。如果不提供，返回全市场数据。
+        
+        Returns
+        -------
+        Optional[pd.DataFrame]
+            日线数据，包含 stock_code, open, high, low, close, volume, amount 等
+        
+        Notes
+        -----
+        - 推荐用于日更流程：每次只需获取最新交易日的数据
+        - 自动缓存：同一交易日的数据只会调用一次 API
+        
+        Examples
+        --------
+        >>> loader = TushareDataLoaderBase()
+        >>> df = loader.fetch_daily_by_date("20260110")
+        >>> print(f"获取到 {len(df)} 只股票的日线数据")
+        """
+        trade_date = trade_date.replace("-", "")
+        
+        # 尝试缓存（按日期缓存全市场数据）
+        cache_file = self.cache_dir / f"daily_all_{trade_date}.parquet"
+        
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    logger.info(f"从缓存加载全市场日线: {trade_date}, {len(df)} 条")
+                    if stock_list:
+                        df = df[df["stock_code"].isin(stock_list)]
+                    return df
+            except Exception as e:
+                logger.warning(f"缓存读取失败: {e}")
+        
+        # API 获取（一次调用获取当日全市场）
+        logger.info(f"📊 获取全市场日线数据: {trade_date} (单次API调用)")
+        
+        df = self._fetch_with_retry(
+            self.pro.daily,
+            trade_date=trade_date
+        )
+        
+        if df is None or df.empty:
+            logger.warning(f"无法获取 {trade_date} 的日线数据")
+            return None
+        
+        # 标准化列名
+        df = self._standardize_daily_columns(df)
+        
+        # 添加 stock_code 列（6位代码）
+        if "ts_code" in df.columns:
+            df["stock_code"] = df["ts_code"].str[:6]
+        
+        # 保存缓存
+        try:
+            df.to_parquet(cache_file, index=False)
+            logger.info(f"全市场日线已缓存: {cache_file.name}")
+        except Exception as e:
+            logger.warning(f"缓存保存失败: {e}")
+        
+        # 过滤股票
+        if stock_list and "stock_code" in df.columns:
+            df = df[df["stock_code"].isin(stock_list)]
+        
+        logger.info(f"获取全市场日线完成: {len(df)} 条记录")
+        return df
+    
+    def fetch_daily_range_optimized(
+        self,
+        start_date: str,
+        end_date: str,
+        stock_list: Optional[List[str]] = None,
+        show_progress: bool = True
+    ) -> pd.DataFrame:
+        """
+        智能获取日期范围内的日线数据（自动选择最优策略）
+        
+        根据日期跨度和股票数量自动选择最高效的获取方式：
+        - 日期跨度小（≤30天）：按日期逐日获取（每日1次API）
+        - 日期跨度大：按股票获取（使用原有 batch 方法）
+        
+        Parameters
+        ----------
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        stock_list : Optional[List[str]]
+            股票列表
+        show_progress : bool
+            是否显示进度
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的日线数据
+        """
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        # 计算日期跨度
+        start_dt = datetime.strptime(start_date, "%Y%m%d")
+        end_dt = datetime.strptime(end_date, "%Y%m%d")
+        days_span = (end_dt - start_dt).days + 1
+        
+        # 获取交易日历
+        trade_calendar = self.fetch_trade_calendar(start_date, end_date)
+        trade_days = len(trade_calendar)
+        
+        logger.info(f"📊 智能数据获取: {start_date}~{end_date}, {trade_days} 个交易日")
+        
+        # 策略选择：交易日数 ≤ 60 时用"按日期"模式（更高效）
+        # 因为 1 个交易日 = 1 次API调用（全市场）
+        # 而 1000 只股票按股票获取 = 1000 次API调用
+        if trade_days <= 60:
+            logger.info(f"使用【按日期】模式: {trade_days} 次 API 调用")
+            return self._fetch_by_date_range(trade_calendar, stock_list, show_progress)
+        else:
+            # 日期跨度大，按股票获取（适合回测等场景）
+            logger.info(f"使用【按股票】模式: 日期跨度较大 ({trade_days} 天)")
+            if stock_list is None:
+                stock_list = self.fetch_all_stocks()
+            return self.fetch_daily_data_batch(
+                stock_list, start_date, end_date,
+                show_progress=show_progress
+            )
+    
+    def _fetch_by_date_range(
+        self,
+        trade_calendar: pd.DatetimeIndex,
+        stock_list: Optional[List[str]] = None,
+        show_progress: bool = True
+    ) -> pd.DataFrame:
+        """按日期范围逐日获取数据"""
+        all_data = []
+        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    trade_calendar,
+                    desc="📊 按日期获取",
+                    unit="天",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = trade_calendar
+        else:
+            iterator = trade_calendar
+        
+        for trade_date in iterator:
+            date_str = trade_date.strftime("%Y%m%d")
+            df = self.fetch_daily_by_date(date_str, stock_list)
+            if df is not None and not df.empty:
+                all_data.append(df)
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(all_data, ignore_index=True)
+        logger.info(f"按日期获取完成: {len(result)} 条记录")
+        return result
+    
+    def fetch_daily_basic_range(
+        self,
+        start_date: str,
+        end_date: str,
+        stock_list: Optional[List[str]] = None,
+        show_progress: bool = True
+    ) -> pd.DataFrame:
+        """
+        按日期范围获取每日基础指标（PE/PB/市值/换手率等）
+        
+        使用按日期模式，每个交易日 1 次 API 调用获取全市场数据。
+        
+        Parameters
+        ----------
+        start_date : str
+            开始日期
+        end_date : str
+            结束日期
+        stock_list : Optional[List[str]]
+            股票列表，用于过滤
+        show_progress : bool
+            是否显示进度
+        
+        Returns
+        -------
+        pd.DataFrame
+            合并后的基础指标数据
+        """
+        start_date = start_date.replace("-", "")
+        end_date = end_date.replace("-", "")
+        
+        trade_calendar = self.fetch_trade_calendar(start_date, end_date)
+        all_data = []
+        
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(
+                    trade_calendar,
+                    desc="📈 获取估值数据",
+                    unit="天",
+                    ncols=80
+                )
+            except ImportError:
+                iterator = trade_calendar
+        else:
+            iterator = trade_calendar
+        
+        for trade_date in iterator:
+            date_str = trade_date.strftime("%Y%m%d")
+            df = self.fetch_daily_basic(date_str, stock_list)
+            if df is not None and not df.empty:
+                all_data.append(df)
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        result = pd.concat(all_data, ignore_index=True)
+        logger.info(f"估值数据获取完成: {len(result)} 条记录")
         return result
     
     # ==================== 指数日线 ====================
@@ -1225,7 +1477,6 @@ class TushareDataLoaderBase:
     def _standardize_daily_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """标准化日线数据列名"""
         column_mapping = {
-            "trade_date": "date",
             "ts_code": "ts_code",
             "open": "open",
             "high": "high",
@@ -1239,8 +1490,14 @@ class TushareDataLoaderBase:
         
         df = df.rename(columns=column_mapping)
         
-        if "date" in df.columns:
+        # 处理日期列：保留 trade_date 作为标准名（兼容性）
+        if "trade_date" in df.columns:
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df["date"] = df["trade_date"]  # 添加别名
+            df = df.sort_values("trade_date")
+        elif "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"])
+            df["trade_date"] = df["date"]  # 添加别名
             df = df.sort_values("date")
         
         # 成交量单位转换（Tushare 单位是手，转为股）
@@ -1255,6 +1512,7 @@ class TushareDataLoaderBase:
     
     def _standardize_basic_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """标准化每日基础指标列名"""
+        # 注意：dv_ttm 和 dv_ratio 不能同时映射到 dividend_yield
         column_mapping = {
             "trade_date": "date",
             "ts_code": "ts_code",
@@ -1262,15 +1520,22 @@ class TushareDataLoaderBase:
             "pe": "pe",
             "pb": "pb",
             "ps_ttm": "ps_ttm",
-            "dv_ttm": "dividend_yield",
-            "dv_ratio": "dividend_yield",
             "total_mv": "total_mv",
             "circ_mv": "circ_mv",
             "turnover_rate": "turn",
             "turnover_rate_f": "turn_free",
         }
         
+        # 处理 dividend_yield 列名冲突：优先使用 dv_ttm
+        if "dv_ttm" in df.columns:
+            column_mapping["dv_ttm"] = "dividend_yield"
+        elif "dv_ratio" in df.columns:
+            column_mapping["dv_ratio"] = "dividend_yield"
+        
         df = df.rename(columns=column_mapping)
+        
+        # 删除重复的列名（如果仍然存在）
+        df = df.loc[:, ~df.columns.duplicated(keep='first')]
         
         # 提取 6 位股票代码
         if "ts_code" in df.columns:
@@ -1284,10 +1549,14 @@ class TushareDataLoaderBase:
             if col in df.columns:
                 df[col] = df[col] * 10000
         
+        # 确保索引唯一性
+        df.index = pd.RangeIndex(len(df))
         return df
     
     def _standardize_financial_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """标准化财务指标列名"""
+        # 注意：profit_to_gr 和 netprofit_margin 不能同时映射到 net_margin
+        # 优先使用 netprofit_margin，如果不存在则使用 profit_to_gr
         column_mapping = {
             "ts_code": "ts_code",
             "ann_date": "ann_date",
@@ -1297,20 +1566,29 @@ class TushareDataLoaderBase:
             "roe_yearly": "roe_ttm",
             "roa": "roa",
             "grossprofit_margin": "gross_margin",
-            "profit_to_gr": "net_margin",
             "eps": "eps",
             "bps": "bps",
-            "netprofit_margin": "net_margin",
             "current_ratio": "current_ratio",
             "quick_ratio": "quick_ratio",
         }
         
+        # 处理 net_margin 列名冲突：优先使用 netprofit_margin
+        if "netprofit_margin" in df.columns:
+            column_mapping["netprofit_margin"] = "net_margin"
+        elif "profit_to_gr" in df.columns:
+            column_mapping["profit_to_gr"] = "net_margin"
+        
         df = df.rename(columns=column_mapping)
+        
+        # 删除重复的列名（如果仍然存在）
+        df = df.loc[:, ~df.columns.duplicated(keep='first')]
         
         # 提取 6 位股票代码
         if "ts_code" in df.columns:
             df["stock_code"] = df["ts_code"].str[:6]
         
+        # 确保索引唯一性
+        df.index = pd.RangeIndex(len(df))
         return df
     
     # ==================== 数据单位验证工具 ====================

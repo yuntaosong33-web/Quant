@@ -43,14 +43,22 @@ from .numba_utils import (
     calculate_kdj_numba,
 )
 
-# 从原始 features.py 导入大型类（向后兼容）
+# 从原始模块导入大型类（向后兼容）
 try:
-    from ..features import FactorCalculator, SentimentEngine
+    from ..features import FactorCalculator
 except ImportError:
     try:
-        from features import FactorCalculator, SentimentEngine
+        from features import FactorCalculator
     except ImportError:
         FactorCalculator = None
+
+# 导入情绪分析引擎
+try:
+    from ..sentiment_analyzer import SentimentEngine
+except ImportError:
+    try:
+        from sentiment_analyzer import SentimentEngine
+    except ImportError:
         SentimentEngine = None
 
 __all__ = [
