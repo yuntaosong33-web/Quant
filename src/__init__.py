@@ -6,16 +6,23 @@ A股量化交易系统 (A-Share Quantitative Trading System)
 
 主要模块:
     - data_loader: 数据获取与ETL处理
+    - tushare/: Tushare 数据加载器（重构后的模块化版本）
+    - strategy/: 策略逻辑实现（重构后的模块化版本）
     - features: 因子计算引擎
-    - strategy: 策略逻辑实现
     - backtest: VectorBT回测流程
     - optimizer: 投资组合优化
     - utils: 通用工具函数
+    - daily_runner: 每日更新运行器
+    - backtest_runner: 回测执行逻辑
+    - report_generator: 报告生成器
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Quant Developer"
 
+# ========================================
+# 数据加载模块
+# ========================================
 from .data_loader import (
     DataHandler,
     AShareDataCleaner,
@@ -23,10 +30,17 @@ from .data_loader import (
     DataCleaner,
     DownloadResult,
 )
-from .tushare_loader import (
-    TushareDataLoader,
-    create_tushare_loader,
-)
+
+# Tushare 数据加载器（优先使用新模块，回退到旧模块）
+try:
+    from .tushare import TushareClient as TushareDataLoader
+    from .tushare import create_tushare_loader
+except ImportError:
+    from .tushare_loader import TushareDataLoader, create_tushare_loader
+
+# ========================================
+# 特征工程模块
+# ========================================
 from .features import (
     FeatureEngine,
     TechnicalFeatures,
@@ -34,22 +48,54 @@ from .features import (
     FactorCalculator,
     z_score_normalize,
 )
-from .strategy import (
-    BaseStrategy,
-    MACrossStrategy,
-    RSIStrategy,
-    CompositeStrategy,
-    MultiFactorStrategy,
-    SignalType,
-    TradeSignal,
-)
+
+# ========================================
+# 策略模块（优先使用新模块，回退到旧模块）
+# ========================================
+try:
+    from .strategy import (
+        BaseStrategy,
+        MACrossStrategy,
+        RSIStrategy,
+        MultiFactorStrategy,
+        SignalType,
+        TradeSignal,
+    )
+    # CompositeStrategy 可能不在新模块中
+    try:
+        from .strategy import CompositeStrategy
+    except ImportError:
+        CompositeStrategy = None
+except ImportError:
+    # 回退到旧的 strategy.py
+    from .strategy import (
+        BaseStrategy,
+        MACrossStrategy,
+        RSIStrategy,
+        CompositeStrategy,
+        MultiFactorStrategy,
+        SignalType,
+        TradeSignal,
+    )
+
+# ========================================
+# 回测模块
+# ========================================
 from .backtest import BacktestEngine, VBTProBacktester
+
+# ========================================
+# 组合优化模块
+# ========================================
 from .optimizer import (
     optimize_max_sharpe,
     PortfolioOptimizer,
     OptimizationResult,
     calculate_expected_returns,
 )
+
+# ========================================
+# 工具模块
+# ========================================
 from .utils import (
     setup_logging,
     load_config,
@@ -75,6 +121,25 @@ from .utils import (
     calculate_expected_returns_mean,
     PortfolioWeightOptimizer,
 )
+
+# ========================================
+# 新增模块（重构版）
+# ========================================
+try:
+    from .report_generator import ReportGenerator
+except ImportError:
+    ReportGenerator = None
+
+try:
+    from .daily_runner import DailyUpdateRunner, run_daily_update
+except ImportError:
+    DailyUpdateRunner = None
+    run_daily_update = None
+
+try:
+    from .backtest_runner import run_backtest as run_backtest_new
+except ImportError:
+    run_backtest_new = None
 
 __all__ = [
     # 数据处理
@@ -131,5 +196,10 @@ __all__ = [
     "calculate_shrinkage_covariance",
     "calculate_expected_returns_mean",
     "PortfolioWeightOptimizer",
+    # 新增模块（重构版）
+    "ReportGenerator",
+    "DailyUpdateRunner",
+    "run_daily_update",
+    "run_backtest_new",
 ]
 

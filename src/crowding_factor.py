@@ -212,6 +212,7 @@ def _create_ray_remote_function():
         Ray remote 装饰的计算函数
     """
     import ray
+    import logging as _logging  # Ray worker 中需要独立的 logger
     
     @ray.remote
     def calculate_sector_correlation(
@@ -249,13 +250,15 @@ def _create_ray_remote_function():
         - 返回的 Series 索引为 DatetimeIndex
         """
         import ray
+        # Ray worker 中使用独立的 logger，避免序列化问题
+        _worker_logger = _logging.getLogger(f"crowding_factor.worker.{sector_code}")
         
         try:
             # 获取行业价格数据
             sector_df = ray.get(sector_data_ref)
             
             if sector_df.empty or len(sector_df.columns) < 2:
-                logger.warning(f"行业 {sector_code} 股票数量不足，跳过计算")
+                _worker_logger.warning(f"行业 {sector_code} 股票数量不足，跳过计算")
                 return (sector_code, pd.Series(dtype=np.float64))
             
             # 计算收益率矩阵
@@ -281,7 +284,7 @@ def _create_ray_remote_function():
             return (sector_code, result)
             
         except Exception as e:
-            logger.error(f"计算行业 {sector_code} 拥挤因子失败: {e}")
+            _worker_logger.error(f"计算行业 {sector_code} 拥挤因子失败: {e}")
             return (sector_code, pd.Series(dtype=np.float64))
     
     return calculate_sector_correlation

@@ -293,7 +293,20 @@ class LRUCache:
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
-        self._lock = asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+        # 延迟初始化异步锁，避免在导入时调用 get_event_loop() 导致的问题
+        self._lock: Optional[asyncio.Lock] = None
+    
+    def _get_lock(self) -> Optional[asyncio.Lock]:
+        """延迟获取异步锁（避免在非异步上下文中初始化）"""
+        if self._lock is None:
+            try:
+                # 仅在事件循环运行时创建锁
+                loop = asyncio.get_running_loop()
+                self._lock = asyncio.Lock()
+            except RuntimeError:
+                # 没有运行中的事件循环，返回 None
+                pass
+        return self._lock
     
     def get(self, key: str) -> Optional[Any]:
         """获取缓存值"""
